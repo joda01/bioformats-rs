@@ -1546,6 +1546,21 @@ impl TiffReader {
         self.get_samples(ifd_index, x, y, w, h)
     }
 
+    fn blank_plane_region(&self, w: u32, h: u32) -> Result<Vec<u8>> {
+        let meta = self.metadata();
+        let samples = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
+        let len = checked_mul_usize(w as usize, h as usize, "OME blank plane pixels")
+            .and_then(|v| checked_mul_usize(v, samples as usize, "OME blank plane samples"))
+            .and_then(|v| {
+                checked_mul_usize(
+                    v,
+                    meta.pixel_type.bytes_per_sample(),
+                    "OME blank plane bytes",
+                )
+            })?;
+        Ok(vec![0; len])
+    }
+
     fn resolution_metadata(&self, level: usize) -> Result<Option<ImageMetadata>> {
         if level == 0 {
             return Ok(None);
@@ -1696,8 +1711,10 @@ impl TiffReader {
             let mut tile_length = rows_per_strip as u64;
             if contiguous_strips {
                 single_offset = [info.strip_offsets[0]];
-                single_count = [info.strip_byte_counts[0]
-                    .checked_mul(info.strip_byte_counts.len() as u64)
+                single_count = [info
+                    .strip_byte_counts
+                    .iter()
+                    .try_fold(0u64, |sum, &count| sum.checked_add(count))
                     .ok_or_else(|| {
                         BioFormatsError::Format("TIFF contiguous strip byte count overflows".into())
                     })?];
@@ -4914,7 +4931,11 @@ impl crate::common::reader::FormatReader for TiffReader {
                 let m = self.metadata();
                 (m.size_x, m.size_y)
             };
-            return self.read_external_plane(&ext, 0, 0, w, h);
+            return match self.read_external_plane(&ext, 0, 0, w, h) {
+                Ok(bytes) => Ok(bytes),
+                Err(BioFormatsError::PlaneOutOfRange(_)) => self.blank_plane_region(w, h),
+                Err(err) => Err(err),
+            };
         }
         let ifd_index = self.resolve_ifd_index(plane_index)?;
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -4933,7 +4954,11 @@ impl crate::common::reader::FormatReader for TiffReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         if let Some(ext) = self.external_plane_for(plane_index) {
-            return self.read_external_plane(&ext, x, y, w, h);
+            return match self.read_external_plane(&ext, x, y, w, h) {
+                Ok(bytes) => Ok(bytes),
+                Err(BioFormatsError::PlaneOutOfRange(_)) => self.blank_plane_region(w, h),
+                Err(err) => Err(err),
+            };
         }
         let ifd_index = self.resolve_ifd_index(plane_index)?;
         self.get_samples(ifd_index, x, y, w, h)

@@ -9,7 +9,7 @@ The internal Metakit table reader used for Volocity is translated from
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 
-* 2026-08-04: fixed regression
+* 2026-08-04: fixed error handling + speed regression
 * 2026-07-15: Translated jpegxr, fixing a bug in it. Now using jpegxr-pure-rs instead as dependency
 * 2026-07-12: For now assumed to be a feature complete translation, tested on real data. API added to also enable extraction of embedded tile raw data (e.g., to avoid lossy conversion)
 
