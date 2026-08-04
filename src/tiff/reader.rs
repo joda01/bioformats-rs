@@ -94,6 +94,9 @@ struct OmeTiffData {
     /// FileName from a nested `<UUID FileName="...">`, if any. When present the
     /// plane's pixels live in a companion TIFF rather than the current file.
     filename: Option<String>,
+    /// Text content of the nested `<UUID>` element, used for Java-compatible
+    /// missing companion diagnostics.
+    uuid: Option<String>,
 }
 
 /// A logical plane whose pixels live in a companion TIFF file, mirroring the
@@ -762,10 +765,10 @@ impl TiffReader {
         little_endian: bool,
         base_dir: Option<&Path>,
         current_path: Option<&Path>,
-    ) -> Option<Vec<TiffSeries>> {
+    ) -> Result<Option<Vec<TiffSeries>>> {
         let images = parse_ome_tiff_images(xml);
         if images.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Parse the structured OME metadata once so we can attach per-image
@@ -775,6 +778,7 @@ impl TiffReader {
         // on its stable public surface: `OmeMetadata::from_ome_xml(xml)` and the
         // per-image `modulo_z/c/t` fields. If those move, update this call site.
         let ome_meta = crate::common::ome_metadata::OmeMetadata::from_ome_xml(xml);
+        let current_uuid = ome_root_uuid(xml);
 
         let mut series = Vec::new();
         for (image_idx, image) in images.into_iter().enumerate() {
@@ -789,7 +793,12 @@ impl TiffReader {
                 continue;
             }
 
-            let companions = resolve_tiff_data_companions(&image, base_dir, current_path);
+            let companions = resolve_tiff_data_companions(
+                &image,
+                base_dir,
+                current_path,
+                current_uuid.as_deref(),
+            )?;
             let (mut plane_map, mut external_planes) =
                 build_ome_plane_maps(&image, ifds.len(), &companions);
             // Fall back to sequential mapping only when neither a local IFD nor a
@@ -976,7 +985,7 @@ impl TiffReader {
             });
         }
 
-        Some(series)
+        Ok(Some(series))
     }
 
     /// Parse SubIFD chains for pyramid support.
@@ -3000,7 +3009,7 @@ impl TiffReader {
         self.ome_xml = Some(xml.to_string());
         // Pass an empty IFD slice so every plane is resolved as external; the
         // backing `tf` only needs to exist for the reader to stay initialised.
-        let series = Self::build_ome_series(&[], xml, little_endian, base_dir, None)
+        let series = Self::build_ome_series(&[], xml, little_endian, base_dir, None)?
             .ok_or_else(|| BioFormatsError::Format("companion.ome has no usable images".into()))?;
         self.series = series;
         self.file = Some(tf);
@@ -3405,17 +3414,25 @@ fn parse_ome_tiff_images(xml: &str) -> Vec<OmeTiffImage> {
                 // when present the plane's pixels live in a companion TIFF.
                 let body_start = pos + tag.len();
                 let self_closing = tag.trim_end().ends_with("/>");
-                let filename = if self_closing {
-                    None
+                let (filename, uuid) = if self_closing {
+                    (None, None)
                 } else {
                     let body_end = matching_end_tag_start(pixels_xml, pos, "TiffData")
                         .unwrap_or(pixels_xml.len());
                     let body = pixels_xml.get(body_start..body_end).unwrap_or("");
-                    start_tag_positions(body, "UUID")
-                        .first()
-                        .map(|&up| start_tag_at(body, up))
+                    let uuid_pos = start_tag_positions(body, "UUID").into_iter().next();
+                    let filename = uuid_pos
+                        .map(|up| start_tag_at(body, up))
                         .and_then(|t| xml_attr(t, "FileName"))
-                        .filter(|s| !s.trim().is_empty())
+                        .filter(|s| !s.trim().is_empty());
+                    let uuid = uuid_pos.and_then(|up| {
+                        let tag = start_tag_at(body, up);
+                        let start = up + tag.len();
+                        let end = body[start..].find("</UUID>").map(|rel| start + rel)?;
+                        let value = body[start..end].trim();
+                        (!value.is_empty()).then(|| value.to_string())
+                    });
+                    (filename, uuid)
                 };
                 OmeTiffData {
                     ifd: parse_u32_attr(tag, "IFD").unwrap_or(0) as usize,
@@ -3424,6 +3441,7 @@ fn parse_ome_tiff_images(xml: &str) -> Vec<OmeTiffImage> {
                     first_c: parse_u32_attr(tag, "FirstC").unwrap_or(0),
                     first_t: parse_u32_attr(tag, "FirstT").unwrap_or(0),
                     filename,
+                    uuid,
                 }
             })
             .collect();
@@ -3466,29 +3484,44 @@ fn external_plane_ifd_info(plane: &ExternalPlane) -> Option<IfdInfo> {
 /// Returns `None` for a TiffData whose pixels are in the current file (no
 /// `<UUID FileName>`, or a FileName equal to the current file). Returns
 /// `Some(path)` for a companion file that exists. A FileName that does not
-/// resolve to an existing file yields `Some(None)` so the planes are left blank
-/// rather than mis-mapped onto local IFDs (mirrors Java's "missing file" path,
-/// which warns and leaves the plane unset).
+/// resolve to an existing file is a format error, matching Java Bio-Formats'
+/// OMETiffReader `setId` behavior.
 fn resolve_tiff_data_companions(
     image: &OmeTiffImage,
     base_dir: Option<&Path>,
     current_path: Option<&Path>,
-) -> Vec<Option<Option<PathBuf>>> {
+    current_uuid: Option<&str>,
+) -> Result<Vec<Option<Option<PathBuf>>>> {
     image
         .tiff_data
         .iter()
         .map(|td| {
             let Some(name) = td.filename.as_deref() else {
-                return None; // pixels in current file
+                return Ok(None); // pixels in current file
             };
             let resolved = resolve_companion_path(base_dir, name);
             // If the FileName points back at the current file, treat as local.
             if let (Some(resolved), Some(cur)) = (resolved.as_ref(), current_path) {
                 if paths_equal(resolved, cur) {
-                    return None;
+                    return Ok(None);
                 }
             }
-            Some(resolved)
+            if resolved.is_none() && td.uuid.as_deref() == current_uuid {
+                return Ok(None);
+            }
+            match resolved {
+                Some(path) => Ok(Some(Some(path))),
+                None => {
+                    let uuid = td
+                        .uuid
+                        .as_deref()
+                        .map(|u| format!(" associated with UUID {u}"))
+                        .unwrap_or_default();
+                    Err(BioFormatsError::Format(format!(
+                        "Missing file {name}{uuid}."
+                    )))
+                }
+            }
         })
         .collect()
 }
@@ -3801,6 +3834,16 @@ fn is_ome_xml_description(xml: &str) -> bool {
     start_tag_positions(xml.trim_start(), "OME")
         .first()
         .is_some()
+}
+
+fn ome_root_uuid(xml: &str) -> Option<String> {
+    let trimmed = xml.trim_start();
+    start_tag_positions(trimmed, "OME")
+        .into_iter()
+        .next()
+        .map(|pos| start_tag_at(trimmed, pos))
+        .and_then(|tag| xml_attr(tag, "UUID"))
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Java TiffReader.checkCommentImageJ: an ImageDescription comment is ImageJ-style
@@ -4795,7 +4838,7 @@ impl crate::common::reader::FormatReader for TiffReader {
                             little_endian,
                             meta_dir.as_deref(),
                             Some(path),
-                        ) {
+                        )? {
                             self.series = ome_series;
                         }
                         self.file = Some(tf);
@@ -4812,7 +4855,7 @@ impl crate::common::reader::FormatReader for TiffReader {
 
         if let Some(xml) = self.ome_xml.as_deref() {
             if let Some(ome_series) =
-                Self::build_ome_series(&tf.ifds, xml, little_endian, base_dir, Some(path))
+                Self::build_ome_series(&tf.ifds, xml, little_endian, base_dir, Some(path))?
             {
                 self.series = ome_series;
             }
@@ -5185,6 +5228,7 @@ mod tests {
                     first_c: 1,
                     first_t: 1,
                     filename: None,
+                    uuid: None,
                 },
                 OmeTiffData {
                     ifd: 1,
@@ -5193,6 +5237,7 @@ mod tests {
                     first_c: 2,
                     first_t: 1,
                     filename: None,
+                    uuid: None,
                 },
             ],
         };
@@ -6102,6 +6147,35 @@ mod tests {
         assert_eq!(reader.series_count(), 0);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ome_tiff_missing_companion_file_errors_like_java() {
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="1" SizeY="1" SizeZ="1" SizeC="2" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="1"/><Channel ID="Channel:0:1" SamplesPerPixel="1"/><TiffData IFD="0" FirstC="0" PlaneCount="1"><UUID FileName="missing-companion.ome.tif">urn:uuid:missing-test</UUID></TiffData></Pixels></Image></OME>"#;
+        let specs = vec![TinyIfdSpec {
+            width: 1,
+            height: 1,
+            bits_per_sample: 8,
+            samples_per_pixel: 1,
+            photometric: 1,
+            new_subfile_type: None,
+            description: Some(xml),
+            color_map: None,
+            pixels: vec![42],
+        }];
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ome-missing-companion-{}.ome.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        let err = reader.set_id(&path).unwrap_err().to_string();
+
+        let _ = fs::remove_file(&path);
+
+        assert!(err.contains("Missing file missing-companion.ome.tif"));
+        assert!(err.contains("urn:uuid:missing-test"));
     }
 
     #[test]
