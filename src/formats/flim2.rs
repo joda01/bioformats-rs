@@ -12643,20 +12643,64 @@ impl EtsVolume {
             raw.resize(read_len, 0);
         }
 
-        let mut buf = match self.compression {
-            ETS_RAW => raw,
-            ETS_JPEG => crate::common::codec::decompress_jpeg(&raw)?,
-            ETS_JPEG_2000 => crate::common::codec::decompress_jpeg2000(&raw)?,
-            ETS_JPEG_LOSSLESS => crate::common::codec::decompress_jpeg(&raw)?,
+        let (buf, actual_w, actual_h) = match self.compression {
+            ETS_RAW => (raw, self.tile_x as usize, self.tile_y as usize),
+            ETS_JPEG | ETS_JPEG_LOSSLESS => {
+                let decoded = crate::common::codec::decompress_jpeg(&raw)?;
+                let (w, h) = crate::common::codec::jpeg_dimensions(&raw)
+                    .map(|(w, h)| (w as usize, h as usize))
+                    .unwrap_or((self.tile_x as usize, self.tile_y as usize));
+                (decoded, w, h)
+            }
+            ETS_JPEG_2000 => {
+                let (decoded, w, h) = crate::common::codec::decompress_jpeg2000_with_dims(&raw)?;
+                (decoded, w as usize, h as usize)
+            }
             // PNG/BMP tiles store a full image payload; decode in memory via the
             // codec helpers (CellSensReader.java:1198-1210, APNGReader/BMPReader).
-            ETS_PNG => crate::common::codec::decompress_png(&raw)?,
-            ETS_BMP => crate::common::codec::decompress_bmp(&raw)?,
+            ETS_PNG => {
+                let (decoded, w, h) = crate::common::codec::decompress_png_with_dims(&raw)?;
+                (decoded, w as usize, h as usize)
+            }
+            ETS_BMP => {
+                let (decoded, w, h) = crate::common::codec::decompress_bmp_with_dims(&raw)?;
+                (decoded, w as usize, h as usize)
+            }
             other => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "cellSens ETS tile codec {other} is not supported"
                 )))
             }
+        };
+
+        let pixel = {
+            let bpp = self.pixel_type()?.bytes_per_sample();
+            bpp * self.rgb_channels() as usize
+        };
+        let mut buf = if actual_w == self.tile_x as usize && actual_h == self.tile_y as usize {
+            buf
+        } else {
+            // The decoded raster's width doesn't match the nominal tile size
+            // (e.g. a compressed codec that cropped/padded the tile
+            // differently than assumed). A flat byte-count resize/truncate
+            // here would silently reinterpret row N of the decoded buffer as
+            // row N of a `tile_x`-wide raster, misaligning every row after
+            // the first into a fine-grained, position-shifted repeat rather
+            // than erroring or cleanly cropping. Re-stride row by row instead
+            // so each destination row pulls from the matching source row.
+            let mut fixed = vec![0u8; tile_size];
+            let copy_w = actual_w.min(self.tile_x as usize) * pixel;
+            let src_stride = actual_w * pixel;
+            let dst_stride = self.tile_x as usize * pixel;
+            let copy_h = actual_h.min(self.tile_y as usize);
+            for row in 0..copy_h {
+                let src = row * src_stride;
+                let dst = row * dst_stride;
+                if src + copy_w <= buf.len() && dst + copy_w <= fixed.len() {
+                    fixed[dst..dst + copy_w].copy_from_slice(&buf[src..src + copy_w]);
+                }
+            }
+            fixed
         };
 
         if buf.len() < tile_size {
@@ -20742,6 +20786,58 @@ EndClass: 0
             vol.assemble_region(0, 0, 0, 0, 1, 0, 2, 2).unwrap(),
             vec![1, 0, 5, 0]
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A compressed tile whose decoded raster is narrower than the nominal
+    /// `tile_x` must not be flattened with a byte-count-only resize: that
+    /// would silently reinterpret decoded row N as row N of a `tile_x`-wide
+    /// raster, sliding real pixel content into what should be a padding
+    /// column. `decode_tile` must re-stride row by row instead.
+    #[test]
+    fn ets_decode_tile_restrides_jpeg_narrower_than_nominal_tile() {
+        use image::{codecs::jpeg::JpegEncoder, ColorType};
+
+        // Real decoded raster is 80x80 grayscale, but the nominal tile is
+        // declared 100x100 - as could happen if a compressed codec's tile
+        // doesn't cover the full nominal tile extent.
+        let pixels = vec![200u8; 80 * 80];
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg)
+            .encode(&pixels, 80, 80, ColorType::L8.into())
+            .expect("JPEG fixture encode failed");
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bioformats_ets_jpeg_restride_{nanos}.bin"));
+        std::fs::write(&path, &jpeg).unwrap();
+
+        let vol = EtsVolume {
+            path: path.clone(),
+            n_dimensions: 2,
+            size_c: 1,
+            compression: ETS_JPEG,
+            tile_x: 100,
+            tile_y: 100,
+            pixel_type_code: ETS_PT_UCHAR,
+            use_pyramid: false,
+            tiles: vec![(vec![0, 0], 0, jpeg.len() as u32)],
+            ..Default::default()
+        };
+
+        let tile = vol.decode_tile(0, 0, 0, 0, 0, 0).unwrap();
+        assert_eq!(tile.len(), 100 * 100, "tile_x * tile_y * bpp * channels");
+
+        // Index 85 falls in row 0's padding columns (80..100) under the
+        // correct 100-wide stride. Under the pre-fix flat byte-count resize,
+        // this index instead landed on real decoded content (row 1, col 5 of
+        // the actual 80-wide raster), so it would have been ~200, not 0.
+        assert_eq!(tile[85], 0, "row 0 padding column must stay zero");
+        // A genuine decoded pixel should survive (lossy JPEG, so allow slack).
+        assert!(tile[0] > 150, "row 0 col 0 should hold decoded content");
 
         let _ = std::fs::remove_file(path);
     }
