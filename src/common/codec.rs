@@ -110,6 +110,61 @@ pub(crate) fn jpeg_payload(data: &[u8]) -> &[u8] {
         .unwrap_or(data)
 }
 
+/// Read the frame width/height directly from a JPEG's `SOFn` marker, without
+/// fully decoding the image.
+///
+/// Callers that treat decoded JPEG bytes as a fixed-stride raster (e.g. tile
+/// stitchers that assume the decoded raster is exactly as wide as the nominal
+/// tile size) need this to detect a mismatch: a flat byte-count
+/// resize/truncate silently misaligns every row after the first when the
+/// decoded width differs from what the caller assumed, instead of erroring.
+pub fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let data = jpeg_payload(data);
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut pos = 2usize;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xFF {
+            pos += 1;
+            continue;
+        }
+        let marker = data[pos + 1];
+        // Fill bytes / stuffing, not a real marker.
+        if marker == 0x00 || marker == 0xFF {
+            pos += 1;
+            continue;
+        }
+        // Markers with no length field: TEM, RSTn, SOI, EOI.
+        if marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+            pos += 2;
+            continue;
+        }
+        // Start-of-scan: entropy-coded data follows, no more markers to scan
+        // for the header we care about.
+        if marker == 0xDA {
+            return None;
+        }
+        let seg_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        if seg_len < 2 {
+            return None;
+        }
+        let is_sof =
+            (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+        if is_sof {
+            let hdr = pos + 4; // start of the precision byte
+            if hdr + 5 > data.len() {
+                return None;
+            }
+            let height = u16::from_be_bytes([data[hdr + 1], data[hdr + 2]]) as u32;
+            let width = u16::from_be_bytes([data[hdr + 3], data[hdr + 4]]) as u32;
+            return Some((width, height));
+        }
+        pos += 2 + seg_len;
+    }
+    None
+}
+
 /// Decode with `jpeg-decoder` (default color transform). The authoritative path
 /// for everything `zune-jpeg` does not handle.
 pub(crate) fn decompress_jpeg_fallback(data: &[u8]) -> Result<Vec<u8>> {
@@ -204,6 +259,12 @@ pub fn decompress_png(data: &[u8]) -> Result<Vec<u8>> {
     decode_image_memory(data, image::ImageFormat::Png)
 }
 
+/// Like [`decompress_png`], but also reports the decoded raster's actual
+/// width/height so callers can detect a mismatch against an assumed tile size.
+pub fn decompress_png_with_dims(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    decode_image_memory_with_dims(data, image::ImageFormat::Png)
+}
+
 /// Decode an in-memory BMP payload to interleaved raw pixel bytes.
 ///
 /// Mirrors the Java cellSens `BMPReader` path used for ETS BMP tiles
@@ -213,12 +274,28 @@ pub fn decompress_bmp(data: &[u8]) -> Result<Vec<u8>> {
     decode_image_memory(data, image::ImageFormat::Bmp)
 }
 
+/// Like [`decompress_bmp`], but also reports the decoded raster's actual
+/// width/height so callers can detect a mismatch against an assumed tile size.
+pub fn decompress_bmp_with_dims(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    decode_image_memory_with_dims(data, image::ImageFormat::Bmp)
+}
+
 /// Decode an in-memory image payload of a known format to interleaved raw pixel
 /// bytes (little-endian). Shared backend for [`decompress_png`]/[`decompress_bmp`].
 fn decode_image_memory(data: &[u8], format: image::ImageFormat) -> Result<Vec<u8>> {
+    decode_image_memory_with_dims(data, format).map(|(bytes, _, _)| bytes)
+}
+
+/// Shared backend for [`decompress_png_with_dims`]/[`decompress_bmp_with_dims`].
+fn decode_image_memory_with_dims(
+    data: &[u8],
+    format: image::ImageFormat,
+) -> Result<(Vec<u8>, u32, u32)> {
+    use image::GenericImageView;
     let img = image::load_from_memory_with_format(data, format)
         .map_err(|e| BioFormatsError::Codec(e.to_string()))?;
-    Ok(match img {
+    let (width, height) = img.dimensions();
+    let bytes = match img {
         image::DynamicImage::ImageLuma8(b) => b.into_raw(),
         image::DynamicImage::ImageLumaA8(b) => b.into_raw(),
         image::DynamicImage::ImageRgb8(b) => b.into_raw(),
@@ -236,7 +313,8 @@ fn decode_image_memory(data: &[u8], format: image::ImageFormat) -> Result<Vec<u8
             b.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect()
         }
         other => other.to_rgb8().into_raw(),
-    })
+    };
+    Ok((bytes, width, height))
 }
 
 /// Decompress JPEG 2000 data (JP2 or J2K codestream).
@@ -244,10 +322,24 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
     decompress_jpeg2000_with_endianness(data, true)
 }
 
+/// Like [`decompress_jpeg2000`], but also reports the decoded raster's actual
+/// width/height so callers can detect a mismatch against an assumed tile size.
+pub fn decompress_jpeg2000_with_dims(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    decompress_jpeg2000_with_endianness_dims(data, true)
+}
+
 /// Decompress JPEG 2000 data, emitting multi-byte samples in the requested byte
 /// order. TIFF callers pass the IFD endianness; standalone callers keep the
 /// historical little-endian output through [`decompress_jpeg2000`].
 pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> Result<Vec<u8>> {
+    decompress_jpeg2000_with_endianness_dims(data, little_endian).map(|(bytes, _, _)| bytes)
+}
+
+/// Core JPEG 2000 decode, also reporting the decoded component-0 width/height.
+fn decompress_jpeg2000_with_endianness_dims(
+    data: &[u8],
+    little_endian: bool,
+) -> Result<(Vec<u8>, u32, u32)> {
     use jpeg2k::Image as J2kImage;
     let image = J2kImage::from_bytes(data)
         .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
@@ -327,7 +419,7 @@ pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> 
             }
         }
     }
-    Ok(out)
+    Ok((out, width as u32, height as u32))
 }
 
 /// Compress an interleaved pixel plane to a lossless JPEG 2000 (`.jp2`) file.
@@ -2748,6 +2840,23 @@ mod tests {
 
         assert_eq!(jpeg_payload(prefixed), b"\xff\xd8jpeg");
         assert_eq!(jpeg_payload(b"not-jpeg"), b"not-jpeg");
+    }
+
+    #[test]
+    fn jpeg_dimensions_reads_sof_width_height() {
+        use image::{codecs::jpeg::JpegEncoder, ColorType};
+
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg)
+            .encode(&vec![128u8; 3 * 5 * 7], 5, 7, ColorType::Rgb8.into())
+            .expect("JPEG fixture encode failed");
+
+        assert_eq!(jpeg_dimensions(&jpeg), Some((5, 7)));
+    }
+
+    #[test]
+    fn jpeg_dimensions_none_for_non_jpeg() {
+        assert_eq!(jpeg_dimensions(b"not a jpeg at all"), None);
     }
 
     #[test]
