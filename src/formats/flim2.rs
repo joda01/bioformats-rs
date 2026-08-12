@@ -11882,9 +11882,10 @@ pub struct CellSensReader {
     /// Metadata describing the current ETS resolution (when an ETS target is
     /// active). Held so `metadata()` can return a borrow.
     ets_meta: Option<ImageMetadata>,
-    /// Flattened series ordering (mirrors Java with flattened resolutions): the
-    /// ETS pyramid resolution levels come first (one logical series each), then a
-    /// single embedded TIFF image (the overview). Built in `enrich_metadata`.
+    /// Logical series ordering: one series per ETS pyramid volume (with
+    /// resolution levels exposed via `resolution_count`/`set_resolution`,
+    /// mirroring Java's default `setFlattenedResolutions(false)`), followed by
+    /// a single embedded TIFF image (the overview). Built in `enrich_metadata`.
     series_map: Vec<CellSensTarget>,
     /// Image name per logical series, for OME (CellSensReader.java:994-1031).
     series_names: Vec<String>,
@@ -12888,7 +12889,7 @@ impl EtsVolume {
             // (CellSensReader.java:800). Compressed tiles (JPEG/JPEG2000/etc.)
             // report littleEndian = false.
             is_little_endian: self.compression == ETS_RAW,
-            resolution_count: 1,
+            resolution_count: self.levels.len().max(1) as u32,
             ..ImageMetadata::default()
         };
         insert_cellsens_acquisition_metadata(&mut meta.series_metadata, "cellsens.ets", &self.meta);
@@ -14332,12 +14333,12 @@ impl CellSensReader {
         }
         self.ets = volumes;
 
-        // Build the flattened logical-series ordering. Mirrors Java with
-        // setFlattenedResolutions(true): each ETS pyramid resolution level is a
-        // distinct series, followed by one embedded TIFF image (the overview, the
-        // first IFD of the .vsi). When ETS files exist, Java exposes
-        // `files.size()` core series = (#ETS pyramids) + 1 overview, and the other
-        // embedded TIFF IFDs are NOT exposed (CellSensReader.java:732-855).
+        // Build the logical-series ordering. Mirrors Java's default
+        // setFlattenedResolutions(false): each ETS pyramid volume is one series,
+        // with its resolution levels reachable via resolution_count()/
+        // set_resolution(), followed by one embedded TIFF image (the overview,
+        // the first IFD of the .vsi). The other embedded TIFF IFDs are NOT
+        // exposed (CellSensReader.java:732-855).
         self.series_map.clear();
         self.series_names.clear();
         self.series_phys.clear();
@@ -14349,34 +14350,36 @@ impl CellSensReader {
                 self.series_phys.push(None);
             }
         } else {
-            // ETS pyramid resolution levels first (flattened).
+            // One series per ETS pyramid volume. Resolution levels within a
+            // volume are exposed via resolution_count()/set_resolution(), not
+            // as separate flattened series (Java's setFlattenedResolutions(false),
+            // the default most Bio-Formats-based apps rely on for pyramid LOD
+            // switching).
             for (vi, vol) in self.ets.iter().enumerate() {
-                for res in 0..vol.levels.len() {
-                    self.series_map.push(CellSensTarget::Ets {
-                        volume: vi,
-                        resolution: res,
-                    });
-                    // Image 0 of the first pyramid takes the pyramid (stack) name;
-                    // later resolution levels get the default "filename #N"
-                    // (CellSensReader.java:994-1031 + populatePixels defaults).
-                    let series_idx = self.series_map.len() - 1;
-                    if res == 0 && vi == 0 {
-                        let name = vol
-                            .meta
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("{filename} #{}", series_idx + 1));
-                        self.series_names.push(name);
-                        self.series_phys
-                            .push(match (vol.physical_size_x, vol.physical_size_y) {
-                                (Some(x), Some(y)) => Some((x, y)),
-                                _ => None,
-                            });
-                    } else {
-                        self.series_names
-                            .push(format!("{filename} #{}", series_idx + 1));
-                        self.series_phys.push(None);
-                    }
+                self.series_map.push(CellSensTarget::Ets {
+                    volume: vi,
+                    resolution: 0,
+                });
+                // Image 0 of the first pyramid takes the pyramid (stack) name;
+                // other volumes get the default "filename #N"
+                // (CellSensReader.java:994-1031 + populatePixels defaults).
+                let series_idx = self.series_map.len() - 1;
+                if vi == 0 {
+                    let name = vol
+                        .meta
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{filename} #{}", series_idx + 1));
+                    self.series_names.push(name);
+                    self.series_phys
+                        .push(match (vol.physical_size_x, vol.physical_size_y) {
+                            (Some(x), Some(y)) => Some((x, y)),
+                            _ => None,
+                        });
+                } else {
+                    self.series_names
+                        .push(format!("{filename} #{}", series_idx + 1));
+                    self.series_phys.push(None);
                 }
             }
             // One embedded TIFF overview image last (CellSensReader.java:826-855).
@@ -14575,16 +14578,12 @@ impl FormatReader for CellSensReader {
                 .unwrap_or("image")
                 .to_string();
             self.ets.push(vol);
-            for res in 0..self.ets[0].levels.len() {
+            if !self.ets[0].levels.is_empty() {
                 self.series_map.push(CellSensTarget::Ets {
                     volume: 0,
-                    resolution: res,
+                    resolution: 0,
                 });
-                self.series_names.push(if res == 0 {
-                    filename.clone()
-                } else {
-                    format!("{filename} #{}", res + 1)
-                });
+                self.series_names.push(filename);
                 self.series_phys.push(None);
             }
             if !self.series_map.is_empty() {
@@ -14654,19 +14653,41 @@ impl FormatReader for CellSensReader {
             .as_ref()
             .unwrap_or_else(|| self.inner.metadata())
     }
-    // Flattened resolutions: every logical series is a single resolution level.
     fn resolution_count(&self) -> usize {
-        1
+        match self.target {
+            CellSensTarget::Ets { volume, .. } => {
+                self.ets.get(volume).map(|v| v.levels.len()).unwrap_or(1)
+            }
+            CellSensTarget::Tiff(_) => 1,
+        }
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level == 0 {
-            Ok(())
-        } else {
-            Err(BioFormatsError::PlaneOutOfRange(level as u32))
+        match self.target {
+            CellSensTarget::Ets { volume, .. } => {
+                if level >= self.ets[volume].levels.len() {
+                    return Err(BioFormatsError::PlaneOutOfRange(level as u32));
+                }
+                self.target = CellSensTarget::Ets {
+                    volume,
+                    resolution: level,
+                };
+                self.ets_meta = Some(self.ets[volume].level_metadata(level)?);
+                Ok(())
+            }
+            CellSensTarget::Tiff(_) => {
+                if level == 0 {
+                    Ok(())
+                } else {
+                    Err(BioFormatsError::PlaneOutOfRange(level as u32))
+                }
+            }
         }
     }
     fn resolution(&self) -> usize {
-        0
+        match self.target {
+            CellSensTarget::Ets { resolution, .. } => resolution,
+            CellSensTarget::Tiff(_) => 0,
+        }
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         match self.target {
@@ -14805,14 +14826,9 @@ impl FormatReader for CellSensReader {
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
-        if level != 0 {
-            return Ok(CompressedExtractionSupport::NotSupported {
-                reason: "cellSens exposes ETS pyramid resolutions as flattened series; only level 0 is valid for the current series".into(),
-            });
-        }
         match self.target {
-            CellSensTarget::Ets { volume, resolution } => {
-                self.ets[volume].compressed_support(plane_index, resolution, level)
+            CellSensTarget::Ets { volume, .. } => {
+                self.ets[volume].compressed_support(plane_index, level as usize, level)
             }
             CellSensTarget::Tiff(_) => Ok(CompressedExtractionSupport::NotSupported {
                 reason: "cellSens embedded TIFF overview is not an ETS tiled chunk series".into(),
@@ -14828,15 +14844,10 @@ impl FormatReader for CellSensReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        if level != 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "cellSens exposes ETS pyramid resolutions as flattened series; only level 0 is valid for the current series".into(),
-            ));
-        }
         match self.target {
-            CellSensTarget::Ets { volume, resolution } => self.ets[volume].compressed_tile(
+            CellSensTarget::Ets { volume, .. } => self.ets[volume].compressed_tile(
                 plane_index,
-                resolution,
+                level as usize,
                 level,
                 col,
                 row,
@@ -14848,10 +14859,11 @@ impl FormatReader for CellSensReader {
         }
     }
 
-    /// Build one OME image per flattened logical series, mirroring Java's
-    /// post-flattening `OMEPyramidStore` population (image 0 = pyramid/stack name
-    /// + physical pixel size, intermediate pyramid levels = default "filename #N"
-    /// names, overview = "macro image").
+    /// Build one OME image per logical series (one per ETS pyramid volume, plus
+    /// the embedded TIFF overview), mirroring Java's `OMEPyramidStore`
+    /// population (image 0 = pyramid/stack name + physical pixel size, other
+    /// pyramid volumes = default "filename #N" names, overview = "macro image").
+    /// Resolution levels within a volume are not separate OME images.
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         use crate::common::ome_metadata::{OmeImage, OmeMetadata};
         if self.series_map.is_empty() {
@@ -21119,6 +21131,67 @@ EndClass: 0
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x5a]);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A pyramidal ETS volume must be exposed as ONE series with multiple
+    /// resolution levels (`resolution_count()`/`set_resolution()`), not as one
+    /// flattened top-level series per level. Regression test for the VSI
+    /// pyramid-flattening bug: every other pyramidal reader in the crate
+    /// exposes true multi-resolution series, and Java's `CellSensReader`
+    /// supports this via `setFlattenedResolutions(false)`.
+    #[test]
+    fn cellsens_vsi_pyramid_exposes_resolution_levels_not_flattened_series() {
+        let mut vol = EtsVolume {
+            n_dimensions: 3,
+            size_c: 1,
+            compression: ETS_RAW,
+            tile_x: 512,
+            tile_y: 512,
+            pixel_type_code: ETS_PT_UCHAR,
+            use_pyramid: true,
+            // [col, row, resolution]: one tile at full res, one at level 1.
+            tiles: vec![(vec![0, 0, 0], 0, 1), (vec![0, 0, 1], 0, 1)],
+            ..Default::default()
+        };
+        vol.compute_levels();
+        assert_eq!(vol.levels.len(), 2, "synthetic volume has two pyramid levels");
+        assert_eq!((vol.levels[0].size_x, vol.levels[0].size_y), (512, 512));
+        assert_eq!((vol.levels[1].size_x, vol.levels[1].size_y), (256, 256));
+
+        let mut reader = CellSensReader::new();
+        reader.ets.push(vol);
+        reader.series_map.push(CellSensTarget::Ets {
+            volume: 0,
+            resolution: 0,
+        });
+        reader.series_names.push("pyramid".to_string());
+        reader.series_phys.push(None);
+
+        assert_eq!(
+            reader.series_count(),
+            1,
+            "one logical series per ETS pyramid volume, not one per resolution level"
+        );
+
+        reader.set_series(0).unwrap();
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!(reader.metadata().size_x, 512);
+        assert_eq!(reader.metadata().resolution_count, 2);
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!(reader.resolution(), 1);
+        assert_eq!(reader.metadata().size_x, 256);
+        assert_eq!(reader.metadata().size_y, 256);
+
+        reader.set_resolution(0).unwrap();
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!(reader.metadata().size_x, 512);
+
+        assert!(matches!(
+            reader.set_resolution(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
     }
 
     /// Non-geometry acquisition metadata tags are captured into the pyramid meta
