@@ -404,6 +404,18 @@ struct Nd2LvValues {
     n_x_fields: u32,
     /// `dCompressionParam > 0` ⇒ lossless (ND2Handler:548-550).
     is_lossless: bool,
+    /// `uiWidth` / `uiHeight` from a binary (non-XML) `ImageAttributesLV`
+    /// chunk (ND2 v3 files store this as an LV tree, not XML - the XML-only
+    /// `parse_nd2_attributes` returns nothing for these files).
+    width: Option<u32>,
+    height: Option<u32>,
+    /// `uiComp` (falls back to `uiVirtualComponents`) - channel/sample count.
+    components: Option<u32>,
+    /// `uiBpcInMemory` - storage bit depth, drives `pixel_type` (e.g. 16 for a
+    /// 14-bit-significant sensor stored in 16-bit samples).
+    bpc_in_memory: Option<u32>,
+    /// `uiBpcSignificant` - reported bit depth, drives `bits_per_pixel`.
+    bpc_significant: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -466,6 +478,22 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                     // (Java: currentColor = (Integer) value).
                     if name == "uiColor" {
                         current_color = read_i32(data, p);
+                    } else {
+                        let uv = read_i32(data, p).map(|v| v.max(0) as u32);
+                        match name.as_str() {
+                            "uiWidth" if out.width.is_none() => out.width = uv,
+                            "uiHeight" if out.height.is_none() => out.height = uv,
+                            "uiComp" | "uiVirtualComponents" if out.components.is_none() => {
+                                out.components = uv.filter(|&v| v > 0)
+                            }
+                            "uiBpcInMemory" if out.bpc_in_memory.is_none() => {
+                                out.bpc_in_memory = uv.filter(|&v| v > 0)
+                            }
+                            "uiBpcSignificant" if out.bpc_significant.is_none() => {
+                                out.bpc_significant = uv.filter(|&v| v > 0)
+                            }
+                            _ => {}
+                        }
                     }
                     p += 4;
                 }
@@ -591,64 +619,106 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
 
 /// Parse the flat binary `ImageAttributes*` attribute list for the compression
 /// flags handled directly in `ND2Reader.initFile`.
+///
+/// `dCompressionParam` is an 8-byte double and `eCompression` is a 4-byte
+/// int32 in the real LV tree (verified against a real v3 file:
+/// `dCompressionParam = -1.0`, `eCompression = 2`) - there is no single fixed
+/// record width to march through. Like `parse_image_metadata_lv`, this scan
+/// does not track LV structure: it only advances by a whole record when it
+/// recognizes the attribute name (using that name's real value width), and
+/// otherwise slides forward one byte and retries, so it resynchronizes with
+/// real record boundaries around every other (unrecognized-width) field.
 fn parse_nd2_binary_image_attributes(data: &[u8], out: &mut Nd2LvValues) {
     fn read_i32(d: &[u8], p: usize) -> Option<i32> {
         d.get(p..p + 4)
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+    fn read_f64(d: &[u8], p: usize) -> Option<f64> {
+        d.get(p..p + 8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+    }
 
-    if data.len() <= 7 {
+    if data.len() <= 1 {
         return;
     }
 
-    // Java skips 6 bytes, then consumes zero padding and one non-zero byte
-    // before the repeated [nameLen][UTF-16LE name][i32 value] records.
-    let mut p = 6usize;
+    // Skip the outermost LV entry's 1-byte type tag (see
+    // `parse_image_metadata_lv`'s doc comment for why this is exactly 1 byte).
+    let mut p = 1usize;
     while p < data.len() && data[p] == 0 {
         p += 1;
     }
-    if p < data.len() {
-        p += 1;
-    }
+    let end_fp = data.len();
 
     let mut saw_lossless_param = false;
     let mut lossless_param = false;
     let mut can_be_lossless = true;
 
-    while p < data.len() {
-        let name_len = data[p] as usize;
-        p += 1;
+    loop {
+        let q = p;
+        if q >= data.len() {
+            break;
+        }
+        let name_len = data[q] as usize;
         if name_len == 0 {
+            p += 1;
+            if p > end_fp {
+                break;
+            }
             continue;
         }
-        let name_bytes = match name_len.checked_mul(2) {
-            Some(v) => v,
-            None => break,
-        };
-        if p + name_bytes + 4 > data.len() {
+        let name_bytes = name_len * 2;
+        if q + 1 + name_bytes > data.len() {
             break;
         }
         let units: Vec<u16> = (0..name_len)
-            .map(|i| u16::from_le_bytes([data[p + i * 2], data[p + i * 2 + 1]]))
-            .take_while(|&u| u != 0)
+            .map(|i| u16::from_le_bytes([data[q + 1 + i * 2], data[q + 2 + i * 2]]))
             .collect();
-        let name = String::from_utf16_lossy(&units);
-        p += name_bytes;
-        let Some(value) = read_i32(data, p) else {
-            break;
-        };
-        p += 4;
+        let stripped: Vec<u16> = units.iter().copied().take_while(|&u| u != 0).collect();
+        let name = String::from_utf16_lossy(&stripped);
+        let after_name = q + 1 + name_bytes;
 
-        match name.as_str() {
+        if name.chars().count() != name_len - 1 {
+            p += 1;
+            if p > end_fp {
+                break;
+            }
+            continue;
+        }
+
+        let advanced = match name.as_str() {
             // Java binary ImageAttributes path: isLossless = valueOrLength >= 0.
             "dCompressionParam" => {
-                saw_lossless_param = true;
-                lossless_param = value >= 0;
+                if let Some(v) = read_f64(data, after_name) {
+                    saw_lossless_param = true;
+                    lossless_param = v >= 0.0;
+                }
+                // The trailing `p += 1` below brings this to `after_name`.
+                p = q + name_bytes;
+                true
             }
             // Java: canBeLossless = valueOrLength <= 0, then
             // isLossless = isLossless && canBeLossless after the block.
-            "eCompression" => can_be_lossless = value <= 0,
-            _ => {}
+            "eCompression" => {
+                if let Some(v) = read_i32(data, after_name) {
+                    can_be_lossless = v <= 0;
+                }
+                p = q + name_bytes;
+                true
+            }
+            _ => false,
+        };
+
+        if !advanced {
+            p += 1;
+            if p > end_fp {
+                break;
+            }
+            continue;
+        }
+        p += 1;
+        if p > end_fp {
+            break;
         }
     }
 
@@ -682,8 +752,20 @@ struct ImageMetadataLv {
 /// Port of the `blockType.startsWith("ImageMetadat")` binary walk in
 /// `ND2Reader.initFile` (java:967-1062). `data` is the raw chunk data, i.e. the
 /// bytes Java sees starting at `in.getFilePointer()` after the block name has
-/// been consumed. Java then does `skipBytes(6)` and a `while (in.read() == 0)`
-/// zero-skip before the attribute scan; we mirror that on the byte buffer.
+/// been consumed.
+///
+/// The chunk data starts with the outermost LV entry's own 1-byte type tag
+/// (matching `parse_nd2_lv`'s tree format - verified against a real v3 file:
+/// `data[0] == 0x0b` (Level) and `data[1] == 14` (nameLen for
+/// `"SLxExperiment\0"`)). This scan is type-tag-blind (it reads `nameLen` at
+/// the byte it's pointed at with no notion of a preceding type byte), so it
+/// must skip exactly that one leading type-tag byte to align with the first
+/// entry's `nameLen`. From there it does not track LV structure at all: on
+/// any position that doesn't decode to a recognized attribute name it just
+/// slides forward one byte and retries, so it naturally resynchronizes with
+/// real record boundaries after walking through unrecognized/nested fields -
+/// this is what makes a fixed 1-byte skip work despite not parsing every
+/// entry's actual type/size.
 ///
 /// Returns `None` if the block does not look like a parseable LV experiment.
 fn parse_image_metadata_lv(data: &[u8]) -> Option<ImageMetadataLv> {
@@ -707,16 +789,13 @@ fn parse_image_metadata_lv(data: &[u8]) -> Option<ImageMetadataLv> {
         processed: false,
     };
 
-    // Java: in.skipBytes(6); then while (in.read() == 0); — the read consumes one
-    // byte past the trailing zero, so scanning resumes at that non-zero byte.
+    // Skip the outermost LV entry's 1-byte type tag (see the doc comment
+    // above) so `p` lands on that entry's own `nameLen` byte.
     let start_file_pointer = 0usize;
-    let mut p = 6usize;
+    let mut p = 1usize;
     while p < data.len() && data[p] == 0 {
         p += 1;
     }
-    // `in.read()` consumes the first non-zero byte too; the next loop re-seeks to
-    // `currentFilePointer`, so the post-zero non-zero byte is where the name-length
-    // scan begins (Java reads it as nameLen on the first iteration).
     let end_fp = data.len(); // endFP = fp + len - 18; the chunk data is already that bounded slice
     let mut current_file_pointer = p;
 
@@ -2555,12 +2634,26 @@ impl Nd2Reader {
     }
 
     fn normal_frame_chunk_for_plane(&self, plane_index: u32) -> Result<&Nd2Chunk> {
+        // Every channel of a Z/T frame shares one physical chunk (see
+        // `open_bytes`'s plane_index/chunk/channel mapping comment); a
+        // compressed codestream covers the whole interleaved frame, so the
+        // chunk lookup only needs the frame index, not the channel.
+        let size_c = self
+            .meta
+            .get(self.current_series)
+            .map(|m| m.size_c.max(1))
+            .unwrap_or(1);
+        let chunk_plane_index = if size_c > 1 {
+            plane_index / size_c
+        } else {
+            plane_index
+        };
         let series_chunks = self
             .series_image_chunks
             .get(self.current_series)
             .unwrap_or(&self.image_chunks);
         let chunk_idx = series_chunks
-            .get(plane_index as usize)
+            .get(chunk_plane_index as usize)
             .copied()
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         self.chunks
@@ -2635,6 +2728,11 @@ impl FormatReader for Nd2Reader {
 
         let (mut size_x, mut size_y, mut size_c, mut size_z, mut bpp) =
             (0u32, 0u32, 1u32, 1u32, 8u8);
+        // `uiBpcInMemory` (storage bit depth, e.g. 16) when known separately
+        // from `bpp` (reported/significant bit depth, e.g. 14) - drives
+        // `pixel_type` selection below instead of the reported value, matching
+        // Java's split between `getPixelType()` and `getBitsPerPixel()`.
+        let mut storage_bpp: Option<u8> = None;
         let mut loop_size_z: Option<u32> = None;
         let mut loop_size_t: Option<u32> = None;
         let mut loop_series_count: Option<u32> = None;
@@ -2645,9 +2743,28 @@ impl FormatReader for Nd2Reader {
             .filter(|c| c.name.starts_with("ImageAttributes"))
         {
             let data = read_chunk_data(&mut reader, ac).map_err(BioFormatsError::Io)?;
-            // Data may be a raw binary struct OR XML wrapped. Try XML first.
+            // Data may be a raw binary LV-encoded struct OR XML wrapped. Try
+            // XML first, then the binary LV tree (ND2 v3 files store
+            // ImageAttributesLV as a binary tree, not XML, so the XML-only
+            // parse_nd2_attributes returns nothing for those files).
             let xml = String::from_utf8_lossy(&data);
             let (w, h, c, z, b) = parse_nd2_attributes(&xml);
+            let (w, h, c, z, b, storage) = if w > 0 && h > 0 {
+                (w, h, c, z, Some(b), None)
+            } else {
+                let mut attr_lv = Nd2LvValues::default();
+                parse_nd2_lv(&data, &mut attr_lv);
+                (
+                    attr_lv.width.unwrap_or(0),
+                    attr_lv.height.unwrap_or(0),
+                    attr_lv.components.unwrap_or(0),
+                    1,
+                    attr_lv
+                        .bpc_significant
+                        .map(|v| v.min(u8::MAX as u32) as u8),
+                    attr_lv.bpc_in_memory.map(|v| v.min(u8::MAX as u32) as u8),
+                )
+            };
             if w > 0 && h > 0 {
                 size_x = w;
                 size_y = h;
@@ -2657,9 +2774,10 @@ impl FormatReader for Nd2Reader {
                 if z > 0 {
                     size_z = z;
                 }
-                if b > 0 {
+                if let Some(b) = b.filter(|&v| v > 0) {
                     bpp = b;
                 }
+                storage_bpp = storage.filter(|&v| v > 0);
                 nd2_update_loop_counts_from_xml(
                     &xml,
                     &mut loop_size_z,
@@ -2747,7 +2865,7 @@ impl FormatReader for Nd2Reader {
             }
         }
 
-        let pixel_type = match bpp {
+        let pixel_type = match storage_bpp.unwrap_or(bpp) {
             8 => PixelType::Uint8,
             16 => PixelType::Uint16,
             _ => PixelType::Uint16,
@@ -3607,6 +3725,12 @@ impl FormatReader for Nd2Reader {
                 .get(series_index)
                 .copied()
                 .unwrap_or(series_image_count);
+            // `series_image_count` (and its overrides) count physical chunks
+            // (one Z/T frame each); Java reports one plane per channel
+            // (image_count = sizeC*sizeZ*sizeT). `open_bytes` extracts a
+            // single channel per plane_index to match (see its mapping
+            // comment), so the reported count must include the sizeC factor.
+            let this_image_count = this_image_count.saturating_mul(size_c.max(1));
             metas.push(ImageMetadata {
                 size_x,
                 size_y,
@@ -3743,12 +3867,28 @@ impl FormatReader for Nd2Reader {
             );
         }
 
+        // A physical ImageDataSeq chunk stores all channels for one Z/T frame
+        // interleaved together (channels are captured simultaneously, not as a
+        // separate acquisition loop). Java nonetheless exposes one single-
+        // channel plane per channel (image_count = sizeC*sizeZ*sizeT,
+        // dimension_order "XYCZT" ⇒ C fastest), so a caller-facing plane_index
+        // maps to chunk `plane_index / sizeC`, channel `plane_index % sizeC`.
+        let size_c_usize = meta.size_c.max(1) as usize;
+        let (chunk_plane_index, channel) = if size_c_usize > 1 {
+            (
+                plane_index / meta.size_c.max(1),
+                (plane_index % meta.size_c.max(1)) as usize,
+            )
+        } else {
+            (plane_index, 0usize)
+        };
+
         let series_chunks = self
             .series_image_chunks
             .get(self.current_series)
             .unwrap_or(&self.image_chunks);
         let chunk_idx = series_chunks
-            .get(plane_index as usize)
+            .get(chunk_plane_index as usize)
             .copied()
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         let chunk = &self.chunks[chunk_idx];
@@ -3792,20 +3932,35 @@ impl FormatReader for Nd2Reader {
             other => other,
         })?;
 
-        if scanline_pad == 0 {
-            return Ok(decoded);
+        let full = if scanline_pad == 0 {
+            decoded
+        } else {
+            // De-pad: strip the trailing pad sample from each row so the
+            // buffer is the unpadded sizeX*sizeY*sizeC*bpp plane (Java
+            // openBytes copies rowLength bytes then skips scanlinePad*bpp per
+            // row, ~280-289).
+            let out_row = size_x * size_c * bps;
+            let mut out = Vec::with_capacity(out_row * size_y);
+            for row in 0..size_y {
+                let start = row * stored_row;
+                out.extend_from_slice(&decoded[start..start + out_row]);
+            }
+            out
+        };
+
+        if size_c <= 1 {
+            return Ok(full);
         }
 
-        // De-pad: strip the trailing pad sample from each row so the returned
-        // buffer is the unpadded sizeX*sizeY*sizeC*bpp plane (Java openBytes
-        // copies rowLength bytes then skips scanlinePad*bpp per row, ~280-289).
-        let out_row = size_x * size_c * bps;
-        let mut out = Vec::with_capacity(out_row * size_y);
-        for row in 0..size_y {
-            let start = row * stored_row;
-            out.extend_from_slice(&decoded[start..start + out_row]);
+        // Extract just the requested channel's samples out of the
+        // per-pixel-interleaved frame (see the plane_index/chunk mapping
+        // comment above).
+        let mut single = Vec::with_capacity(size_x * size_y * bps);
+        for pixel in 0..size_x * size_y {
+            let src = pixel * size_c * bps + channel * bps;
+            single.extend_from_slice(&full[src..src + bps]);
         }
-        Ok(out)
+        Ok(single)
     }
 
     fn open_bytes_region(
@@ -3818,11 +3973,10 @@ impl FormatReader for Nd2Reader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.metadata();
-        let spp = if self.old_jp2_planes.is_empty() {
-            meta.size_c as usize
-        } else {
-            1
-        };
+        // `open_bytes` already extracts a single channel's plane when
+        // size_c > 1 (see its plane_index/chunk/channel mapping), so the
+        // buffer here is always one sample per pixel.
+        let spp = 1;
         crop_full_plane("ND2", &full, meta, spp, x, y, w, h)
     }
 
@@ -4078,9 +4232,12 @@ impl FormatReader for Nd2Reader {
             || plane_pos_z_value.is_some()
             || !self.exposure_time.is_empty()
         {
-            // This reader treats uiComp samples as interleaved within each
-            // ImageDataSeq frame, so one chunk maps to one Z/T plane.
-            let effective_c = 1;
+            // Every channel of a physical ImageDataSeq frame is exposed as its
+            // own plane (image_count = sizeC*sizeZ*sizeT, dimension_order
+            // "XYCZT" ⇒ C fastest - see open_bytes's plane_index/chunk/channel
+            // mapping comment), so `i` must be split into a channel and a
+            // chunk-indexed Z/T position before looking up per-frame data.
+            let effective_c = meta.size_c.max(1);
             let plane_offset = self
                 .series_plane_offsets
                 .get(self.current_series)
@@ -4090,11 +4247,12 @@ impl FormatReader for Nd2Reader {
             img.planes = (0..meta.image_count)
                 .map(|i| {
                     let c = i % effective_c;
-                    let z = (i / effective_c) % meta.size_z.max(1);
-                    let t = i / (effective_c * meta.size_z.max(1));
+                    let zt_index = i / effective_c;
+                    let z = zt_index % meta.size_z.max(1);
+                    let t = zt_index / meta.size_z.max(1);
                     let source_plane = source_planes
-                        .and_then(|planes| planes.get(i as usize).copied())
-                        .unwrap_or(plane_offset + i as usize);
+                        .and_then(|planes| planes.get(zt_index as usize).copied())
+                        .unwrap_or(plane_offset + zt_index as usize);
                     // Per-channel exposure when the list matches sizeC, else the
                     // shared single value (ND2Reader:2419-2430).
                     let exposure_time = if self.exposure_time.len() == meta.size_c as usize {
@@ -4364,32 +4522,122 @@ mod tests {
         assert_eq!(lv.position_count, 1);
     }
 
+    /// ND2 v3 files store `ImageAttributesLV` as a binary LV tree, not XML
+    /// (`parse_nd2_attributes` finds nothing for these files). `parse_nd2_lv`
+    /// must extract `uiWidth`/`uiHeight`/`uiComp`/`uiBpcInMemory`/
+    /// `uiBpcSignificant` directly from that tree - verified against a real
+    /// v3 file where these exact fields/values appear (2424/2424/3/16/14).
+    #[test]
+    fn nd2_binary_lv_extracts_width_height_comp_and_bpc() {
+        fn entry(ty: u8, name: &str, value: &[u8]) -> Vec<u8> {
+            let mut e = vec![ty, name.chars().count() as u8];
+            for u in name.encode_utf16() {
+                e.extend_from_slice(&u.to_le_bytes());
+            }
+            e.extend_from_slice(value);
+            e
+        }
+        let mut data = Vec::new();
+        data.extend_from_slice(&entry(3, "uiWidth", &2424u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiHeight", &2424u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiComp", &3u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiBpcInMemory", &16u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiBpcSignificant", &14u32.to_le_bytes()));
+
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_lv(&data, &mut lv);
+        assert_eq!(lv.width, Some(2424));
+        assert_eq!(lv.height, Some(2424));
+        assert_eq!(lv.components, Some(3));
+        assert_eq!(lv.bpc_in_memory, Some(16));
+        assert_eq!(lv.bpc_significant, Some(14));
+    }
+
+    /// `parse_image_metadata_lv` must find `SLxExperiment` and correctly walk
+    /// a real (not name-padded-to-6-bytes) chunk layout: the outermost LV
+    /// entry's own 1-byte type tag, then directly its `nameLen`/name -
+    /// verified against a real v3 file's `ImageMetadataLV` chunk (which
+    /// yields z=23, t=1, order="Z", processed=true).
+    #[test]
+    fn nd2_image_metadata_lv_finds_experiment_after_type_tag_prefix() {
+        fn entry(ty: u8, name: &str, value: &[u8]) -> Vec<u8> {
+            let mut e = vec![ty, name.chars().count() as u8 + 1];
+            for u in name.encode_utf16() {
+                e.extend_from_slice(&u.to_le_bytes());
+            }
+            e.extend_from_slice(&0u16.to_le_bytes());
+            e.extend_from_slice(value);
+            e
+        }
+        // Outermost entry's own type tag (Level, matches parse_nd2_lv), then
+        // "SLxExperiment" (no value bytes - it's a marker for this scan),
+        // then eType=4 (Z) followed by uiCount=23.
+        let mut data = vec![0x0bu8];
+        data.extend_from_slice(&entry(11, "SLxExperiment", &[]));
+        data.extend_from_slice(&entry(2, "eType", &4i32.to_le_bytes()));
+        data.extend_from_slice(&entry(2, "uiCount", &23i32.to_le_bytes()));
+        data.extend_from_slice(&entry(2, "uiNextLevelCount", &0i32.to_le_bytes()));
+        data.resize(data.len() + 600, 0);
+
+        let result = parse_image_metadata_lv(&data).expect("some result");
+        assert!(result.processed, "must find SLxExperiment");
+        assert_eq!(result.order, "Z");
+        assert_eq!(result.z_count, 23);
+        assert_eq!(result.time_count, 1);
+    }
+
     #[test]
     fn nd2_binary_image_attributes_lossless_matches_java_flags() {
-        fn attr(name: &str, value: i32) -> Vec<u8> {
-            let mut out = vec![name.chars().count() as u8];
+        // Real LV record: [nameLen: name chars + 1][name UTF-16LE][NUL unit][value].
+        // `dCompressionParam` is an 8-byte double and `eCompression` a 4-byte
+        // int32 in the real format (verified against a real v3 ND2 file).
+        fn attr_f64(name: &str, value: f64) -> Vec<u8> {
+            let mut out = vec![(name.chars().count() + 1) as u8];
             for u in name.encode_utf16() {
                 out.extend_from_slice(&u.to_le_bytes());
             }
+            out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(&value.to_le_bytes());
             out
         }
+        fn attr_i32(name: &str, value: i32) -> Vec<u8> {
+            let mut out = vec![(name.chars().count() + 1) as u8];
+            for u in name.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
+            out
+        }
+        // Trailing padding so a resync attempt that misreads part of a value
+        // as a bogus name length doesn't run off the end of the buffer before
+        // it can recover: a single misread length byte can claim up to 255
+        // UTF-16 units (510 bytes) of "name", so headroom must exceed that -
+        // a real chunk has plenty of file left after these two fields, which
+        // this mirrors.
+        fn with_padding(mut data: Vec<u8>) -> Vec<u8> {
+            data.resize(data.len() + 600, 0);
+            data
+        }
 
-        // Java skips 6 bytes, consumes zero padding and one non-zero byte, then
-        // reads flat attribute records. dCompressionParam >= 0 is lossless only
-        // while eCompression <= 0 leaves canBeLossless true.
-        let mut data = vec![0; 6];
-        data.extend_from_slice(&[0, 0, 1]);
-        data.extend_from_slice(&attr("dCompressionParam", 0));
-        data.extend_from_slice(&attr("eCompression", 0));
+        // The chunk data starts with the outermost LV entry's own type-tag
+        // byte (see `parse_image_metadata_lv`'s doc comment), which this scan
+        // skips before reading the first record's nameLen.
+        //
+        // dCompressionParam >= 0 is lossless only while eCompression <= 0
+        // leaves canBeLossless true.
+        let mut data = vec![0x0bu8];
+        data.extend_from_slice(&attr_f64("dCompressionParam", 0.0));
+        data.extend_from_slice(&attr_i32("eCompression", 0));
+        let data = with_padding(data);
         let mut lv = Nd2LvValues::default();
         parse_nd2_binary_image_attributes(&data, &mut lv);
         assert!(lv.is_lossless);
 
-        let mut data = vec![0; 6];
-        data.extend_from_slice(&[0, 1]);
-        data.extend_from_slice(&attr("dCompressionParam", 5));
-        data.extend_from_slice(&attr("eCompression", 1));
+        let mut data = vec![0x0bu8];
+        data.extend_from_slice(&attr_f64("dCompressionParam", 5.0));
+        data.extend_from_slice(&attr_i32("eCompression", 1));
+        let data = with_padding(data);
         let mut lv = Nd2LvValues::default();
         parse_nd2_binary_image_attributes(&data, &mut lv);
         assert!(!lv.is_lossless);
