@@ -19,3 +19,5 @@ testdata/
 parity/target/
 .claude/
 zarrreader/
+/examples/java/
+/examples
