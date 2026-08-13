@@ -24,7 +24,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::{crop_full_plane, validate_region};
 
 /// ND2 file magic bytes.
 pub const ND2_MAGIC: [u8; 4] = [0xDA, 0xCE, 0xBE, 0x0A];
@@ -161,19 +161,25 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
         return Ok(None);
     }
 
+    // Pass 1: read the (small) map region sequentially into (name, position)
+    // pairs. Track the read position ourselves instead of querying it via
+    // `stream_position()` on every byte: that call forces a real
+    // `lseek(fd, 0, SEEK_CUR)` syscall each time, which turned scanning ~50
+    // chunk-map entries' names one byte at a time into well over a thousand
+    // syscalls (the dominant cost of `set_id` on a real multi-hundred-MB file).
     f.seek(SeekFrom::Start(entries_offset))?;
-    let mut chunks = Vec::new();
-    let mut image_count = 0usize;
-    let mut max_image_index: Option<usize> = None;
+    let mut raw_entries: Vec<(String, u64)> = Vec::new();
+    let mut pos = entries_offset;
 
-    while f.stream_position()? + 1 + 16 <= entries_end {
+    while pos + 1 + 16 <= entries_end {
         let mut name_bytes = Vec::new();
         loop {
-            if f.stream_position()? >= entries_end {
+            if pos >= entries_end {
                 return Ok(None);
             }
             let mut b = [0u8; 1];
             f.read_exact(&mut b)?;
+            pos += 1;
             if b[0] == b'!' {
                 break;
             }
@@ -188,10 +194,22 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
         let mut length_bytes = [0u8; 8];
         f.read_exact(&mut position_bytes)?;
         f.read_exact(&mut length_bytes)?;
+        pos += 16;
         let position = u64::from_le_bytes(position_bytes);
         let _length = u64::from_le_bytes(length_bytes);
-        let map_entry_offset = f.stream_position()?;
+        raw_entries.push((name, position));
+    }
 
+    // Pass 2: verify each claimed chunk position and read its real on-disk
+    // header (actual name length + actual data length) directly. Doing this
+    // as a separate pass - rather than interleaved with pass 1 above - avoids
+    // seeking away to each (widely scattered) chunk position and then seeking
+    // all the way back to resume the sequential map scan for every entry.
+    let mut chunks = Vec::with_capacity(raw_entries.len());
+    let mut image_count = 0usize;
+    let mut max_image_index: Option<usize> = None;
+
+    for (name, position) in raw_entries {
         if position + 16 > file_len {
             return Ok(None);
         }
@@ -212,7 +230,6 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
         if data_offset > file_len || data_offset + actual_data_len > file_len {
             return Ok(None);
         }
-        f.seek(SeekFrom::Start(map_entry_offset))?;
 
         if let Some(index) = image_data_index(&name) {
             image_count += 1;
@@ -231,20 +248,16 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
         }
     }
 
-    for chunk in chunks.iter().filter(|c| c.name.starts_with("ImageDataSeq")) {
-        let block_offset = chunk
-            .data_offset
-            .saturating_sub(16 + chunk.name.len() as u64);
-        if block_offset + 4 > file_len {
-            return Ok(None);
-        }
-        f.seek(SeekFrom::Start(block_offset))?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        if magic != ND2_MAGIC {
-            return Ok(None);
-        }
-    }
+    // Note: each chunk's magic bytes are already verified at `position` above
+    // (immediately after `f.seek(SeekFrom::Start(position))`), using the
+    // chunk's own on-disk name length (`actual_name_len`). A second
+    // re-verification here must NOT reconstruct that same offset from
+    // `chunk.name.len()` (the trimmed display name, e.g. "ImageDataSeq|9!" =
+    // 15 bytes) - the on-disk name field is NUL-padded and can be far larger
+    // (observed: 4072 bytes for that same chunk), so subtracting the trimmed
+    // length lands on an unrelated file offset, fails the magic check, and
+    // spuriously returns `None` - forcing every caller through the
+    // byte-by-byte `scan_chunks` fallback for the entire file.
 
     chunks.sort_by_key(|c| c.data_offset);
     Ok(Some(chunks))
@@ -1949,10 +1962,6 @@ fn nd2_chunk_table_payload_encoding(
     }
 }
 
-fn nd2_frame_payload_hint(data: &[u8], expected: usize) -> &'static str {
-    nd2_frame_payload_layout(data, data.len(), expected).0
-}
-
 fn nd2_frame_payload_layout(
     prefix: &[u8],
     total_len: usize,
@@ -2688,6 +2697,89 @@ impl Nd2Reader {
             )
         })
     }
+
+    /// Fast path for `open_bytes_region` on raw (uncompressed) frames: read
+    /// only the requested `[x,y)x[w,h)` window directly from disk instead of
+    /// materializing the entire plane. `open_bytes` reads the whole physical
+    /// chunk (tens of MB for a real acquisition frame) and then extracts one
+    /// channel via a per-pixel loop over every pixel in the image, which for
+    /// a small region request (e.g. one screen tile) reads and touches orders
+    /// of magnitude more data than the caller asked for. Returns `Ok(None)`
+    /// for anything this fast path doesn't handle (compressed/chunk-tabled
+    /// frames, the legacy whole-file JPEG2000 format), so the caller falls
+    /// back to the always-correct full-plane path.
+    fn nd2_windowed_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        if !self.old_jp2_planes.is_empty() {
+            return Ok(None);
+        }
+        let meta = self
+            .meta
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        validate_region("ND2", meta.size_x, meta.size_y, x, y, w, h)?;
+
+        let size_c = meta.size_c.max(1) as usize;
+        let channel = if size_c > 1 {
+            (plane_index % meta.size_c.max(1)) as usize
+        } else {
+            0
+        };
+        let chunk = self.normal_frame_chunk_for_plane(plane_index)?.clone();
+
+        let bps = meta.pixel_type.bytes_per_sample();
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        // Java ND2Reader.getScanlinePad(): one padding sample per row total
+        // when both sizeX and sizeC are odd (matches `open_bytes` above).
+        let scanline_pad = if meta.size_x % 2 != 0 && meta.size_c % 2 != 0 {
+            1
+        } else {
+            0
+        };
+        let stored_row = (size_x * size_c + scanline_pad) * bps;
+        let stored_expected = stored_row * size_y;
+
+        let f = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+        let prefix = read_chunk_prefix(f, &chunk, 8192).map_err(BioFormatsError::Io)?;
+        let (encoding, payload_offset) =
+            nd2_frame_payload_layout(&prefix, chunk.data_length as usize, stored_expected);
+        // Every "raw*" variant (a bare raw frame, or one preceded by a fixed
+        // 8-byte timestamp / 4096-byte Nikon prefix - `decode_nd2_frame_payload`
+        // handles the same variants by literally slicing `data[payload_offset..]`)
+        // is a plain row-major pixel buffer starting at `payload_offset` bytes
+        // into the chunk; only compressed/chunk-tabled encodings need a full
+        // decode; those fall back to the caller's slow, always-correct path.
+        if !encoding.starts_with("raw") {
+            return Ok(None);
+        }
+        let payload_start = chunk.data_offset + payload_offset as u64;
+
+        let row_span = w as usize * size_c * bps;
+        let start_x_bytes = x as usize * size_c * bps;
+        let mut out = Vec::with_capacity(h as usize * w as usize * bps);
+        let mut row_buf = vec![0u8; row_span];
+        for row in 0..h as usize {
+            let offset = payload_start + ((y as usize + row) * stored_row + start_x_bytes) as u64;
+            f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+            f.read_exact(&mut row_buf).map_err(BioFormatsError::Io)?;
+            for px in 0..w as usize {
+                let src = px * size_c * bps + channel * bps;
+                out.extend_from_slice(&row_buf[src..src + bps]);
+            }
+        }
+        Ok(Some(out))
+    }
 }
 
 impl Default for Nd2Reader {
@@ -2721,7 +2813,19 @@ impl FormatReader for Nd2Reader {
             return self.set_old_jp2_id(reader, path);
         }
 
-        let chunks = match read_chunk_map(&mut reader).map_err(BioFormatsError::Io)? {
+        let chunk_map_result = read_chunk_map(&mut reader).map_err(BioFormatsError::Io)?;
+        if std::env::var_os("ND2_DEBUG").is_some() {
+            // Whether `set_id` took the fast chunk-map path or fell back to
+            // `scan_chunks`'s byte-by-byte linear scan of the whole file (see
+            // `read_chunk_map`'s doc comment for why that fallback is orders
+            // of magnitude slower on real multi-hundred-MB acquisitions).
+            eprintln!(
+                "nd2 set_id: chunk_map={} ({:?} chunks)",
+                chunk_map_result.is_some(),
+                chunk_map_result.as_ref().map(|c| c.len())
+            );
+        }
+        let chunks = match chunk_map_result {
             Some(chunks) => chunks,
             None => scan_chunks(&mut reader).map_err(BioFormatsError::Io)?,
         };
@@ -3287,12 +3391,22 @@ impl FormatReader for Nd2Reader {
                 let first_chunk = &chunks[first_chunk_index];
                 let stored_expected =
                     stored_expected_for_nd2_frame(size_x, size_y, size_c, pixel_type);
-                if let Ok(data) = read_chunk_data(&mut reader, first_chunk) {
+                // Only a diagnostic hint string, not used for decoding - every
+                // check inside `nd2_frame_payload_layout` (raw/zlib/jpeg2000/
+                // chunk-table sniffing) looks no further than ~20KB into the
+                // payload, so reading the FULL chunk here (tens of MB for a
+                // real frame) to compute one metadata string made `set_id`
+                // materialize an entire pixel plane it never uses.
+                const HINT_PREFIX_LEN: usize = 65536;
+                if let Ok(prefix) = read_chunk_prefix(&mut reader, first_chunk, HINT_PREFIX_LEN) {
+                    let (encoding, _) = nd2_frame_payload_layout(
+                        &prefix,
+                        first_chunk.data_length as usize,
+                        stored_expected,
+                    );
                     series_metadata.insert(
                         "nd2_first_image_data_encoding".into(),
-                        MetadataValue::String(
-                            nd2_frame_payload_hint(&data, stored_expected).to_string(),
-                        ),
+                        MetadataValue::String(encoding.to_string()),
                     );
                 }
             }
@@ -3971,6 +4085,9 @@ impl FormatReader for Nd2Reader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        if let Some(region) = self.nd2_windowed_region(plane_index, x, y, w, h)? {
+            return Ok(region);
+        }
         let full = self.open_bytes(plane_index)?;
         let meta = self.metadata();
         // `open_bytes` already extracts a single channel's plane when
@@ -4291,6 +4408,73 @@ impl FormatReader for Nd2Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_nd2_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_nd2_{label}_{nanos}.nd2"))
+    }
+
+    /// Real Nikon ND2 files pad each chunk's on-disk name field with trailing
+    /// NULs far beyond the trimmed display name (observed: a 15-byte
+    /// "ImageDataSeq|9!" name stored in a 4072-byte field). `read_chunk_map`
+    /// must use each chunk's own on-disk name length (read directly from its
+    /// header) to locate it - not the trimmed display name's length - or the
+    /// chunk-map fast path spuriously fails and `set_id` falls back to
+    /// scanning the entire file byte-by-byte via `scan_chunks`.
+    #[test]
+    fn read_chunk_map_handles_padded_chunk_names() {
+        const CHUNK_MAP_SIGNATURE: &[u8] = b"ND2 CHUNK MAP SIGNATURE 0000001";
+
+        let chunk_data = [0xAAu8; 16];
+        let padded_name_len: u32 = 64;
+        let trimmed_name = b"ImageDataSeq|0!";
+
+        // The ImageDataSeq chunk itself, at file offset 0, with a name field
+        // far longer than the trimmed display name.
+        let mut file = Vec::new();
+        file.extend_from_slice(&ND2_MAGIC);
+        file.extend_from_slice(&padded_name_len.to_le_bytes());
+        file.extend_from_slice(&(chunk_data.len() as u64).to_le_bytes());
+        let mut name_field = vec![0u8; padded_name_len as usize];
+        name_field[..trimmed_name.len()].copy_from_slice(trimmed_name);
+        file.extend_from_slice(&name_field);
+        file.extend_from_slice(&chunk_data);
+
+        // The chunk map: one entry pointing back at the chunk above.
+        let map_chunk_offset = file.len() as u64;
+        let mut entries = Vec::new();
+        entries.extend_from_slice(b"ImageDataSeq|0");
+        entries.push(b'!');
+        entries.extend_from_slice(&0u64.to_le_bytes()); // position of the chunk
+        entries.extend_from_slice(&(chunk_data.len() as u64).to_le_bytes()); // declared length
+        file.extend_from_slice(&ND2_MAGIC);
+        file.extend_from_slice(&0u32.to_le_bytes()); // map chunk's own name length
+        file.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        file.extend_from_slice(&entries);
+
+        // Footer: signature + 1 skip byte + map chunk offset.
+        file.extend_from_slice(CHUNK_MAP_SIGNATURE);
+        file.push(0);
+        file.extend_from_slice(&map_chunk_offset.to_le_bytes());
+
+        let path = temp_nd2_path("padded_names");
+        std::fs::write(&path, &file).unwrap();
+
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        let chunks = read_chunk_map(&mut reader)
+            .unwrap()
+            .expect("chunk map must parse despite the padded name field");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].name, "ImageDataSeq|0!");
+        assert_eq!(chunks[0].data_offset, 16 + padded_name_len as u64);
+        assert_eq!(chunks[0].data_length, chunk_data.len() as u64);
+
+        let _ = std::fs::remove_file(path);
+    }
 
     fn chunk_table_frame(ranges: &[(u32, &[u8])]) -> Vec<u8> {
         let mut frame = Vec::new();
