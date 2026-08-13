@@ -802,6 +802,15 @@ impl VectraReader {
     }
 
     fn current_ifd_indices(&self) -> Vec<usize> {
+        if self.inner.series() == 0 && self.inner.resolution() > 0 {
+            return self
+                .inner
+                .series_list()
+                .first()
+                .and_then(|s| s.sub_resolutions.get(self.inner.resolution() - 1))
+                .cloned()
+                .unwrap_or_default();
+        }
         self.plane_ifds
             .get(self.inner.series())
             .cloned()
@@ -857,8 +866,8 @@ impl VectraReader {
         let Some(template) = self.inner.series_list().first().cloned() else {
             return;
         };
-        let mut series = Vec::with_capacity(core_size);
-        let mut all_plane_ifds = Vec::with_capacity(core_size);
+        let mut flattened = Vec::with_capacity(core_size);
+        let mut flattened_plane_ifds = Vec::with_capacity(core_size);
         for core_index in 0..core_size {
             let plane_ifds = qptiff_plane_ifds(core_index, size_c, pyramid_depth, ifd_count);
             let Some(&first_ifd_index) = plane_ifds.first() else {
@@ -891,7 +900,11 @@ impl VectraReader {
             meta.is_interleaved = false;
             meta.is_little_endian = true;
             meta.dimension_order = DimensionOrder::XYCZT;
-            meta.resolution_count = 1;
+            meta.resolution_count = if core_index == 0 {
+                pyramid_depth as u32
+            } else {
+                1
+            };
             meta.series_metadata.insert(
                 "image_name".to_string(),
                 MetadataValue::String(qptiff_image_name(core_index, pyramid_depth, ifd_count)),
@@ -918,12 +931,33 @@ impl VectraReader {
             s.plane_ifd_indices = plane_ifds.iter().copied().map(Some).collect();
             s.sub_resolutions = Vec::new();
             s.metadata = meta;
-            series.push(s);
-            all_plane_ifds.push(plane_ifds);
+            flattened.push(s);
+            flattened_plane_ifds.push(plane_ifds);
         }
-        if !series.is_empty() {
-            self.inner.replace_series(series);
-            self.plane_ifds = all_plane_ifds;
+        if !flattened.is_empty() {
+            let mut nested = Vec::new();
+            let mut nested_plane_ifds = Vec::new();
+            let mut pyramid = flattened[0].clone();
+            pyramid.sub_resolutions = flattened_plane_ifds
+                .iter()
+                .take(pyramid_depth)
+                .skip(1)
+                .cloned()
+                .collect();
+            pyramid.metadata.resolution_count = pyramid_depth as u32;
+            nested_plane_ifds.push(flattened_plane_ifds[0].clone());
+            nested.push(pyramid);
+
+            for core_index in pyramid_depth..flattened.len() {
+                let mut s = flattened[core_index].clone();
+                s.sub_resolutions = Vec::new();
+                s.metadata.resolution_count = 1;
+                nested_plane_ifds.push(flattened_plane_ifds[core_index].clone());
+                nested.push(s);
+            }
+
+            self.inner.replace_series(nested);
+            self.plane_ifds = nested_plane_ifds;
         }
     }
 
@@ -980,7 +1014,204 @@ fn qptiff_xml_text(xml: &str, tag: &str) -> Option<String> {
 fn qptiff_channel_name(ifd: &crate::tiff::ifd::Ifd) -> Option<String> {
     ifd.get(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
         .and_then(|value| value.as_str())
-        .and_then(|xml| qptiff_xml_text(xml, "Name"))
+        .and_then(|xml| qptiff_xml_text(xml, "Biomarker").or_else(|| qptiff_xml_text(xml, "Name")))
+}
+
+#[cfg(test)]
+mod qptiff_tests {
+    use super::*;
+    use crate::common::reader::FormatReader;
+    use crate::tiff::ifd::{tag, Ifd, IfdValue};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str, ext: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bioformats_qptiff_{name}_{}_{}.{}",
+            std::process::id(),
+            unique,
+            ext
+        ))
+    }
+
+    fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&typ.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value.to_le_bytes());
+        entry
+    }
+
+    fn push_entry(out: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tiff_entry(tag, typ, count, value));
+    }
+
+    fn write_qptiff_two_channel_pyramid(path: &Path) {
+        let mut software = b"PerkinElmer-QPI".to_vec();
+        software.push(0);
+        let descriptions: Vec<Vec<u8>> = ["<Biomarker>C0</Biomarker>", "<Biomarker>C1</Biomarker>"]
+            .into_iter()
+            .map(|s| {
+                let mut v = s.as_bytes().to_vec();
+                v.push(0);
+                v
+            })
+            .collect();
+
+        let ifd_count = 5usize;
+        let entries = 13u32;
+        let ifd_size = 2 + entries * 12 + 4;
+        let ifd_offsets: Vec<u32> = (0..ifd_count).map(|i| 8 + i as u32 * ifd_size).collect();
+        let software_offset = ifd_offsets[ifd_count - 1] + ifd_size;
+        let desc0_offset = software_offset + software.len() as u32;
+        let desc1_offset = desc0_offset + descriptions[0].len() as u32;
+        let pixel0 = desc1_offset + descriptions[1].len() as u32;
+        let pixel1 = pixel0 + 4;
+        let pixel2 = pixel1 + 4;
+        let pixel3 = pixel2 + 1;
+        let pixel4 = pixel3 + 1;
+
+        let specs = [
+            (
+                2u32,
+                2u32,
+                4u32,
+                pixel0,
+                desc0_offset,
+                descriptions[0].len() as u32,
+                0u32,
+            ),
+            (
+                2,
+                2,
+                4,
+                pixel1,
+                desc1_offset,
+                descriptions[1].len() as u32,
+                0,
+            ),
+            (1, 1, 1, pixel2, 0, 1, 0),
+            (
+                1,
+                1,
+                1,
+                pixel3,
+                desc0_offset,
+                descriptions[0].len() as u32,
+                1,
+            ),
+            (
+                1,
+                1,
+                1,
+                pixel4,
+                desc1_offset,
+                descriptions[1].len() as u32,
+                1,
+            ),
+        ];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_offsets[0].to_le_bytes());
+        for (i, (w, h, byte_count, pixel_offset, desc_offset, desc_len, subfile)) in
+            specs.iter().enumerate()
+        {
+            bytes.extend_from_slice(&(entries as u16).to_le_bytes());
+            push_entry(&mut bytes, 254, 4, 1, *subfile);
+            push_entry(&mut bytes, 256, 4, 1, *w);
+            push_entry(&mut bytes, 257, 4, 1, *h);
+            push_entry(&mut bytes, 258, 3, 1, 8);
+            push_entry(&mut bytes, 259, 3, 1, 1);
+            push_entry(&mut bytes, 262, 3, 1, 1);
+            push_entry(&mut bytes, 270, 2, *desc_len, *desc_offset);
+            push_entry(&mut bytes, 273, 4, 1, *pixel_offset);
+            push_entry(&mut bytes, 277, 3, 1, 1);
+            push_entry(&mut bytes, 278, 4, 1, *h);
+            push_entry(&mut bytes, 279, 4, 1, *byte_count);
+            push_entry(&mut bytes, 284, 3, 1, 1);
+            push_entry(
+                &mut bytes,
+                305,
+                2,
+                if i == 0 { software.len() as u32 } else { 1 },
+                if i == 0 { software_offset } else { 0 },
+            );
+            let next = if i + 1 < ifd_count {
+                ifd_offsets[i + 1]
+            } else {
+                0
+            };
+            bytes.extend_from_slice(&next.to_le_bytes());
+        }
+        bytes.extend_from_slice(&software);
+        bytes.extend_from_slice(&descriptions[0]);
+        bytes.extend_from_slice(&descriptions[1]);
+        bytes.extend_from_slice(&[10, 11, 12, 13]);
+        bytes.extend_from_slice(&[20, 21, 22, 23]);
+        bytes.push(30);
+        bytes.push(40);
+        bytes.push(50);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn qptiff_channel_name_prefers_biomarker_like_java() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            tag::IMAGE_DESCRIPTION,
+            IfdValue::Ascii("<Name>Opal 520</Name><Biomarker>CD3</Biomarker>".to_string()),
+        );
+        let ifd = Ifd { entries };
+
+        assert_eq!(qptiff_channel_name(&ifd).as_deref(), Some("CD3"));
+    }
+
+    #[test]
+    fn qptiff_channel_name_falls_back_to_name_without_biomarker() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            tag::IMAGE_DESCRIPTION,
+            IfdValue::Ascii("<Name>Opal 520</Name>".to_string()),
+        );
+        let ifd = Ifd { entries };
+
+        assert_eq!(qptiff_channel_name(&ifd).as_deref(), Some("Opal 520"));
+    }
+
+    #[test]
+    fn qptiff_pyramid_levels_are_nested_resolutions_like_java_non_flattened() {
+        let path = temp_path("nested", "qptiff");
+        write_qptiff_two_channel_pyramid(&path);
+
+        let mut reader = VectraReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.metadata().resolution_count, 2);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 11, 12, 13]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![20, 21, 22, 23]);
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![40]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![50]);
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![30]);
+
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn qptiff_plane_ifds(
@@ -1567,6 +1798,18 @@ impl FormatReader for VectraReader {
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.inner.series() == 0
+            && self.pyramid_depth > 1
+            && self.inner.resolution() < self.pyramid_depth - 1
+        {
+            let original_resolution = self.inner.resolution();
+            self.inner.set_resolution(self.pyramid_depth - 1)?;
+            let result = self.inner.open_bytes(p);
+            self.inner.set_resolution(original_resolution)?;
+            self.current_resolution = original_resolution;
+            self.refresh_metadata();
+            return result;
+        }
         self.inner.open_thumb_bytes(p)
     }
 
@@ -9532,7 +9775,13 @@ fn cellomics_metadata_string(
 
 fn cellomics_ome_color(value: i64) -> Option<i32> {
     if (0..=0x00ff_ffff).contains(&value) {
-        let rgba = ((value as u32) << 8) | 0xff;
+        // Java CellomicsReader parses MDB CompositeColor as BGR:
+        // blue = value >> 16, green = value >> 8, red = value.
+        let raw = value as u32;
+        let blue = (raw >> 16) & 0xff;
+        let green = (raw >> 8) & 0xff;
+        let red = raw & 0xff;
+        let rgba = (red << 24) | (green << 16) | (blue << 8) | 0xff;
         Some(rgba as i32)
     } else if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
         Some(value as i32)
@@ -10132,8 +10381,8 @@ mod cellomics_mdb_tests {
     }
 
     #[test]
-    fn cellomics_ome_color_packs_rgb_with_opaque_alpha() {
-        assert_eq!(cellomics_ome_color(0x336699), Some(0x336699ff));
+    fn cellomics_ome_color_converts_java_bgr_with_opaque_alpha() {
+        assert_eq!(cellomics_ome_color(0x336699), Some(0x996633ffu32 as i32));
     }
 
     #[test]
@@ -10966,6 +11215,7 @@ pub struct YokogawaReader {
     /// Physical pixel size (X, Y) in micrometres from the first channel, if any.
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
+    channel_names: Vec<String>,
 }
 
 #[derive(Default, Clone)]
@@ -10993,6 +11243,7 @@ struct YokogawaChannel {
     index: i32,
     action_index: i32,
     timeline_index: i32,
+    camera_number: i32,
     x_size: Option<f64>,
     y_size: Option<f64>,
 }
@@ -11011,6 +11262,7 @@ impl YokogawaReader {
             fields: 1,
             physical_size_x: None,
             physical_size_y: None,
+            channel_names: Vec::new(),
         }
     }
 }
@@ -11199,6 +11451,8 @@ fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
                         index: (yk_attr_int(e, reader.decoder(), "bts:Ch").unwrap_or(1) - 1) as i32,
                         action_index: 0,
                         timeline_index: 0,
+                        camera_number: yk_attr_int(e, reader.decoder(), "bts:CameraNumber")
+                            .unwrap_or(0) as i32,
                         x_size: yk_attr_f64(e, reader.decoder(), "bts:HorizontalPixelDimension"),
                         y_size: yk_attr_f64(e, reader.decoder(), "bts:VerticalPixelDimension"),
                     });
@@ -11314,6 +11568,16 @@ impl YokogawaReader {
         let mut channel_indexes: Vec<i32> = unique_channels.into_iter().collect();
         channel_indexes.sort_unstable();
         let n_channels = channel_indexes.len().max(1) as u32;
+        let mut channel_names = Vec::with_capacity(channel_indexes.len());
+        for channel_index in &channel_indexes {
+            let plane = planes
+                .iter()
+                .find(|p| yk_channel_index(p, &channels) == *channel_index);
+            let name = plane
+                .and_then(|p| yk_lookup_channel(p, &channels).map(|ch| yk_channel_name(p, ch)))
+                .unwrap_or_else(|| format!("Channel #{}", channel_index + 1));
+            channel_names.push(name);
+        }
 
         let real_wells = wells.len();
         let series_count = real_wells * fields;
@@ -11420,6 +11684,7 @@ impl YokogawaReader {
         self.fields = fields;
         self.physical_size_x = channels.first().and_then(|c| c.x_size).filter(|&v| v > 0.0);
         self.physical_size_y = channels.first().and_then(|c| c.y_size).filter(|&v| v > 0.0);
+        self.channel_names = channel_names;
         self.current_series = 0;
         Ok(())
     }
@@ -11448,6 +11713,26 @@ fn yk_channel_index(p: &YokogawaPlane, channels: &[YokogawaChannel]) -> i32 {
     } else {
         index
     }
+}
+
+fn yk_lookup_channel<'a>(
+    p: &YokogawaPlane,
+    channels: &'a [YokogawaChannel],
+) -> Option<&'a YokogawaChannel> {
+    channels.iter().find(|ch| {
+        ch.index == p.channel
+            && ch.timeline_index == p.timeline_index
+            && ch.action_index == p.action_index
+    })
+}
+
+fn yk_channel_name(p: &YokogawaPlane, channel: &YokogawaChannel) -> String {
+    format!(
+        "Action #{}, Channel #{}, Camera #{}",
+        p.action_index + 1,
+        channel.index + 1,
+        channel.camera_number
+    )
 }
 
 impl FormatReader for YokogawaReader {
@@ -11484,6 +11769,7 @@ impl FormatReader for YokogawaReader {
         self.fields = 1;
         self.physical_size_x = None;
         self.physical_size_y = None;
+        self.channel_names.clear();
         self.current_series = 0;
         if self.tiff_loaded {
             let _ = self.inner.close();
@@ -11597,6 +11883,15 @@ impl FormatReader for YokogawaReader {
                 name: Some(name),
                 physical_size_x: self.physical_size_x,
                 physical_size_y: self.physical_size_y,
+                channels: self
+                    .channel_names
+                    .iter()
+                    .map(|name| OmeChannel {
+                        name: Some(name.clone()),
+                        samples_per_pixel: 1,
+                        ..Default::default()
+                    })
+                    .collect(),
                 ..Default::default()
             });
         }
@@ -11654,6 +11949,71 @@ fn yk_row_name(row: u32) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod yokogawa_tests {
+    use super::*;
+
+    #[test]
+    fn cv7000_ome_metadata_projects_channel_names_like_java() {
+        let mut reader = YokogawaReader::new();
+        reader.series = vec![ImageMetadata {
+            size_x: 2,
+            size_y: 2,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            is_little_endian: true,
+            ..Default::default()
+        }];
+        reader.series_well_field = vec![(0, 0)];
+        reader.wells = vec![(0, 0)];
+        reader.fields = 1;
+        reader.plate = YokogawaPlate {
+            name: Some("Plate".to_string()),
+            rows: 1,
+            columns: 1,
+        };
+        reader.channel_names = vec!["Action #1, Channel #2, Camera #3".to_string()];
+
+        let ome = reader.ome_metadata().unwrap();
+
+        assert_eq!(
+            ome.images[0].channels[0].name.as_deref(),
+            Some("Action #1, Channel #2, Camera #3")
+        );
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 1);
+    }
+
+    #[test]
+    fn cv7000_channel_name_uses_original_channel_index_and_camera_like_java() {
+        let plane = YokogawaPlane {
+            row: 0,
+            column: 0,
+            field: 0,
+            z: 0,
+            channel: 1,
+            timepoint: 0,
+            action_index: 0,
+            timeline_index: 0,
+            file: None,
+        };
+        let channel = YokogawaChannel {
+            index: 1,
+            camera_number: 3,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            yk_channel_name(&plane, &channel),
+            "Action #1, Channel #2, Camera #3"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

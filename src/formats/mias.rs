@@ -6,14 +6,19 @@
 //! - FeiSerReader: FEI SER electron-microscopy series (.ser)
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::ome_metadata::{
+    create_lsid, OmeDetector, OmeInstrument, OmeMetadata, OmePlate, OmeROI, OmeWell, OmeWellSample,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
+use crate::tiff::ifd::{tag, Ifd};
+use crate::tiff::parser::TiffParser;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -93,6 +98,7 @@ pub struct CellWorxReader {
     subdirectories: bool,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded: bool,
+    ome_template: Option<OmeMetadata>,
 }
 
 impl CellWorxReader {
@@ -113,6 +119,7 @@ impl CellWorxReader {
             subdirectories: false,
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded: false,
+            ome_template: None,
         }
     }
 
@@ -288,6 +295,7 @@ impl CellWorxReader {
         })?;
 
         self.tiff_reader.set_id(&probe)?;
+        let ome_template = cellworx_companion_ome_template(&probe);
         let tm = self.tiff_reader.metadata();
         let size_x = tm.size_x;
         let size_y = tm.size_y;
@@ -345,7 +353,15 @@ impl CellWorxReader {
             // metadata (Java parseWellLogFile -> addSeriesMeta). The log file is
             // "<plate><well>_scan.log".
             let well_log = PathBuf::from(format!("{}{}_scan.log", plate, well_name(row, col)));
-            parse_well_log(&well_log, &mut md);
+            parse_cellworx_well_log_structured(&well_log, &mut md, size_x, size_y, image_count);
+            for (i, w) in info.wavelengths.iter().enumerate() {
+                if let Some(name) = w {
+                    md.insert(
+                        format!("channel.{i}.name"),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+            }
             series.push(ImageMetadata {
                 size_x,
                 size_y,
@@ -373,6 +389,7 @@ impl CellWorxReader {
         self.series = series;
         self.current_series = 0;
         self.tiff_loaded = false;
+        self.ome_template = ome_template;
         Ok(())
     }
 
@@ -730,6 +747,173 @@ fn parse_well_log(log_file: &Path, md: &mut HashMap<String, MetadataValue>) {
     }
 }
 
+fn parse_cellworx_well_log_structured(
+    log_file: &Path,
+    md: &mut HashMap<String, MetadataValue>,
+    size_x: u32,
+    size_y: u32,
+    image_count: u32,
+) {
+    parse_well_log(log_file, md);
+
+    if let Some(date) = metadata_string(md, "Date") {
+        md.insert(
+            "acquisition_date".into(),
+            MetadataValue::String(date.clone()),
+        );
+        if let Some(iso) = cellworx_date_to_iso8601(&date) {
+            md.insert(
+                "acquisition_datetime_iso8601".into(),
+                MetadataValue::String(iso),
+            );
+        }
+    }
+
+    if let Some(origin) = metadata_string(md, "Scan Origin") {
+        let axes: Vec<&str> = origin.split(',').collect();
+        if axes.len() >= 2 {
+            if let (Some(x), Some(y)) = (parse_f64(axes[0]), parse_f64(axes[1])) {
+                md.insert("WellSamplePositionX".into(), MetadataValue::Float(x));
+                md.insert("WellSamplePositionY".into(), MetadataValue::Float(y));
+                for plane in 0..image_count {
+                    md.insert(format!("plane.{plane}.position_x"), MetadataValue::Float(x));
+                    md.insert(format!("plane.{plane}.position_y"), MetadataValue::Float(y));
+                }
+            }
+        }
+    }
+
+    if let Some(area) = metadata_string(md, "Scan Area") {
+        if let Some((scan_x, scan_y)) = parse_cellworx_scan_area(&area) {
+            if size_x > 0 {
+                md.insert(
+                    "PhysicalSizeX".into(),
+                    MetadataValue::Float(scan_x / size_x as f64),
+                );
+                md.insert(
+                    "physical_size_x".into(),
+                    MetadataValue::Float(scan_x / size_x as f64),
+                );
+            }
+            if size_y > 0 {
+                md.insert(
+                    "PhysicalSizeY".into(),
+                    MetadataValue::Float(scan_y / size_y as f64),
+                );
+                md.insert(
+                    "physical_size_y".into(),
+                    MetadataValue::Float(scan_y / size_y as f64),
+                );
+            }
+        }
+    }
+
+    let channel_lines: Vec<(String, String)> = md
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("Channel ")
+                .and_then(|_| metadata_value_string(value))
+                .map(|v| (key.clone(), v))
+        })
+        .collect();
+    for (key, value) in channel_lines {
+        let Some(channel_index) = cellworx_channel_index(&key) else {
+            continue;
+        };
+        for token in value.split(',').map(str::trim) {
+            if let Some(gain) = token.strip_prefix("gain ").and_then(parse_f64) {
+                md.insert(
+                    format!("channel.{channel_index}.detector_settings_gain"),
+                    MetadataValue::Float(gain),
+                );
+                md.insert(
+                    format!("channel.{channel_index}.detector_ref"),
+                    MetadataValue::String("Detector:0:0".into()),
+                );
+                md.entry("detector.0.gain".into())
+                    .or_insert(MetadataValue::Float(gain));
+            } else if token.starts_with("EX") {
+                if let Some((ex, em)) = parse_cellworx_ex_em(token) {
+                    md.insert(
+                        format!("channel.{channel_index}.excitation_wavelength"),
+                        MetadataValue::Float(ex),
+                    );
+                    md.insert(
+                        format!("channel.{channel_index}.emission_wavelength"),
+                        MetadataValue::Float(em),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn metadata_string(md: &HashMap<String, MetadataValue>, key: &str) -> Option<String> {
+    md.get(key).and_then(metadata_value_string)
+}
+
+fn metadata_value_string(value: &MetadataValue) -> Option<String> {
+    match value {
+        MetadataValue::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    }
+}
+
+fn parse_f64(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+fn parse_cellworx_scan_area(value: &str) -> Option<(f64, f64)> {
+    let (x, rest) = value.split_once('x')?;
+    let y = rest.split_whitespace().next()?;
+    Some((parse_f64(x)?, parse_f64(y)?))
+}
+
+fn parse_cellworx_ex_em(token: &str) -> Option<(f64, f64)> {
+    let (ex, em) = token.split_once('/')?;
+    let ex = ex.split_whitespace().last()?;
+    let em = em
+        .split_whitespace()
+        .nth(1)
+        .or_else(|| em.split_whitespace().next())?;
+    Some((parse_f64(ex)?, parse_f64(em)?))
+}
+
+fn cellworx_channel_index(key: &str) -> Option<usize> {
+    let rest = key.strip_prefix("Channel ")?;
+    let index = rest.split_whitespace().next()?.parse::<usize>().ok()?;
+    index.checked_sub(1)
+}
+
+fn cellworx_date_to_iso8601(value: &str) -> Option<String> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let month = match parts[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day = parts[2].parse::<u32>().ok()?;
+    let time = parts[3];
+    if time.split(':').count() != 3 {
+        return None;
+    }
+    let year = parts[4].parse::<u32>().ok()?;
+    Some(format!("{year:04}-{month:02}-{day:02}T{time}"))
+}
+
 /// Z coordinate of a plane index under an `XYCZT` dimension order.
 fn z_coord(meta: &ImageMetadata, no: u32) -> u32 {
     let sc = meta.size_c.max(1);
@@ -746,6 +930,390 @@ fn zct_coords(meta: &ImageMetadata, no: u32) -> (u32, u32, u32) {
     let z = (no / sc) % sz;
     let t = no / (sc * sz);
     (z, c, t)
+}
+
+fn enrich_ome_from_series_metadata(ome: &mut OmeMetadata, meta: &ImageMetadata) {
+    if let Some(image) = ome.images.get_mut(0) {
+        if let Some(v) =
+            metadata_f64_any(&meta.series_metadata, &["physical_size_x", "PhysicalSizeX"])
+        {
+            image.physical_size_x = Some(v);
+        }
+        if let Some(v) =
+            metadata_f64_any(&meta.series_metadata, &["physical_size_y", "PhysicalSizeY"])
+        {
+            image.physical_size_y = Some(v);
+        }
+        for (channel_index, channel) in image.channels.iter_mut().enumerate() {
+            let prefix = format!("channel.{channel_index}");
+            if let Some(gain) = metadata_f64_any(
+                &meta.series_metadata,
+                &[&format!("{prefix}.detector_settings_gain")],
+            ) {
+                channel.detector_settings_gain = Some(gain);
+                channel.detector_ref = Some("Detector:0:0".into());
+            }
+            if let Some(detector) =
+                metadata_string_any(&meta.series_metadata, &[&format!("{prefix}.detector_ref")])
+            {
+                channel.detector_ref = Some(detector);
+            }
+            if let Some(color) =
+                metadata_i32_any(&meta.series_metadata, &[&format!("{prefix}.color")])
+            {
+                channel.color = Some(color);
+            }
+        }
+    }
+}
+
+fn ome_from_all_mias_series(series: &[ImageMetadata]) -> OmeMetadata {
+    let mut ome = OmeMetadata::default();
+    let mut roi_index = 0usize;
+    for meta in series {
+        let mut image_ome = OmeMetadata::from_image_metadata(meta);
+        enrich_ome_from_series_metadata(&mut image_ome, meta);
+        offset_image_roi_refs(&mut image_ome.images, roi_index);
+        ome.images.extend(image_ome.images);
+        for mut roi in image_ome.rois {
+            renumber_roi(&mut roi, roi_index);
+            roi_index += 1;
+            ome.rois.push(roi);
+        }
+        if ome.instruments.is_empty() {
+            ome.instruments = image_ome.instruments;
+        }
+        if ome.experimenters.is_empty() {
+            ome.experimenters = image_ome.experimenters;
+        }
+        if ome.annotations.is_empty() {
+            ome.annotations = image_ome.annotations;
+        }
+    }
+    ome
+}
+
+fn offset_image_roi_refs(images: &mut [crate::common::ome_metadata::OmeImage], offset: usize) {
+    if offset == 0 {
+        return;
+    }
+    for image in images {
+        for roi_ref in &mut image.roi_refs {
+            if let Some(index) = roi_ref
+                .strip_prefix("ROI:")
+                .and_then(|index| index.parse::<usize>().ok())
+            {
+                *roi_ref = create_lsid("ROI", &[offset + index]);
+            }
+        }
+    }
+}
+
+fn renumber_roi(roi: &mut OmeROI, index: usize) {
+    roi.id = Some(create_lsid("ROI", &[index]));
+}
+
+fn cellworx_plate_name(htd_path: Option<&Path>) -> Option<String> {
+    let stem = htd_path?.file_stem()?.to_str()?;
+    Some(stem.to_string())
+}
+
+fn add_cellworx_spw_metadata(ome: &mut OmeMetadata, reader: &CellWorxReader) {
+    if reader.well_files.is_empty() || reader.field_count == 0 {
+        return;
+    }
+    let rows = reader.well_files.len();
+    let cols = reader.well_files.first().map(|r| r.len()).unwrap_or(0);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+
+    let mut wells = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        for col in 0..cols {
+            let well_index = row * cols + col;
+            let mut well_samples = Vec::new();
+            if reader.well_files[row][col].is_some() {
+                if let Some(selected_index) = reader
+                    .selected_wells
+                    .iter()
+                    .position(|&(r, c)| r == row && c == col)
+                {
+                    for field in 0..reader.field_count {
+                        let image_index = selected_index * reader.field_count + field;
+                        if image_index >= ome.images.len() {
+                            continue;
+                        }
+                        let (position_x, position_y) = reader
+                            .series
+                            .get(image_index)
+                            .map(|meta| {
+                                (
+                                    metadata_f64_any(
+                                        &meta.series_metadata,
+                                        &["WellSamplePositionX"],
+                                    ),
+                                    metadata_f64_any(
+                                        &meta.series_metadata,
+                                        &["WellSamplePositionY"],
+                                    ),
+                                )
+                            })
+                            .unwrap_or((None, None));
+                        well_samples.push(OmeWellSample {
+                            id: Some(create_lsid("WellSample", &[0, well_index, field])),
+                            index: image_index as u32,
+                            image_ref: Some(image_index),
+                            position_x,
+                            position_y,
+                        });
+                        if let Some(image) = ome.images.get_mut(image_index) {
+                            image.name =
+                                Some(format!("Well {} Field #{}", well_name(row, col), field + 1));
+                        }
+                    }
+                }
+            }
+            wells.push(OmeWell {
+                id: Some(create_lsid("Well", &[0, well_index])),
+                row: row as u32,
+                column: col as u32,
+                well_samples,
+            });
+        }
+    }
+
+    ome.plates.push(OmePlate {
+        id: Some(create_lsid("Plate", &[0])),
+        name: cellworx_plate_name(reader.htd_path.as_deref()),
+        rows: rows as u32,
+        columns: cols as u32,
+        wells,
+    });
+}
+
+fn add_cellworx_populated_planes(ome: &mut OmeMetadata, series: &[ImageMetadata]) {
+    for (image, meta) in ome.images.iter_mut().zip(series) {
+        if !image.planes.is_empty() {
+            continue;
+        }
+        for plane_index in 0..meta.image_count {
+            let (the_z, the_c, the_t) = zct_coords(meta, plane_index);
+            image.planes.push(crate::common::ome_metadata::OmePlane {
+                the_z,
+                the_c,
+                the_t,
+                delta_t: None,
+                exposure_time: None,
+                position_x: None,
+                position_y: None,
+                position_z: None,
+            });
+        }
+    }
+}
+
+fn cellworx_companion_ome_template(path: &Path) -> Option<OmeMetadata> {
+    let mut metamorph = crate::formats::metamorph::MetamorphReader::new();
+    if metamorph.set_id(path).is_ok() {
+        if let Some(ome) = metamorph.ome_metadata() {
+            return Some(ome);
+        }
+    }
+    crate::registry::ImageReader::open(path)
+        .ok()
+        .and_then(|reader| reader.ome_metadata())
+}
+
+fn add_cellworx_template_metadata(ome: &mut OmeMetadata, template: Option<&OmeMetadata>) {
+    let template_image = template.and_then(|template| template.images.first());
+    for image in &mut ome.images {
+        if let Some(template) = template_image {
+            if image.physical_size_x.is_none() {
+                image.physical_size_x = template.physical_size_x;
+            }
+            if image.physical_size_y.is_none() {
+                image.physical_size_y = template.physical_size_y;
+            }
+            if image.physical_size_z.is_none() {
+                image.physical_size_z = template.physical_size_z;
+            }
+            if image.time_increment.is_none() {
+                image.time_increment = template.time_increment;
+            }
+            for (channel, template_channel) in
+                image.channels.iter_mut().zip(template.channels.iter())
+            {
+                if channel.detector_ref.is_none() {
+                    channel.detector_ref = template_channel.detector_ref.clone();
+                }
+                if channel.detector_settings_gain.is_none() {
+                    channel.detector_settings_gain = template_channel.detector_settings_gain;
+                }
+                if channel.detector_settings_binning.is_none() {
+                    channel.detector_settings_binning =
+                        template_channel.detector_settings_binning.clone();
+                }
+                if channel.detector_settings_offset.is_none() {
+                    channel.detector_settings_offset = template_channel.detector_settings_offset;
+                }
+            }
+        }
+        if image.instrument_ref.is_none() {
+            image.instrument_ref = Some(0);
+        }
+    }
+
+    if let Some(template) = template {
+        if !template.instruments.is_empty() {
+            ome.instruments = template.instruments.clone();
+        }
+    }
+    if ome.instruments.is_empty() {
+        ome.instruments.push(OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            detectors: vec![OmeDetector {
+                id: Some(create_lsid("Detector", &[0, 0])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+}
+
+fn mias_well_columns(n_wells: usize, wells: &[MiasWell]) -> u32 {
+    if n_wells == 96 {
+        12
+    } else if n_wells == 384 {
+        24
+    } else {
+        let max_col = wells
+            .iter()
+            .map(|well| ((well.well_number.max(0) as u32) % 24) + 1)
+            .max()
+            .unwrap_or(1);
+        max_col.max(24)
+    }
+}
+
+fn add_mias_spw_metadata(ome: &mut OmeMetadata, reader: &MiasReader) {
+    if reader.wells.is_empty() {
+        return;
+    }
+    let n_wells = reader.wells.len();
+    let well_columns = mias_well_columns(n_wells, &reader.wells);
+    let rows = if n_wells as u32 >= well_columns {
+        (n_wells as u32) / well_columns
+    } else {
+        1
+    };
+    let template_meta = reader
+        .template_file
+        .as_deref()
+        .and_then(parse_mias_template_file)
+        .unwrap_or_default();
+    let mut wells = Vec::with_capacity(reader.wells.len());
+    for (well, mias_well) in reader.wells.iter().enumerate() {
+        let well_index = mias_well.well_number.max(0) as u32;
+        let row = well_index / well_columns;
+        let column = well_index % well_columns;
+        let well_sample_id = create_lsid("WellSample", &[0, well, 0]);
+        if let Some(image) = ome.images.get_mut(well) {
+            image.name = Some(format!("Well {}{}", mias_well_row_name(row), column + 1));
+        }
+        wells.push(OmeWell {
+            id: Some(create_lsid("Well", &[0, well])),
+            row,
+            column,
+            well_samples: vec![OmeWellSample {
+                id: Some(well_sample_id),
+                index: well as u32,
+                image_ref: Some(well),
+                position_x: None,
+                position_y: None,
+            }],
+        });
+    }
+    ome.plates.push(OmePlate {
+        id: Some(create_lsid("Plate", &[0])),
+        name: reader
+            .plate_name
+            .as_deref()
+            .and_then(mias_java_plate_label)
+            .or(template_meta.plate_name)
+            .or(template_meta.plate_external_id),
+        rows,
+        columns: well_columns,
+        wells,
+    });
+}
+
+fn mias_java_plate_label(plate_name: &str) -> Option<String> {
+    if plate_name.is_empty() {
+        return None;
+    }
+    let start = plate_name.find('-').map(|index| index + 1).unwrap_or(0);
+    Some(plate_name[start..].to_string())
+}
+
+fn mias_well_row_name(mut row: u32) -> String {
+    let mut name = String::new();
+    loop {
+        let rem = (row % 26) as u8;
+        name.insert(0, (b'A' + rem) as char);
+        if row < 26 {
+            break;
+        }
+        row = row / 26 - 1;
+    }
+    name
+}
+
+fn metadata_f64_any(md: &HashMap<String, MetadataValue>, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        match md.get(*key) {
+            Some(MetadataValue::Float(v)) if v.is_finite() => return Some(*v),
+            Some(MetadataValue::Int(v)) => return Some(*v as f64),
+            Some(MetadataValue::String(v)) => {
+                if let Some(parsed) = parse_f64(v) {
+                    return Some(parsed);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn metadata_string_any(md: &HashMap<String, MetadataValue>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = md.get(*key).and_then(metadata_value_string) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn metadata_i32_any(md: &HashMap<String, MetadataValue>, keys: &[&str]) -> Option<i32> {
+    for key in keys {
+        let Some(value) = md.get(*key) else {
+            continue;
+        };
+        match value {
+            MetadataValue::Int(v) => {
+                if let Ok(v) = i32::try_from(*v) {
+                    return Some(v);
+                }
+            }
+            MetadataValue::String(v) => {
+                if let Ok(v) = v.parse::<i32>() {
+                    return Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 impl FormatReader for CellWorxReader {
@@ -781,6 +1349,7 @@ impl FormatReader for CellWorxReader {
         self.serial_number = None;
         self.z_map_file = None;
         self.subdirectories = false;
+        self.ome_template = None;
         if self.tiff_loaded {
             let _ = self.tiff_reader.close();
             self.tiff_loaded = false;
@@ -877,6 +1446,17 @@ impl FormatReader for CellWorxReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.open_bytes(plane_index)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.series.is_empty() {
+            return None;
+        }
+        let mut ome = ome_from_all_mias_series(&self.series);
+        add_cellworx_template_metadata(&mut ome, self.ome_template.as_ref());
+        add_cellworx_populated_planes(&mut ome, &self.series);
+        add_cellworx_spw_metadata(&mut ome, self);
+        Some(ome)
     }
 }
 
@@ -1825,6 +2405,10 @@ pub struct MiasReader {
     current_series: usize,
     tile_rows: u32,
     tile_cols: u32,
+    analysis_files: Vec<MiasAnalysisFile>,
+    template_file: Option<PathBuf>,
+    plate_name: Option<String>,
+    parse_masks: bool,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded: bool,
 }
@@ -1837,10 +2421,33 @@ impl MiasReader {
             current_series: 0,
             tile_rows: 1,
             tile_cols: 1,
+            analysis_files: Vec::new(),
+            template_file: None,
+            plate_name: None,
+            parse_masks: false,
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded: false,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct MiasAnalysisFile {
+    filename: PathBuf,
+    plate: i64,
+    well: i64,
+    kind: MiasAnalysisKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MiasAnalysisKind {
+    Result,
+    PlateOutput,
+    PlateResult,
+    Detail,
+    RoiOverlay,
+    MaskOverlay,
+    Other,
 }
 
 impl Default for MiasReader {
@@ -1980,16 +2587,803 @@ fn is_in_mias_alternate_layout(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_mias_software_header(header: &[u8]) -> bool {
+    let mut parser = match TiffParser::new(Cursor::new(header)) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    let (ifd, _) = match parser.read_ifd(parser.first_ifd_offset) {
+        Ok(ifd) => ifd,
+        Err(_) => return false,
+    };
+    let Some(software) = ifd.get(tag::SOFTWARE).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    software.starts_with("eaZYX")
+        || software.starts_with("SCIL_Image")
+        || software.starts_with("IDL")
+}
+
+#[derive(Default)]
+struct MiasCompanions {
+    analysis_files: Vec<MiasAnalysisFile>,
+    template_file: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct MiasTemplateMetadata {
+    plate_name: Option<String>,
+    plate_external_id: Option<String>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    objective_model: Option<String>,
+    objective_magnification: Option<f64>,
+    channel_names: Vec<String>,
+    acquisition_date: Option<String>,
+    exposure_time: Option<f64>,
+}
+
+fn resolve_mias_entrypoint(id: &Path) -> Result<PathBuf> {
+    if !id
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("txt"))
+        .unwrap_or(false)
+    {
+        return Ok(id.to_path_buf());
+    }
+
+    let base = id.canonicalize().unwrap_or_else(|_| id.to_path_buf());
+    let parent = base.parent().ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("MIAS: .txt entry has no parent directory".into())
+    })?;
+    let plate = match parent.file_name().and_then(|n| n.to_str()) {
+        Some("Batchresults") => {
+            let experiment = parent.parent().ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "MIAS: Batchresults has no experiment parent".into(),
+                )
+            })?;
+            first_child_dir(experiment).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "MIAS: no plate directory beside Batchresults".into(),
+                )
+            })?
+        }
+        Some("results") => parent.parent().unwrap_or(parent).to_path_buf(),
+        _ => parent.to_path_buf(),
+    };
+
+    find_first_mias_tiff(&plate).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("MIAS: could not locate TIFF for .txt entry".into())
+    })
+}
+
+fn first_child_dir(dir: &Path) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort();
+    entries.into_iter().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n != "Batchresults")
+            .unwrap_or(false)
+    })
+}
+
+fn find_first_mias_tiff(plate: &Path) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(plate)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for well in entries {
+        if !well.is_dir() {
+            continue;
+        }
+        let name = well.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !is_well_dir_name(name) {
+            continue;
+        }
+        let mut tiffs = collect_well_tiffs(&well);
+        tiffs.sort();
+        if let Some(tiff) = tiffs.into_iter().next() {
+            return Some(tiff);
+        }
+    }
+    None
+}
+
+fn mias_plate_number(plate: &Path) -> Option<i64> {
+    let name = plate.file_name()?.to_str()?;
+    let first_three: String = name.chars().take(3).collect();
+    first_three.parse::<i64>().ok()
+}
+
+fn collect_mias_companions(
+    plate: &Path,
+    experiment: Option<&Path>,
+    plate_number: Option<i64>,
+) -> MiasCompanions {
+    let mut companions = MiasCompanions::default();
+
+    if let Some(experiment) = experiment {
+        let batch = experiment.join("Batchresults");
+        if let Ok(entries) = std::fs::read_dir(&batch) {
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for file in paths {
+                let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("NEO_Results") {
+                    companions.analysis_files.push(MiasAnalysisFile {
+                        filename: file,
+                        plate: -1,
+                        well: -1,
+                        kind: MiasAnalysisKind::Result,
+                    });
+                } else if name.starts_with("NEO_PlateOutput_") {
+                    let file_plate = name.get(16..19).and_then(|s| s.parse::<i64>().ok());
+                    if file_plate == plate_number {
+                        companions.analysis_files.push(MiasAnalysisFile {
+                            filename: file,
+                            plate: 0,
+                            well: -1,
+                            kind: MiasAnalysisKind::PlateOutput,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let template = plate.join("Nugenesistemplate.txt");
+    if template.exists() {
+        companions.template_file = Some(template);
+    }
+
+    let results = plate.join("results");
+    if let Ok(entries) = std::fs::read_dir(&results) {
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for file in paths {
+            let name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if name.ends_with(".sav") || name.ends_with(".dsv") || name.ends_with(".dat") {
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            let kind = if name.ends_with("detail.txt") {
+                MiasAnalysisKind::Detail
+            } else if name.ends_with("AllModesOverlay.tif") {
+                MiasAnalysisKind::RoiOverlay
+            } else if name.ends_with("overlay.tif") {
+                MiasAnalysisKind::MaskOverlay
+            } else if lower.ends_with(".txt") || lower.ends_with(".tif") || lower.ends_with(".tiff")
+            {
+                MiasAnalysisKind::PlateResult
+            } else {
+                MiasAnalysisKind::Other
+            };
+            companions.analysis_files.push(MiasAnalysisFile {
+                filename: file,
+                plate: 0,
+                well: mias_well_from_analysis_name(&name),
+                kind,
+            });
+        }
+    }
+
+    companions
+}
+
+fn mias_well_from_analysis_name(name: &str) -> i64 {
+    if name.to_ascii_lowercase().starts_with("well") && name.len() >= 8 {
+        name.get(4..8)
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|v| v - 1)
+            .unwrap_or(-1)
+    } else {
+        -1
+    }
+}
+
+fn parse_mias_template_file(path: &Path) -> Option<MiasTemplateMetadata> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut template = MiasTemplateMetadata::default();
+    let mut date = None;
+    for raw in content.split(['\n', '\r']) {
+        let Some((key, value)) = raw.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "Barcode" => template.plate_external_id = Some(value.to_string()),
+            "Carrier" => template.plate_name = Some(value.to_string()),
+            "Pixel_X" => template.physical_size_x = parse_f64(value),
+            "Pixel_Y" => template.physical_size_y = parse_f64(value),
+            "Objective_ID" => template.objective_model = Some(value.to_string()),
+            "Magnification" => template.objective_magnification = parse_f64(value),
+            "Date" => date = Some(value.to_string()),
+            "Time" => {
+                let prefix = date.take().unwrap_or_default();
+                template.acquisition_date = Some(format!("{prefix} {value}").trim().to_string());
+            }
+            "Exposure" => template.exposure_time = parse_f64(value),
+            _ if key.starts_with("Mode_") => template.channel_names.push(value.to_string()),
+            _ => {}
+        }
+    }
+    if template.acquisition_date.is_none() {
+        template.acquisition_date = date;
+    }
+    Some(template)
+}
+
+fn apply_mias_template_metadata(
+    md: &mut HashMap<String, MetadataValue>,
+    template: &MiasTemplateMetadata,
+    logical_channels: u32,
+) {
+    if let Some(value) = &template.plate_name {
+        md.insert(
+            "mias.plate.name".into(),
+            MetadataValue::String(value.clone()),
+        );
+    }
+    if let Some(value) = &template.plate_external_id {
+        md.insert(
+            "mias.plate.external_identifier".into(),
+            MetadataValue::String(value.clone()),
+        );
+    }
+    if let Some(value) = template.physical_size_x {
+        md.insert("PhysicalSizeX".into(), MetadataValue::Float(value));
+        md.insert("physical_size_x".into(), MetadataValue::Float(value));
+    }
+    if let Some(value) = template.physical_size_y {
+        md.insert("PhysicalSizeY".into(), MetadataValue::Float(value));
+        md.insert("physical_size_y".into(), MetadataValue::Float(value));
+    }
+    if let Some(value) = &template.objective_model {
+        md.insert(
+            "objective.0.model".into(),
+            MetadataValue::String(value.clone()),
+        );
+    }
+    if let Some(value) = template.objective_magnification {
+        md.insert(
+            "objective.0.nominal_magnification".into(),
+            MetadataValue::Float(value),
+        );
+    }
+    if let Some(value) = &template.acquisition_date {
+        md.insert(
+            "acquisition_date".into(),
+            MetadataValue::String(value.clone()),
+        );
+    }
+    if let Some(value) = template.exposure_time {
+        for plane in 0..logical_channels.max(1) {
+            md.insert(
+                format!("plane.{plane}.exposure_time"),
+                MetadataValue::Float(value),
+            );
+        }
+    }
+    for (index, name) in template.channel_names.iter().enumerate() {
+        md.insert(
+            format!("channel.{index}.name"),
+            MetadataValue::String(name.clone()),
+        );
+    }
+}
+
+fn add_mias_companion_metadata(
+    md: &mut HashMap<String, MetadataValue>,
+    analysis_files: &[MiasAnalysisFile],
+    template_file: Option<&Path>,
+    well_number: i64,
+) {
+    if let Some(template) = template_file {
+        md.insert(
+            "mias.template_file".into(),
+            MetadataValue::String(template.to_string_lossy().into_owned()),
+        );
+    }
+
+    let mut count = 0usize;
+    let mut detail_count = 0usize;
+    let mut roi_overlay_count = 0usize;
+    let mut mask_overlay_count = 0usize;
+    let mut roi_count = 0usize;
+    for file in analysis_files {
+        if file.plate > 0 {
+            continue;
+        }
+        if !(file.well == well_number || file.well < 0) {
+            continue;
+        }
+        md.insert(
+            format!("mias.analysis_file.{count}"),
+            MetadataValue::String(file.filename.to_string_lossy().into_owned()),
+        );
+        md.insert(
+            format!("mias.analysis_file.{count}.kind"),
+            MetadataValue::String(format!("{:?}", file.kind)),
+        );
+        match file.kind {
+            MiasAnalysisKind::Detail => {
+                detail_count += 1;
+                roi_count += add_mias_detail_rois(md, &file.filename, roi_count);
+            }
+            MiasAnalysisKind::RoiOverlay => roi_overlay_count += 1,
+            MiasAnalysisKind::MaskOverlay => mask_overlay_count += 1,
+            _ => {}
+        }
+        count += 1;
+    }
+    md.insert(
+        "mias.analysis_file_count".into(),
+        MetadataValue::Int(count as i64),
+    );
+    md.insert(
+        "mias.roi_detail_file_count".into(),
+        MetadataValue::Int(detail_count as i64),
+    );
+    md.insert(
+        "mias.roi_overlay_file_count".into(),
+        MetadataValue::Int(roi_overlay_count as i64),
+    );
+    md.insert(
+        "mias.mask_overlay_file_count".into(),
+        MetadataValue::Int(mask_overlay_count as i64),
+    );
+    md.insert(
+        "mias.roi_detail_count".into(),
+        MetadataValue::Int(roi_count as i64),
+    );
+}
+
+fn add_mias_overlay_channel_colors(
+    md: &mut HashMap<String, MetadataValue>,
+    colors: &[Option<i32>],
+) {
+    for (channel, color) in colors.iter().enumerate() {
+        if let Some(color) = color {
+            md.insert(
+                format!("channel.{channel}.color"),
+                MetadataValue::Int(i64::from(*color)),
+            );
+        }
+    }
+}
+
+fn collect_mias_overlay_channel_colors(
+    analysis_files: &[MiasAnalysisFile],
+    size_c: u32,
+) -> Vec<Option<i32>> {
+    let mut colors = vec![None; size_c as usize];
+    for file in analysis_files {
+        if file.kind != MiasAnalysisKind::RoiOverlay {
+            continue;
+        }
+        let Some((_, _, _, channel)) = mias_position_from_analysis_file(&file.filename) else {
+            continue;
+        };
+        let Ok(channel) = usize::try_from(channel) else {
+            continue;
+        };
+        if channel >= colors.len() || colors[channel].is_some() {
+            continue;
+        }
+        colors[channel] = mias_channel_color_from_overlay(&file.filename);
+    }
+    colors
+}
+
+fn add_mias_mask_rois(
+    md: &mut HashMap<String, MetadataValue>,
+    analysis_files: &[MiasAnalysisFile],
+    well_number: i64,
+    size_x: u32,
+    size_y: u32,
+) {
+    let mut next_roi = mias_next_roi_index(md);
+    for file in analysis_files {
+        if file.kind != MiasAnalysisKind::MaskOverlay || file.well != well_number {
+            continue;
+        }
+        for (channel, bin_data) in mias_masks_from_overlay(&file.filename)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(bin_data) = bin_data else {
+                continue;
+            };
+            let color = match channel {
+                0 => pack_ome_rgba(255, 0, 0, 255),
+                1 => pack_ome_rgba(0, 255, 0, 255),
+                2 => pack_ome_rgba(0, 0, 255, 255),
+                _ => continue,
+            };
+            let prefix = format!("roi.{next_roi}");
+            md.insert(
+                format!("{prefix}.shape"),
+                MetadataValue::String("mask".into()),
+            );
+            md.insert(format!("{prefix}.x"), MetadataValue::Float(0.0));
+            md.insert(format!("{prefix}.y"), MetadataValue::Float(0.0));
+            md.insert(
+                format!("{prefix}.width"),
+                MetadataValue::Float(size_x as f64),
+            );
+            md.insert(
+                format!("{prefix}.height"),
+                MetadataValue::Float(size_y as f64),
+            );
+            md.insert(
+                format!("{prefix}.stroke_color"),
+                MetadataValue::Int(i64::from(color)),
+            );
+            md.insert(
+                format!("{prefix}.fill_color"),
+                MetadataValue::Int(i64::from(color)),
+            );
+            md.insert(format!("{prefix}.bin_data"), MetadataValue::Bytes(bin_data));
+            md.insert(
+                format!("image.roi_ref.{next_roi}"),
+                MetadataValue::Int(next_roi as i64),
+            );
+            next_roi += 1;
+        }
+    }
+}
+
+fn mias_next_roi_index(md: &HashMap<String, MetadataValue>) -> usize {
+    md.keys()
+        .filter_map(|key| {
+            let mut parts = key.split('.');
+            match (parts.next(), parts.next()) {
+                (Some("roi"), Some(index)) => index.parse::<usize>().ok(),
+                _ => None,
+            }
+        })
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn mias_masks_from_overlay(file: &Path) -> Vec<Option<Vec<u8>>> {
+    let mut data = Vec::new();
+    if std::fs::File::open(file)
+        .and_then(|mut file| file.read_to_end(&mut data))
+        .is_err()
+    {
+        return vec![None, None, None];
+    }
+    let mut parser = match TiffParser::new(Cursor::new(&data)) {
+        Ok(parser) => parser,
+        Err(_) => return vec![None, None, None],
+    };
+    let (ifd, _) = match parser.read_ifd(parser.first_ifd_offset) {
+        Ok(result) => result,
+        Err(_) => return vec![None, None, None],
+    };
+    let width = ifd.get_u32(tag::IMAGE_WIDTH).unwrap_or(0) as usize;
+    let height = ifd.get_u32(tag::IMAGE_LENGTH).unwrap_or(0) as usize;
+    let pixel_count = width.saturating_mul(height);
+    if pixel_count == 0 {
+        return vec![None, None, None];
+    }
+    let color_map = ifd
+        .get(tag::COLOR_MAP)
+        .map(|v| v.as_vec_u16())
+        .unwrap_or_default();
+    let n_entries = color_map.len() / 3;
+    let plane = match mias_overlay_plane_bytes(&data, &ifd) {
+        Some(plane) => plane,
+        None => return vec![None, None, None],
+    };
+
+    let mut rgb = if n_entries > 0 && color_map.len() == n_entries * 3 {
+        let mut rgb = vec![vec![0u8; pixel_count]; 3];
+        for (pixel, &index) in plane.iter().take(pixel_count).enumerate() {
+            let index = index as usize;
+            if index >= n_entries {
+                continue;
+            }
+            for channel in 0..3 {
+                rgb[channel][pixel] = (color_map[channel * n_entries + index] >> 8) as u8;
+            }
+        }
+        rgb
+    } else {
+        match mias_rgb_planes_from_overlay(&ifd, &plane, pixel_count) {
+            Some(rgb) => rgb,
+            None => return vec![None, None, None],
+        }
+    };
+    for pixel in 0..pixel_count {
+        let first = rgb[0][pixel];
+        if rgb.iter().all(|channel| channel[pixel] == first) {
+            for channel in &mut rgb {
+                channel[pixel] = 0;
+            }
+        }
+    }
+
+    (0..3)
+        .map(|channel| mias_pack_mask_bits(&rgb[channel]))
+        .collect()
+}
+
+fn mias_overlay_plane_bytes(data: &[u8], ifd: &Ifd) -> Option<Vec<u8>> {
+    let offsets = ifd.get_vec_u32(tag::STRIP_OFFSETS);
+    let byte_counts = ifd.get_vec_u32(tag::STRIP_BYTE_COUNTS);
+    if offsets.is_empty() || byte_counts.is_empty() {
+        return None;
+    }
+    let mut plane = Vec::new();
+    for (&offset, &byte_count) in offsets.iter().zip(byte_counts.iter()) {
+        let offset = offset as usize;
+        let byte_count = byte_count as usize;
+        if offset >= data.len() {
+            return None;
+        }
+        let end = offset.saturating_add(byte_count).min(data.len());
+        plane.extend_from_slice(&data[offset..end]);
+    }
+    Some(plane)
+}
+
+fn mias_rgb_planes_from_overlay(
+    ifd: &Ifd,
+    plane: &[u8],
+    pixel_count: usize,
+) -> Option<Vec<Vec<u8>>> {
+    let samples = usize::from(ifd.samples_per_pixel());
+    if samples < 3 {
+        return None;
+    }
+    let bits = ifd.bits_per_sample();
+    let bytes_per_sample = if bits.is_empty() {
+        1
+    } else {
+        let first = bits[0];
+        if first != 8 || bits.iter().take(samples).any(|&b| b != first) {
+            return None;
+        }
+        usize::from(first / 8)
+    };
+    if bytes_per_sample != 1 {
+        return None;
+    }
+
+    let planar = ifd.planar_configuration() == 2;
+    let mut rgb = vec![vec![0u8; pixel_count]; 3];
+    if planar {
+        let required = pixel_count.checked_mul(samples)?;
+        if plane.len() < required {
+            return None;
+        }
+        for channel in 0usize..3 {
+            let start = channel.checked_mul(pixel_count)?;
+            let end = start.checked_add(pixel_count)?;
+            rgb[channel].copy_from_slice(&plane[start..end]);
+        }
+    } else {
+        let required = pixel_count.checked_mul(samples)?;
+        if plane.len() < required {
+            return None;
+        }
+        for pixel in 0..pixel_count {
+            let base = pixel.checked_mul(samples)?;
+            for channel in 0..3 {
+                rgb[channel][pixel] = plane[base + channel];
+            }
+        }
+    }
+    Some(rgb)
+}
+
+fn mias_pack_mask_bits(plane: &[u8]) -> Option<Vec<u8>> {
+    let mut valid = false;
+    let mut out = vec![0u8; (plane.len() + 7) / 8];
+    for (index, &pixel) in plane.iter().enumerate() {
+        if pixel != 0 {
+            valid = true;
+            out[index / 8] |= 1 << (7 - (index % 8));
+        }
+    }
+    valid.then_some(out)
+}
+
+fn mias_channel_color_from_overlay(file: &Path) -> Option<i32> {
+    let mut data = Vec::new();
+    std::fs::File::open(file)
+        .ok()?
+        .read_to_end(&mut data)
+        .ok()?;
+    let mut parser = TiffParser::new(Cursor::new(data)).ok()?;
+    let (ifd, _) = parser.read_ifd(parser.first_ifd_offset).ok()?;
+    let color_map = ifd.get(tag::COLOR_MAP)?.as_vec_u16();
+    let n_entries = color_map.len() / 3;
+    if n_entries == 0 || color_map.len() != n_entries * 3 {
+        return None;
+    }
+
+    let mut max = i32::MIN;
+    let mut max_index = None;
+    for c in 0..3 {
+        let value = ((color_map[c * n_entries] >> 8) & 0xff) as i32;
+        if value > max {
+            max = value;
+            max_index = Some(c);
+        } else if value == max {
+            return Some(pack_ome_rgba(0, 0, 0, 255));
+        }
+    }
+
+    match max_index {
+        Some(0) => Some(pack_ome_rgba(255, 0, 0, 255)),
+        Some(1) => Some(pack_ome_rgba(0, 255, 0, 255)),
+        Some(2) => Some(pack_ome_rgba(0, 0, 255, 255)),
+        _ => None,
+    }
+}
+
+fn pack_ome_rgba(red: u8, green: u8, blue: u8, alpha: u8) -> i32 {
+    u32::from_be_bytes([red, green, blue, alpha]) as i32
+}
+
+fn add_mias_detail_rois(
+    md: &mut HashMap<String, MetadataValue>,
+    detail_file: &Path,
+    first_roi: usize,
+) -> usize {
+    let content = match std::fs::read_to_string(detail_file) {
+        Ok(content) => content,
+        Err(_) => return 0,
+    };
+    let (the_t, the_z) = mias_position_from_analysis_file(detail_file)
+        .map(|(_, t, z, _)| (Some(t as i64), Some(z as i64)))
+        .unwrap_or((None, None));
+    let mut columns: Option<Vec<String>> = None;
+    let mut count = 0usize;
+
+    for raw in content.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if columns.is_none() {
+            if line.starts_with("Label") {
+                columns = Some(line.split('\t').map(|s| s.trim().to_string()).collect());
+            }
+            continue;
+        }
+
+        let Some(columns) = columns.as_ref() else {
+            continue;
+        };
+        let data: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let Some(label) = mias_detail_column(columns, &data, "Label") else {
+            continue;
+        };
+        let Some(x) = mias_detail_column(columns, &data, "Col").and_then(parse_f64) else {
+            continue;
+        };
+        let Some(y) = mias_detail_column(columns, &data, "Row").and_then(parse_f64) else {
+            continue;
+        };
+        let Some(diameter) = mias_detail_column(columns, &data, "Cell Diam.").and_then(parse_f64)
+        else {
+            continue;
+        };
+        if diameter <= 0.0 {
+            continue;
+        }
+
+        let roi = first_roi + count;
+        let prefix = format!("roi.{roi}");
+        md.insert(
+            format!("{prefix}.name"),
+            MetadataValue::String(label.to_string()),
+        );
+        md.insert(
+            format!("image.roi_ref.{roi}"),
+            MetadataValue::Int(roi as i64),
+        );
+        md.insert(
+            format!("{prefix}.label"),
+            MetadataValue::String(label.to_string()),
+        );
+        md.insert(format!("{prefix}.x"), MetadataValue::Float(x));
+        md.insert(format!("{prefix}.y"), MetadataValue::Float(y));
+        md.insert(
+            format!("{prefix}.radius_x"),
+            MetadataValue::Float(diameter / 2.0),
+        );
+        md.insert(
+            format!("{prefix}.radius_y"),
+            MetadataValue::Float(diameter / 2.0),
+        );
+        if let Some(t) = the_t {
+            md.insert(format!("{prefix}.the_t"), MetadataValue::Int(t));
+        }
+        if let Some(z) = the_z {
+            md.insert(format!("{prefix}.the_z"), MetadataValue::Int(z));
+        }
+        count += 1;
+    }
+
+    count
+}
+
+fn mias_detail_column<'a>(columns: &[String], data: &'a [&'a str], name: &str) -> Option<&'a str> {
+    columns
+        .iter()
+        .position(|column| column == name)
+        .and_then(|index| data.get(index).copied())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn mias_position_from_analysis_file(file: &Path) -> Option<(i64, i64, i64, i64)> {
+    let name = file.file_name()?.to_str()?;
+    let well = name
+        .strip_prefix("Well")?
+        .split_once('_')?
+        .0
+        .parse::<i64>()
+        .ok()?
+        - 1;
+    let t = mias_analysis_token(name, "_t")?;
+    let z = mias_analysis_token(name, "_z")?;
+    let c = name
+        .find("mode")
+        .and_then(|start| {
+            let rest = &name[start + 4..];
+            let end = rest.find('_').unwrap_or(rest.len());
+            rest[..end].parse::<i64>().ok()
+        })
+        .map(|value| value - 1)?;
+    Some((well, t, z, c))
+}
+
+fn mias_analysis_token(name: &str, marker: &str) -> Option<i64> {
+    let start = name.find(marker)? + marker.len();
+    let rest = &name[start..];
+    let end = rest.find('_').unwrap_or(rest.len());
+    rest[..end].parse::<i64>().ok()
+}
+
 fn well_number_from_name(name: &str) -> i64 {
     let stripped = name.trim_start_matches("Well");
     stripped.trim().parse::<i64>().map(|v| v - 1).unwrap_or(0)
 }
 
 impl MiasReader {
+    /// Toggle MIAS mask overlay parsing, matching Java
+    /// `MIASReader.setAutomaticallyParseMasks`. Disabled by default.
+    pub fn set_automatically_parse_masks(&mut self, parse: bool) {
+        self.parse_masks = parse;
+    }
+
     /// Locate the plate directory and enumerate well directories given a TIFF
     /// (or well directory) path inside a MIAS hierarchy.
     fn build(&mut self, id: &Path) -> Result<()> {
-        let base = id.canonicalize().unwrap_or_else(|_| id.to_path_buf());
+        let entry = resolve_mias_entrypoint(id)?;
+        let base = entry.canonicalize().unwrap_or(entry);
 
         // The well directory is the parent of a normal-layout TIFF. In the
         // alternate numeric layout the TIFF lives under a channel directory, so
@@ -2011,6 +3405,21 @@ impl MiasReader {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or(well_dir.clone());
+        self.plate_name = plate_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string());
+        let experiment_dir = plate_dir.parent().map(|p| p.to_path_buf());
+        let plate_number = mias_plate_number(&plate_dir);
+        let companions =
+            collect_mias_companions(&plate_dir, experiment_dir.as_deref(), plate_number);
+        self.template_file = companions.template_file.clone();
+        self.analysis_files = companions.analysis_files.clone();
+        let template_meta = self
+            .template_file
+            .as_deref()
+            .and_then(parse_mias_template_file)
+            .unwrap_or_default();
 
         // Enumerate well directories under the plate.
         let mut well_dirs: Vec<PathBuf> = Vec::new();
@@ -2214,6 +3623,13 @@ impl MiasReader {
         }
 
         let mut series = Vec::with_capacity(wells.len());
+        let max_size_c = wells
+            .iter()
+            .map(|w| w.size_c.saturating_mul(tiff_c))
+            .max()
+            .unwrap_or(tiff_c);
+        let overlay_channel_colors =
+            collect_mias_overlay_channel_colors(&self.analysis_files, max_size_c);
         for w in &wells {
             let size_c = w.size_c * tiff_c;
             let mut meta_map = HashMap::new();
@@ -2225,13 +3641,30 @@ impl MiasReader {
                 "well_number".to_string(),
                 crate::common::metadata::MetadataValue::Int(w.well_number),
             );
+            add_mias_companion_metadata(
+                &mut meta_map,
+                &self.analysis_files,
+                self.template_file.as_deref(),
+                w.well_number,
+            );
             let image_count = (w.size_z * w.size_t * w.size_c).max(1);
+            apply_mias_template_metadata(&mut meta_map, &template_meta, image_count);
+            add_mias_overlay_channel_colors(&mut meta_map, &overlay_channel_colors);
             let size_x = tile_w
                 .checked_mul(self.tile_cols)
                 .ok_or_else(|| BioFormatsError::Format("MIAS: mosaic width overflows".into()))?;
             let size_y = tile_h
                 .checked_mul(self.tile_rows)
                 .ok_or_else(|| BioFormatsError::Format("MIAS: mosaic height overflows".into()))?;
+            if self.parse_masks {
+                add_mias_mask_rois(
+                    &mut meta_map,
+                    &self.analysis_files,
+                    w.well_number,
+                    size_x,
+                    size_y,
+                );
+            }
             series.push(ImageMetadata {
                 size_x,
                 size_y,
@@ -2315,6 +3748,23 @@ fn collect_well_tiffs(well_dir: &Path) -> Vec<PathBuf> {
 
 impl FormatReader for MiasReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("txt"))
+            .unwrap_or(false)
+        {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let parent = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            return parent == "results"
+                || parent == "Batchresults"
+                || name == "Nugenesistemplate.txt"
+                || name.starts_with("mode");
+        }
         // A MIAS TIFF lives in a Well<xxxx> directory and uses the
         // mode/z/t naming convention.
         if !path
@@ -2336,8 +3786,8 @@ impl FormatReader for MiasReader {
             || is_in_mias_alternate_layout(path)
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        is_mias_software_header(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -2365,6 +3815,9 @@ impl FormatReader for MiasReader {
         self.current_series = 0;
         self.tile_rows = 1;
         self.tile_cols = 1;
+        self.analysis_files.clear();
+        self.template_file = None;
+        self.plate_name = None;
         if self.tiff_loaded {
             let _ = self.tiff_reader.close();
             self.tiff_loaded = false;
@@ -2512,11 +3965,146 @@ impl FormatReader for MiasReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.series.is_empty() {
+            return None;
+        }
+        let mut ome = ome_from_all_mias_series(&self.series);
+        add_mias_spw_metadata(&mut ome, self);
+        Some(ome)
+    }
 }
 
 #[cfg(test)]
 mod cellworx_log_tests {
     use super::*;
+
+    fn build_tiff_with_software(software: &str) -> Vec<u8> {
+        let mut value = software.as_bytes().to_vec();
+        value.push(0);
+
+        let ifd_start = 8u32;
+        let value_offset = 8 + 2 + 12 + 4;
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&ifd_start.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&tag::SOFTWARE.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        if value.len() <= 4 {
+            let mut inline = [0u8; 4];
+            inline[..value.len()].copy_from_slice(&value);
+            tiff.extend_from_slice(&inline);
+        } else {
+            tiff.extend_from_slice(&(value_offset as u32).to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        if value.len() > 4 {
+            tiff.extend_from_slice(&value);
+        }
+        tiff
+    }
+
+    fn push_u16_le(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32_le(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_ifd_short(out: &mut Vec<u8>, tag_id: u16, value: u16) {
+        push_u16_le(out, tag_id);
+        push_u16_le(out, 3);
+        push_u32_le(out, 1);
+        push_u16_le(out, value);
+        push_u16_le(out, 0);
+    }
+
+    fn push_ifd_long(out: &mut Vec<u8>, tag_id: u16, value: u32) {
+        push_u16_le(out, tag_id);
+        push_u16_le(out, 4);
+        push_u32_le(out, 1);
+        push_u32_le(out, value);
+    }
+
+    fn push_ifd_short_array(out: &mut Vec<u8>, tag_id: u16, count: u32, offset: u32) {
+        push_u16_le(out, tag_id);
+        push_u16_le(out, 3);
+        push_u32_le(out, count);
+        push_u32_le(out, offset);
+    }
+
+    fn build_palette_tiff(color_map: &[u16]) -> Vec<u8> {
+        build_palette_tiff_pixels(1, 1, color_map, &[0])
+    }
+
+    fn build_palette_tiff_pixels(
+        width: u32,
+        height: u32,
+        color_map: &[u16],
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        let entry_count = 9u16;
+        let ifd_start = 8u32;
+        let color_map_offset = ifd_start + 2 + u32::from(entry_count) * 12 + 4;
+        let pixel_offset = color_map_offset + (color_map.len() as u32 * 2);
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        push_u16_le(&mut tiff, 42);
+        push_u32_le(&mut tiff, ifd_start);
+        push_u16_le(&mut tiff, entry_count);
+        push_ifd_long(&mut tiff, tag::IMAGE_WIDTH, width);
+        push_ifd_long(&mut tiff, tag::IMAGE_LENGTH, height);
+        push_ifd_short(&mut tiff, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut tiff, tag::COMPRESSION, 1);
+        push_ifd_short(&mut tiff, tag::PHOTOMETRIC_INTERPRETATION, 3);
+        push_ifd_long(&mut tiff, tag::STRIP_OFFSETS, pixel_offset);
+        push_ifd_long(&mut tiff, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+        push_ifd_short(&mut tiff, tag::SAMPLES_PER_PIXEL, 1);
+        push_ifd_short_array(
+            &mut tiff,
+            tag::COLOR_MAP,
+            color_map.len() as u32,
+            color_map_offset,
+        );
+        push_u32_le(&mut tiff, 0);
+        for &value in color_map {
+            push_u16_le(&mut tiff, value);
+        }
+        tiff.extend_from_slice(pixels);
+        tiff
+    }
+
+    fn build_rgb_tiff_pixels(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let entry_count = 9u16;
+        let ifd_start = 8u32;
+        let bits_offset = ifd_start + 2 + u32::from(entry_count) * 12 + 4;
+        let pixel_offset = bits_offset + 6;
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        push_u16_le(&mut tiff, 42);
+        push_u32_le(&mut tiff, ifd_start);
+        push_u16_le(&mut tiff, entry_count);
+        push_ifd_long(&mut tiff, tag::IMAGE_WIDTH, width);
+        push_ifd_long(&mut tiff, tag::IMAGE_LENGTH, height);
+        push_ifd_short_array(&mut tiff, tag::BITS_PER_SAMPLE, 3, bits_offset);
+        push_ifd_short(&mut tiff, tag::COMPRESSION, 1);
+        push_ifd_short(&mut tiff, tag::PHOTOMETRIC_INTERPRETATION, 2);
+        push_ifd_long(&mut tiff, tag::STRIP_OFFSETS, pixel_offset);
+        push_ifd_long(&mut tiff, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+        push_ifd_short(&mut tiff, tag::SAMPLES_PER_PIXEL, 3);
+        push_ifd_short(&mut tiff, tag::PLANAR_CONFIGURATION, 1);
+        push_u32_le(&mut tiff, 0);
+        push_u16_le(&mut tiff, 8);
+        push_u16_le(&mut tiff, 8);
+        push_u16_le(&mut tiff, 8);
+        tiff.extend_from_slice(pixels);
+        tiff
+    }
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let mut d = std::env::temp_dir();
@@ -2531,6 +4119,19 @@ mod cellworx_log_tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn mias_byte_probe_matches_java_software_prefixes() {
+        let reader = MiasReader::new();
+        for software in ["eaZYX 1.0", "SCIL_Image 2.0", "IDL export"] {
+            assert!(
+                reader.is_this_type_by_bytes(&build_tiff_with_software(software)),
+                "MIASReader should accept Software={software:?}"
+            );
+        }
+        assert!(!reader.is_this_type_by_bytes(&build_tiff_with_software("ImageJ")));
+        assert!(!reader.is_this_type_by_bytes(b"not a tiff"));
     }
 
     #[test]
@@ -2593,6 +4194,644 @@ mod cellworx_log_tests {
         assert!(md.contains_key("Scan Area"));
         assert!(md.contains_key("Channel 1"));
         assert!(!md.contains_key("NoColonLineSkipped"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn well_log_projects_java_structured_metadata() {
+        let dir = tmp_dir("well_structured");
+        let log = dir.join("Plate1_A01_scan.log");
+        std::fs::write(
+            &log,
+            "Date: Mon Jan 02 13:45:30 2017\n\
+             Scan Origin: 12.5, -3.25\n\
+             Scan Area: 100 x 50 um\n\
+             Channel 1: gain 1.5, EX 488/EM 525\n\
+             Channel 2: gain 2.25, EX 561/EM 610 nm\n",
+        )
+        .unwrap();
+
+        let mut md = HashMap::new();
+        parse_cellworx_well_log_structured(&log, &mut md, 200, 100, 2);
+
+        assert_eq!(
+            md.get("acquisition_datetime_iso8601")
+                .map(|v| v.to_string())
+                .as_deref(),
+            Some("2017-01-02T13:45:30")
+        );
+        assert!(
+            matches!(md.get("PhysicalSizeX"), Some(MetadataValue::Float(v)) if (*v - 0.5).abs() < 1e-9)
+        );
+        assert!(
+            matches!(md.get("PhysicalSizeY"), Some(MetadataValue::Float(v)) if (*v - 0.5).abs() < 1e-9)
+        );
+        assert!(
+            matches!(md.get("WellSamplePositionX"), Some(MetadataValue::Float(v)) if (*v - 12.5).abs() < 1e-9)
+        );
+        assert!(
+            matches!(md.get("plane.1.position_y"), Some(MetadataValue::Float(v)) if (*v + 3.25).abs() < 1e-9)
+        );
+        assert!(
+            matches!(md.get("channel.0.detector_settings_gain"), Some(MetadataValue::Float(v)) if (*v - 1.5).abs() < 1e-9)
+        );
+        assert!(
+            matches!(md.get("channel.0.excitation_wavelength"), Some(MetadataValue::Float(v)) if (*v - 488.0).abs() < 1e-9)
+        );
+        assert!(
+            matches!(md.get("channel.1.emission_wavelength"), Some(MetadataValue::Float(v)) if (*v - 610.0).abs() < 1e-9)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mias_template_and_companion_metadata_are_indexed() {
+        let dir = tmp_dir("mias_companions");
+        let plate = dir.join("001-Barcode");
+        let results = plate.join("results");
+        let batch = dir.join("Batchresults");
+        std::fs::create_dir_all(&results).unwrap();
+        std::fs::create_dir_all(&batch).unwrap();
+        let template = plate.join("Nugenesistemplate.txt");
+        std::fs::write(
+            &template,
+            "Barcode=BC123\r\nCarrier=Plate A\r\nPixel_X=0.25\r\nPixel_Y=0.5\r\nObjective_ID=Obj-20x\r\nMagnification=20\r\nMode_1=DAPI\r\nMode_2=FITC\r\nDate=02/01/2017\r\nTime=13:45:30\r\nExposure=0.125\r\n",
+        )
+        .unwrap();
+        std::fs::write(batch.join("NEO_Results.txt"), "header\n").unwrap();
+        std::fs::write(batch.join("NEO_PlateOutput_001.txt"), "plate\n").unwrap();
+        std::fs::write(results.join("Well0001_mode1_z0_t0_detail.txt"), "Label\n").unwrap();
+        std::fs::write(results.join("Well0001_mode1_z0_t0_overlay.tif"), "").unwrap();
+        std::fs::write(results.join("Well0001_mode1_z0_t0_AllModesOverlay.tif"), "").unwrap();
+
+        let companions = collect_mias_companions(&plate, Some(&dir), Some(1));
+        assert_eq!(
+            companions.template_file.as_deref(),
+            Some(template.as_path())
+        );
+        assert_eq!(companions.analysis_files.len(), 5);
+
+        let template_meta = parse_mias_template_file(&template).unwrap();
+        let mut md = HashMap::new();
+        add_mias_companion_metadata(&mut md, &companions.analysis_files, Some(&template), 0);
+        apply_mias_template_metadata(&mut md, &template_meta, 3);
+
+        assert!(matches!(
+            md.get("mias.analysis_file_count"),
+            Some(MetadataValue::Int(5))
+        ));
+        assert!(matches!(
+            md.get("mias.roi_detail_file_count"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            md.get("mias.roi_overlay_file_count"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            md.get("mias.mask_overlay_file_count"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert_eq!(
+            md.get("channel.1.name").map(|v| v.to_string()).as_deref(),
+            Some("FITC")
+        );
+        assert!(
+            matches!(md.get("physical_size_x"), Some(MetadataValue::Float(v)) if (*v - 0.25).abs() < 1e-9)
+        );
+        assert!(
+            matches!(md.get("plane.2.exposure_time"), Some(MetadataValue::Float(v)) if (*v - 0.125).abs() < 1e-9)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mias_all_modes_overlay_colormap_sets_java_channel_color() {
+        let dir = tmp_dir("mias_overlay_color");
+        let red = dir.join("Well0001_mode1_z0_t0_AllModesOverlay.tif");
+        let green = dir.join("Well0001_mode2_z0_t0_AllModesOverlay.tif");
+        let tied = dir.join("Well0001_mode3_z0_t0_AllModesOverlay.tif");
+        std::fs::write(&red, build_palette_tiff(&[65535, 0, 0, 0, 0, 0])).unwrap();
+        std::fs::write(&green, build_palette_tiff(&[0, 0, 65535, 0, 0, 0])).unwrap();
+        std::fs::write(&tied, build_palette_tiff(&[0, 0, 0, 0, 0, 0])).unwrap();
+
+        assert_eq!(
+            mias_channel_color_from_overlay(&red),
+            Some(pack_ome_rgba(255, 0, 0, 255))
+        );
+        assert_eq!(
+            mias_channel_color_from_overlay(&green),
+            Some(pack_ome_rgba(0, 255, 0, 255))
+        );
+        assert_eq!(
+            mias_channel_color_from_overlay(&tied),
+            Some(pack_ome_rgba(0, 0, 0, 255))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mias_overlay_channel_color_projects_to_ome_channels() {
+        let dir = tmp_dir("mias_overlay_ome_color");
+        let overlay = dir.join("Well0001_mode2_z0_t0_AllModesOverlay.tif");
+        std::fs::write(&overlay, build_palette_tiff(&[0, 0, 256, 0, 65535, 0])).unwrap();
+        let analysis_files = vec![MiasAnalysisFile {
+            filename: overlay,
+            plate: 0,
+            well: 0,
+            kind: MiasAnalysisKind::RoiOverlay,
+        }];
+        let colors = collect_mias_overlay_channel_colors(&analysis_files, 2);
+        assert_eq!(colors[0], None);
+        assert_eq!(colors[1], Some(pack_ome_rgba(0, 0, 255, 255)));
+
+        let mut meta = ImageMetadata {
+            size_x: 10,
+            size_y: 10,
+            size_z: 1,
+            size_c: 2,
+            size_t: 1,
+            image_count: 2,
+            ..ImageMetadata::default()
+        };
+        add_mias_overlay_channel_colors(&mut meta.series_metadata, &colors);
+
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(&meta);
+        enrich_ome_from_series_metadata(&mut ome, &meta);
+        assert_eq!(
+            ome.images[0].channels[1].color,
+            Some(pack_ome_rgba(0, 0, 255, 255))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mias_mask_overlay_projects_java_mask_shapes_with_bin_data() {
+        let dir = tmp_dir("mias_mask_overlay");
+        let overlay = dir.join("Well0001_mode1_z0_t0_overlay.tif");
+        let color_map = [
+            0, 65535, 0, 0, // red table
+            0, 0, 65535, 0, // green table
+            0, 0, 0, 65535, // blue table
+        ];
+        std::fs::write(
+            &overlay,
+            build_palette_tiff_pixels(8, 1, &color_map, &[1, 2, 3, 0, 1, 2, 3, 0]),
+        )
+        .unwrap();
+        let analysis_files = vec![MiasAnalysisFile {
+            filename: overlay,
+            plate: 0,
+            well: 0,
+            kind: MiasAnalysisKind::MaskOverlay,
+        }];
+        let mut meta = ImageMetadata {
+            size_x: 8,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            ..ImageMetadata::default()
+        };
+        add_mias_mask_rois(&mut meta.series_metadata, &analysis_files, 0, 8, 1);
+
+        let ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(&meta);
+
+        assert_eq!(ome.rois.len(), 3);
+        assert_eq!(
+            ome.images[0].roi_refs,
+            vec![
+                "ROI:0".to_string(),
+                "ROI:1".to_string(),
+                "ROI:2".to_string()
+            ]
+        );
+        match &ome.rois[0].shapes[..] {
+            [crate::common::ome_metadata::OmeShape::Mask {
+                width,
+                height,
+                stroke_color,
+                fill_color,
+                bin_data,
+                ..
+            }] => {
+                assert_eq!((*width, *height), (8.0, 1.0));
+                assert_eq!(*stroke_color, Some(pack_ome_rgba(255, 0, 0, 255)));
+                assert_eq!(*fill_color, Some(pack_ome_rgba(255, 0, 0, 255)));
+                assert_eq!(bin_data.as_deref(), Some(&[0x88][..]));
+            }
+            other => panic!("expected red mask ROI, got {other:?}"),
+        }
+        match &ome.rois[1].shapes[..] {
+            [crate::common::ome_metadata::OmeShape::Mask { bin_data, .. }] => {
+                assert_eq!(bin_data.as_deref(), Some(&[0x44][..]));
+            }
+            other => panic!("expected green mask ROI, got {other:?}"),
+        }
+        match &ome.rois[2].shapes[..] {
+            [crate::common::ome_metadata::OmeShape::Mask { bin_data, .. }] => {
+                assert_eq!(bin_data.as_deref(), Some(&[0x22][..]));
+            }
+            other => panic!("expected blue mask ROI, got {other:?}"),
+        }
+        let xml = ome.to_ome_xml(&meta);
+        assert!(xml.contains(r#"<BinData Length="1">iA==</BinData>"#));
+        assert!(xml.contains(r#"<BinData Length="1">RA==</BinData>"#));
+        assert!(xml.contains(r#"<BinData Length="1">Ig==</BinData>"#));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mias_rgb_mask_overlay_splits_channels_like_java() {
+        let dir = tmp_dir("mias_rgb_mask_overlay");
+        let overlay = dir.join("Well0001_mode1_z0_t0_overlay_rgb.tif");
+        let pixels = [
+            255, 0, 0, // red
+            0, 128, 0, // green
+            0, 0, 64, // blue
+            9, 9, 9, // grayscale, ignored by Java
+            1, 0, 1, // red + blue
+            0, 0, 0, // grayscale zero
+            5, 5, 5, // grayscale non-zero, ignored by Java
+            0, 2, 0, // green
+        ];
+        std::fs::write(&overlay, build_rgb_tiff_pixels(8, 1, &pixels)).unwrap();
+
+        let masks = mias_masks_from_overlay(&overlay);
+        assert_eq!(masks[0].as_deref(), Some(&[0x88][..]));
+        assert_eq!(masks[1].as_deref(), Some(&[0x41][..]));
+        assert_eq!(masks[2].as_deref(), Some(&[0x28][..]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mias_detail_file_projects_java_ellipse_rois() {
+        let dir = tmp_dir("mias_detail_rois");
+        let detail = dir.join("Well0001_mode2_z003_t004_detail.txt");
+        std::fs::write(
+            &detail,
+            "Summary before table\n\
+             Label\tCol\tRow\tCell Diam.\tNucleus Area\n\
+             Cell-1\t12.5\t8.25\t6.0\t20\n\
+             Cell-2\t4\t5\t2\t7\n\
+             Missing diameter\t1\t2\t\t3\n",
+        )
+        .unwrap();
+
+        let mut md = HashMap::new();
+        let count = add_mias_detail_rois(&mut md, &detail, 3);
+        assert_eq!(count, 2);
+        assert_eq!(
+            md.get("roi.3.name").map(|v| v.to_string()).as_deref(),
+            Some("Cell-1")
+        );
+        assert!(matches!(
+            md.get("roi.3.x"),
+            Some(MetadataValue::Float(v)) if (*v - 12.5).abs() < 1e-9
+        ));
+        assert!(matches!(
+            md.get("roi.3.y"),
+            Some(MetadataValue::Float(v)) if (*v - 8.25).abs() < 1e-9
+        ));
+        assert!(matches!(
+            md.get("roi.3.radius_x"),
+            Some(MetadataValue::Float(v)) if (*v - 3.0).abs() < 1e-9
+        ));
+        assert!(matches!(md.get("roi.3.the_t"), Some(MetadataValue::Int(4))));
+        assert!(matches!(md.get("roi.3.the_z"), Some(MetadataValue::Int(3))));
+
+        let mut meta = ImageMetadata {
+            size_x: 32,
+            size_y: 32,
+            size_z: 5,
+            size_c: 2,
+            size_t: 6,
+            image_count: 60,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata = md;
+        let ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(&meta);
+        assert_eq!(ome.rois.len(), 2);
+        assert_eq!(
+            ome.images[0].roi_refs,
+            vec!["ROI:3".to_string(), "ROI:4".to_string()]
+        );
+        assert_eq!(ome.rois[0].name.as_deref(), Some("Cell-1"));
+        match &ome.rois[0].shapes[..] {
+            [crate::common::ome_metadata::OmeShape::Ellipse {
+                x,
+                y,
+                radius_x,
+                radius_y,
+                the_t,
+                the_z,
+                the_c,
+            }] => {
+                assert!((*x - 12.5).abs() < 1e-9);
+                assert!((*y - 8.25).abs() < 1e-9);
+                assert!((*radius_x - 3.0).abs() < 1e-9);
+                assert!((*radius_y - 3.0).abs() < 1e-9);
+                assert_eq!(*the_t, Some(4));
+                assert_eq!(*the_z, Some(3));
+                assert_eq!(*the_c, None);
+            }
+            other => panic!("expected one ellipse ROI shape, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mias_ome_offsets_image_roi_refs_when_combining_series() {
+        let mut first_md = HashMap::new();
+        first_md.insert(
+            "roi.0.shape".into(),
+            MetadataValue::String("rectangle".into()),
+        );
+        first_md.insert("roi.0.x".into(), MetadataValue::Float(1.0));
+        first_md.insert("roi.0.y".into(), MetadataValue::Float(2.0));
+        first_md.insert("roi.0.width".into(), MetadataValue::Float(3.0));
+        first_md.insert("roi.0.height".into(), MetadataValue::Float(4.0));
+        first_md.insert("image.roi_ref.0".into(), MetadataValue::Int(0));
+
+        let mut second_md = HashMap::new();
+        second_md.insert(
+            "roi.0.shape".into(),
+            MetadataValue::String("rectangle".into()),
+        );
+        second_md.insert("roi.0.x".into(), MetadataValue::Float(5.0));
+        second_md.insert("roi.0.y".into(), MetadataValue::Float(6.0));
+        second_md.insert("roi.0.width".into(), MetadataValue::Float(7.0));
+        second_md.insert("roi.0.height".into(), MetadataValue::Float(8.0));
+        second_md.insert("image.roi_ref.0".into(), MetadataValue::Int(0));
+
+        let meta = |series_metadata| ImageMetadata {
+            size_x: 16,
+            size_y: 16,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            series_metadata,
+            ..ImageMetadata::default()
+        };
+
+        let ome = ome_from_all_mias_series(&[meta(first_md), meta(second_md)]);
+
+        assert_eq!(ome.rois.len(), 2);
+        assert_eq!(ome.rois[0].id.as_deref(), Some("ROI:0"));
+        assert_eq!(ome.rois[1].id.as_deref(), Some("ROI:1"));
+        assert_eq!(ome.images[0].roi_refs, vec!["ROI:0".to_string()]);
+        assert_eq!(ome.images[1].roi_refs, vec!["ROI:1".to_string()]);
+    }
+
+    #[test]
+    fn ome_projection_keeps_channel_count_and_cellworx_channel_fields() {
+        let mut meta = ImageMetadata {
+            size_x: 10,
+            size_y: 10,
+            size_z: 1,
+            size_c: 2,
+            size_t: 1,
+            image_count: 2,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata
+            .insert("PhysicalSizeX".into(), MetadataValue::Float(0.25));
+        meta.series_metadata
+            .insert("PhysicalSizeY".into(), MetadataValue::Float(0.5));
+        meta.series_metadata.insert(
+            "channel.0.name".into(),
+            MetadataValue::String("DAPI".into()),
+        );
+        meta.series_metadata.insert(
+            "channel.1.name".into(),
+            MetadataValue::String("FITC".into()),
+        );
+        meta.series_metadata.insert(
+            "channel.1.excitation_wavelength".into(),
+            MetadataValue::Float(488.0),
+        );
+        meta.series_metadata.insert(
+            "channel.1.emission_wavelength".into(),
+            MetadataValue::Float(525.0),
+        );
+        meta.series_metadata.insert(
+            "channel.1.detector_settings_gain".into(),
+            MetadataValue::Float(2.0),
+        );
+
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(&meta);
+        enrich_ome_from_series_metadata(&mut ome, &meta);
+        let image = &ome.images[0];
+
+        assert_eq!(image.channels.len(), 2);
+        assert_eq!(image.channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(image.channels[1].name.as_deref(), Some("FITC"));
+        assert_eq!(image.physical_size_x, Some(0.25));
+        assert_eq!(image.physical_size_y, Some(0.5));
+        assert_eq!(image.channels[1].excitation_wavelength, Some(488.0));
+        assert_eq!(image.channels[1].emission_wavelength, Some(525.0));
+        assert_eq!(image.channels[1].detector_settings_gain, Some(2.0));
+    }
+
+    #[test]
+    fn cellworx_ome_projects_java_plate_well_field_links() {
+        let mut reader = CellWorxReader::new();
+        reader.htd_path = Some(PathBuf::from("/tmp/PlateAlpha.HTD"));
+        reader.well_files = vec![
+            vec![None, Some(vec![PathBuf::from("A02_w1.TIF")])],
+            vec![Some(vec![PathBuf::from("B01_w1.TIF")]), None],
+        ];
+        reader.selected_wells = vec![(0, 1), (1, 0)];
+        reader.field_count = 2;
+        reader.series = (0..4)
+            .map(|index| {
+                let mut series_metadata = HashMap::new();
+                if index < 2 {
+                    series_metadata
+                        .insert("WellSamplePositionX".into(), MetadataValue::Float(12.5));
+                    series_metadata
+                        .insert("WellSamplePositionY".into(), MetadataValue::Float(-3.25));
+                }
+                ImageMetadata {
+                    size_x: 10,
+                    size_y: 10,
+                    size_z: 1,
+                    size_c: 1,
+                    size_t: 1,
+                    image_count: 1,
+                    series_metadata,
+                    ..ImageMetadata::default()
+                }
+            })
+            .collect();
+
+        let ome = reader.ome_metadata().unwrap();
+
+        assert_eq!(ome.images.len(), 4);
+        assert_eq!(ome.plates.len(), 1);
+        let plate = &ome.plates[0];
+        assert_eq!(plate.name.as_deref(), Some("PlateAlpha"));
+        assert_eq!(plate.rows, 2);
+        assert_eq!(plate.columns, 2);
+        assert_eq!(plate.wells.len(), 4);
+        assert!(plate.wells[0].well_samples.is_empty());
+        assert_eq!(plate.wells[1].row, 0);
+        assert_eq!(plate.wells[1].column, 1);
+        assert_eq!(plate.wells[1].well_samples.len(), 2);
+        assert_eq!(plate.wells[1].well_samples[0].image_ref, Some(0));
+        assert_eq!(plate.wells[1].well_samples[1].image_ref, Some(1));
+        assert_eq!(plate.wells[1].well_samples[0].position_x, Some(12.5));
+        assert_eq!(plate.wells[1].well_samples[0].position_y, Some(-3.25));
+        assert_eq!(plate.wells[1].well_samples[1].position_x, Some(12.5));
+        assert_eq!(plate.wells[1].well_samples[1].position_y, Some(-3.25));
+        assert_eq!(plate.wells[2].well_samples[0].image_ref, Some(2));
+        assert_eq!(plate.wells[2].well_samples[0].position_x, None);
+        assert_eq!(plate.wells[2].well_samples[0].position_y, None);
+        assert_eq!(ome.images[0].name.as_deref(), Some("Well A02 Field #1"));
+        assert_eq!(ome.images[3].name.as_deref(), Some("Well B01 Field #2"));
+    }
+
+    #[test]
+    fn cellworx_ome_inherits_metamorph_tiff_template_metadata() {
+        let mut reader = CellWorxReader::new();
+        reader.htd_path = Some(PathBuf::from("/tmp/PlateAlpha.HTD"));
+        reader.well_files = vec![vec![Some(vec![PathBuf::from("A01_w1.TIF")])]];
+        reader.selected_wells = vec![(0, 0)];
+        reader.field_count = 1;
+        reader.series = vec![ImageMetadata {
+            size_x: 10,
+            size_y: 10,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            ..ImageMetadata::default()
+        }];
+
+        let mut template = OmeMetadata::from_image_metadata(&reader.series[0]);
+        template.images[0].physical_size_x = Some(1.72);
+        template.images[0].physical_size_y = Some(1.72);
+        template.instruments.push(OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            detectors: vec![OmeDetector {
+                id: Some(create_lsid("Detector", &[0, 0])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        reader.ome_template = Some(template);
+
+        let ome = reader.ome_metadata().unwrap();
+
+        assert_eq!(ome.images[0].physical_size_x, Some(1.72));
+        assert_eq!(ome.images[0].physical_size_y, Some(1.72));
+        assert_eq!(ome.images[0].instrument_ref, Some(0));
+        assert_eq!(ome.instruments.len(), 1);
+        assert_eq!(ome.instruments[0].detectors.len(), 1);
+    }
+
+    #[test]
+    fn mias_ome_projects_java_plate_well_links() {
+        let mut reader = MiasReader::new();
+        reader.plate_name = Some("001-BarcodeFromDirectory".into());
+        reader.wells = vec![
+            MiasWell {
+                tiffs: vec![PathBuf::from("Well0001/mode0_z0_t0.tif")],
+                size_z: 1,
+                size_c: 1,
+                size_t: 1,
+                dimension_order: DimensionOrder::XYCZT,
+                well_number: 0,
+            },
+            MiasWell {
+                tiffs: vec![PathBuf::from("Well0025/mode0_z0_t0.tif")],
+                size_z: 1,
+                size_c: 1,
+                size_t: 1,
+                dimension_order: DimensionOrder::XYCZT,
+                well_number: 24,
+            },
+        ];
+        reader.series = (0..2)
+            .map(|_| ImageMetadata {
+                size_x: 10,
+                size_y: 10,
+                size_z: 1,
+                size_c: 1,
+                size_t: 1,
+                image_count: 1,
+                ..ImageMetadata::default()
+            })
+            .collect();
+
+        let ome = reader.ome_metadata().unwrap();
+
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.plates.len(), 1);
+        let plate = &ome.plates[0];
+        assert_eq!(plate.columns, 24);
+        assert_eq!(plate.rows, 1);
+        assert_eq!(plate.wells.len(), 2);
+        assert_eq!(plate.wells[0].row, 0);
+        assert_eq!(plate.wells[0].column, 0);
+        assert_eq!(plate.wells[0].well_samples[0].image_ref, Some(0));
+        assert_eq!(plate.wells[1].row, 1);
+        assert_eq!(plate.wells[1].column, 0);
+        assert_eq!(plate.wells[1].well_samples[0].image_ref, Some(1));
+        assert_eq!(ome.images[0].name.as_deref(), Some("Well A1"));
+        assert_eq!(ome.images[1].name.as_deref(), Some("Well B1"));
+        assert_eq!(plate.name.as_deref(), Some("BarcodeFromDirectory"));
+    }
+
+    #[test]
+    fn mias_plate_name_uses_java_directory_suffix_after_template_parse() {
+        let dir = tmp_dir("mias_plate_name");
+        let plate_dir = dir.join("001-DirectoryBarcode");
+        std::fs::create_dir_all(&plate_dir).unwrap();
+        let template = plate_dir.join("Nugenesistemplate.txt");
+        std::fs::write(
+            &template,
+            "Barcode=TemplateBarcode\r\nCarrier=TemplateCarrier\r\n",
+        )
+        .unwrap();
+
+        let mut reader = MiasReader::new();
+        reader.plate_name = Some("001-DirectoryBarcode".into());
+        reader.template_file = Some(template);
+        reader.wells = vec![MiasWell {
+            tiffs: vec![PathBuf::from("Well0001/mode0_z0_t0.tif")],
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            well_number: 0,
+        }];
+        reader.series = vec![ImageMetadata {
+            size_x: 10,
+            size_y: 10,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            ..ImageMetadata::default()
+        }];
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.plates[0].name.as_deref(),
+            Some("DirectoryBarcode"),
+            "Java MIASReader overwrites template Carrier/Barcode with the plate directory suffix"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -35,6 +35,7 @@ struct CellH5Series {
     plate: String,
     well: String,
     site: String,
+    rois: Vec<OmeROI>,
 }
 
 pub struct CellH5Reader {
@@ -464,35 +465,149 @@ fn cellh5_well_row_column(well: &str) -> (u32, u32) {
     }
 }
 
-fn cellh5_roi_count(
+fn read_cellh5_i32_field(dataset: &hdf5_pure_rust::Dataset, field: &str) -> Option<Vec<i32>> {
+    dataset.read_field::<i32>(field).ok()
+}
+
+fn read_cellh5_string_field(dataset: &hdf5_pure_rust::Dataset, field: &str) -> Option<Vec<String>> {
+    dataset.read_field_values(field).ok().map(|values| {
+        values
+            .into_iter()
+            .map(|value| match value {
+                hdf5_pure_rust::H5Value::String(s) => s,
+                other => format!("{other:?}"),
+            })
+            .map(|s| s.trim_matches('\0').trim().to_string())
+            .collect()
+    })
+}
+
+fn cellh5_cell_object_names(file: &hdf5_pure_rust::File) -> Vec<String> {
+    let object_root = "definition/object";
+    let object_group = match file.group(object_root) {
+        Ok(group) => group,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut names = Vec::new();
+    for object_name in hdf5_group_members(&object_group).unwrap_or_default() {
+        let object_path = format!("{object_root}/{object_name}");
+        let Ok(dataset) = file.dataset(&object_path) else {
+            continue;
+        };
+        let Some(types) = read_cellh5_string_field(&dataset, "type") else {
+            continue;
+        };
+        if types.first().is_some_and(|ty| ty == "region") {
+            names.push(object_name);
+        }
+    }
+    names
+}
+
+fn cellh5_channel_for_object(file: &hdf5_pure_rust::File, object_name: &str) -> i32 {
+    let Ok(dataset) = file.dataset("definition/image/region") else {
+        return -1;
+    };
+    let Some(region_names) = read_cellh5_string_field(&dataset, "region_name") else {
+        return -1;
+    };
+    let Some(channel_indices) = read_cellh5_i32_field(&dataset, "channel_idx") else {
+        return -1;
+    };
+    region_names
+        .iter()
+        .zip(channel_indices)
+        .find_map(|(region_name, channel)| region_name.ends_with(object_name).then_some(channel))
+        .unwrap_or(-1)
+}
+
+fn cellh5_rois(
     file: &hdf5_pure_rust::File,
     first_dataset_path: &str,
     series_count: usize,
-) -> usize {
+) -> Vec<OmeROI> {
     if series_count > 2 {
-        return 0;
+        return Vec::new();
     }
     let Some(position_path) = first_dataset_path
         .strip_suffix("/image/channel")
         .or_else(|| first_dataset_path.strip_suffix("/image/region"))
     else {
-        return 0;
+        return Vec::new();
     };
+
+    let cell_object_names = cellh5_cell_object_names(file);
+    if cell_object_names.is_empty() {
+        return Vec::new();
+    }
+
     let feature_path = format!("{position_path}/feature");
-    let feature_group = match file.group(&feature_path) {
-        Ok(group) => group,
-        Err(_) => return 0,
-    };
-    let mut count = 0usize;
-    for object_name in hdf5_group_members(&feature_group).unwrap_or_default() {
+    let mut rois = Vec::new();
+
+    for object_name in cell_object_names {
         let bbox_path = format!("{feature_path}/{object_name}/bounding_box");
-        if let Ok(dataset) = file.dataset(&bbox_path) {
-            if let Some(rows) = dataset.shape().unwrap_or_default().first() {
-                count = count.saturating_add(*rows as usize);
-            }
+        let Ok(bbox) = file.dataset(&bbox_path) else {
+            break;
+        };
+        let object_path = format!("{position_path}/object/{object_name}");
+        let Ok(times) = file.dataset(&object_path) else {
+            break;
+        };
+
+        let Some(lefts) = read_cellh5_i32_field(&bbox, "left") else {
+            continue;
+        };
+        let Some(rights) = read_cellh5_i32_field(&bbox, "right") else {
+            continue;
+        };
+        let Some(tops) = read_cellh5_i32_field(&bbox, "top") else {
+            continue;
+        };
+        let Some(bottoms) = read_cellh5_i32_field(&bbox, "bottom") else {
+            continue;
+        };
+        let Some(time_indices) = read_cellh5_i32_field(&times, "time_idx") else {
+            continue;
+        };
+        let Some(label_ids) = read_cellh5_i32_field(&times, "obj_label_id") else {
+            continue;
+        };
+
+        let roi_channel = cellh5_channel_for_object(file, &object_name);
+        let row_count = lefts
+            .len()
+            .min(rights.len())
+            .min(tops.len())
+            .min(bottoms.len())
+            .min(time_indices.len())
+            .min(label_ids.len());
+
+        for roi_index in 0..row_count {
+            let left = lefts[roi_index];
+            let right = rights[roi_index];
+            let top = tops[roi_index];
+            let bottom = bottoms[roi_index];
+            let width = right - left;
+            let height = bottom - top;
+            let roi_global_index = rois.len();
+            rois.push(OmeROI {
+                id: Some(create_lsid("ROI", &[roi_global_index])),
+                name: Some(format!("{} {}", object_name, label_ids[roi_index])),
+                shapes: vec![OmeShape::Rectangle {
+                    x: left as f64,
+                    y: top as f64,
+                    width: width as f64,
+                    height: height as f64,
+                    the_z: Some(0),
+                    the_t: u32::try_from(time_indices[roi_index]).ok(),
+                    the_c: u32::try_from(roi_channel).ok(),
+                }],
+            });
         }
     }
-    count
+
+    rois
 }
 
 fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
@@ -512,7 +627,7 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             "CellH5: no image datasets found in supported sample/plate channel layouts".into(),
         ));
     }
-    let roi_count = cellh5_roi_count(&file, &dataset_paths[0], dataset_paths.len());
+    let rois = cellh5_rois(&file, &dataset_paths[0], dataset_paths.len());
 
     let mut series_list = Vec::with_capacity(dataset_paths.len());
     for ds_path in dataset_paths {
@@ -569,7 +684,7 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
         );
         sm.insert(
             "cellh5_roi_count".into(),
-            MetadataValue::Int(roi_count as i64),
+            MetadataValue::Int(rois.len() as i64),
         );
 
         let meta = ImageMetadata {
@@ -609,6 +724,7 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             plate,
             well,
             site,
+            rois: rois.clone(),
         });
     }
 
@@ -1136,26 +1252,7 @@ impl FormatReader for CellH5Reader {
             }],
         });
 
-        let roi_count = match first.meta.series_metadata.get("cellh5_roi_count") {
-            Some(MetadataValue::Int(count)) if *count > 0 => *count as usize,
-            _ => 0,
-        };
-        ome.rois.reserve(roi_count);
-        for index in 0..roi_count {
-            ome.rois.push(OmeROI {
-                id: Some(create_lsid("ROI", &[index])),
-                name: None,
-                shapes: vec![OmeShape::Rectangle {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 0.0,
-                    height: 0.0,
-                    the_z: Some(0),
-                    the_t: Some(0),
-                    the_c: Some(0),
-                }],
-            });
-        }
+        ome.rois.extend(first.rois.clone());
 
         Some(ome)
     }
@@ -1185,6 +1282,7 @@ impl FormatReader for CellH5Reader {
 #[cfg(test)]
 mod writer_tests {
     use super::*;
+    use hdf5_pure_rust::engine::writer::{CompoundFieldSpec, DtypeSpec};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -1462,6 +1560,178 @@ mod writer_tests {
         assert!(reader.metadata().is_indexed);
         assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
         assert!(reader.lookup_table(0).unwrap().is_none());
+        reader.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cellh5_reader_populates_java_style_roi_metadata() {
+        let path = temp_path("roi_metadata");
+        let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        {
+            let mut definition = file.create_group("definition").unwrap();
+            let mut def_object = definition.create_group("object").unwrap();
+            def_object
+                .new_dataset_builder("nucleus")
+                .shape(&[1])
+                .write_raw_with_dtype(
+                    DtypeSpec::Compound {
+                        size: 8,
+                        fields: vec![CompoundFieldSpec {
+                            name: "type".to_string(),
+                            offset: 0,
+                            dtype: DtypeSpec::FixedAsciiString { len: 8, padding: 0 },
+                        }],
+                    },
+                    b"region\0\0",
+                )
+                .unwrap();
+
+            let mut def_image = definition.create_group("image").unwrap();
+            def_image
+                .new_dataset_builder("region")
+                .shape(&[1])
+                .write_raw_with_dtype(
+                    DtypeSpec::Compound {
+                        size: 20,
+                        fields: vec![
+                            CompoundFieldSpec {
+                                name: "region_name".to_string(),
+                                offset: 0,
+                                dtype: DtypeSpec::FixedAsciiString {
+                                    len: 16,
+                                    padding: 0,
+                                },
+                            },
+                            CompoundFieldSpec {
+                                name: "channel_idx".to_string(),
+                                offset: 16,
+                                dtype: DtypeSpec::I32,
+                            },
+                        ],
+                    },
+                    &[b"seg_nucleus\0\0\0\0\0".as_slice(), &1i32.to_le_bytes()].concat(),
+                )
+                .unwrap();
+        }
+        {
+            let mut sample = file.create_group("sample").unwrap();
+            let mut zero = sample.create_group("0").unwrap();
+            let mut plate = zero.create_group("plate").unwrap();
+            let mut plate0 = plate.create_group("Plate0").unwrap();
+            let mut experiment = plate0.create_group("experiment").unwrap();
+            let mut well = experiment.create_group("A01").unwrap();
+            let mut positions = well.create_group("position").unwrap();
+            let mut site = positions.create_group("1").unwrap();
+            let mut image = site.create_group("image").unwrap();
+            image
+                .new_dataset_builder("channel")
+                .shape(&[1, 2, 1, 8, 8])
+                .write::<u8>(&vec![0; 2 * 8 * 8])
+                .unwrap();
+
+            let mut feature = site.create_group("feature").unwrap();
+            let mut nucleus_feature = feature.create_group("nucleus").unwrap();
+            let bbox_rows: Vec<u8> = [
+                2i32, 7, 3, 6, //
+                10, 18, 20, 27,
+            ]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+            nucleus_feature
+                .new_dataset_builder("bounding_box")
+                .shape(&[2])
+                .write_raw_with_dtype(
+                    DtypeSpec::Compound {
+                        size: 16,
+                        fields: vec![
+                            CompoundFieldSpec {
+                                name: "left".to_string(),
+                                offset: 0,
+                                dtype: DtypeSpec::I32,
+                            },
+                            CompoundFieldSpec {
+                                name: "right".to_string(),
+                                offset: 4,
+                                dtype: DtypeSpec::I32,
+                            },
+                            CompoundFieldSpec {
+                                name: "top".to_string(),
+                                offset: 8,
+                                dtype: DtypeSpec::I32,
+                            },
+                            CompoundFieldSpec {
+                                name: "bottom".to_string(),
+                                offset: 12,
+                                dtype: DtypeSpec::I32,
+                            },
+                        ],
+                    },
+                    &bbox_rows,
+                )
+                .unwrap();
+
+            let mut object = site.create_group("object").unwrap();
+            let object_rows: Vec<u8> = [1i32, 42, 0, 43]
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect();
+            object
+                .new_dataset_builder("nucleus")
+                .shape(&[2])
+                .write_raw_with_dtype(
+                    DtypeSpec::Compound {
+                        size: 8,
+                        fields: vec![
+                            CompoundFieldSpec {
+                                name: "time_idx".to_string(),
+                                offset: 0,
+                                dtype: DtypeSpec::I32,
+                            },
+                            CompoundFieldSpec {
+                                name: "obj_label_id".to_string(),
+                                offset: 4,
+                                dtype: DtypeSpec::I32,
+                            },
+                        ],
+                    },
+                    &object_rows,
+                )
+                .unwrap();
+        }
+        file.flush().unwrap();
+
+        let mut reader = CellH5Reader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.rois.len(), 2);
+        assert_eq!(ome.rois[0].name.as_deref(), Some("nucleus 42"));
+        assert_eq!(ome.rois[1].name.as_deref(), Some("nucleus 43"));
+        assert!(matches!(
+            ome.rois[0].shapes.as_slice(),
+            [OmeShape::Rectangle {
+                x: 2.0,
+                y: 3.0,
+                width: 5.0,
+                height: 3.0,
+                the_z: Some(0),
+                the_t: Some(1),
+                the_c: Some(1),
+            }]
+        ));
+        assert!(matches!(
+            ome.rois[1].shapes.as_slice(),
+            [OmeShape::Rectangle {
+                x: 10.0,
+                y: 20.0,
+                width: 8.0,
+                height: 7.0,
+                the_z: Some(0),
+                the_t: Some(0),
+                the_c: Some(1),
+            }]
+        ));
         reader.close().unwrap();
         std::fs::remove_file(&path).ok();
     }

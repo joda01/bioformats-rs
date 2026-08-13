@@ -1,7 +1,7 @@
 //! Khoros VIFF / XV (Visualization Image File Format) reader.
 //!
 //! Ported from the Java `KhorosReader` ("Khoros XV"). Magic: 16-bit value
-//! `0xAB01` (first byte `0xAB`). Extensions: `.xv`, `.viff`.
+//! `0xAB01` (first byte `0xAB`). Java registers the reader for `.xv`.
 //!
 //! The 1024-byte header is parsed per `KhorosReader.initFile`: a `dependency`
 //! word selects byte order, the comment block is skipped, dimensions and the
@@ -266,7 +266,7 @@ impl FormatReader for KhorosReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("xv") | Some("viff"))
+        matches!(ext.as_deref(), Some("xv"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -383,5 +383,18 @@ impl FormatReader for KhorosReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_detection_matches_java_xv_suffix_only() {
+        let reader = KhorosReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("image.XV")));
+        assert!(!reader.is_this_type_by_name(Path::new("image.viff")));
+        assert!(!reader.is_this_type_by_name(Path::new("image.xv.txt")));
     }
 }

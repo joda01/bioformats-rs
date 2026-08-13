@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::peek_header;
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, LookupTable, MetadataOptions};
 use crate::common::ome_metadata::OmeMetadata;
 use crate::common::path::confined_join;
 use crate::common::reader::FormatReader;
@@ -74,6 +74,12 @@ impl ImageReader {
     pub fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(plane_index)
     }
+    pub fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+        self.inner.lookup_table(plane_index)
+    }
+    pub fn set_metadata_options(&mut self, options: MetadataOptions) {
+        self.inner.set_metadata_options(options);
+    }
     pub fn compressed_level_info(
         &self,
         plane_index: u32,
@@ -97,6 +103,9 @@ impl ImageReader {
     }
     pub fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
+    }
+    pub fn resolution(&self) -> usize {
+        self.inner.resolution()
     }
     pub fn close(&mut self) -> Result<()> {
         self.inner.close()

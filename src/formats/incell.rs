@@ -778,7 +778,7 @@ fn validate_incell_companions(m: &InCellMeta) -> Result<()> {
     }
     if !has_existing_companion {
         return Err(BioFormatsError::UnsupportedFormat(
-            "InCell XML/XDCE does not reference any existing companion image files".into(),
+            "InCell XML/XDCE does not reference any existing companion image files; no TIFF image files found referenced in index".into(),
         ));
     }
     if has_tiff_companion {

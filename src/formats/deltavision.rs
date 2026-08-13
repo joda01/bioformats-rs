@@ -1369,18 +1369,14 @@ impl FormatReader for DeltavisionReader {
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        let end = offset.checked_add(plane_bytes as u64).ok_or_else(|| {
-            BioFormatsError::InvalidData("DeltaVision plane offset overflows".into())
-        })?;
-        if end > file_len {
-            return Err(BioFormatsError::InvalidData(format!(
-                "DeltaVision plane {plane_index} exceeds file length: need bytes {offset}..{end}, file length {file_len}"
-            )));
-        }
         f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
         let mut stored = vec![0u8; plane_bytes];
-        f.read_exact(&mut stored).map_err(BioFormatsError::Io)?;
+        if offset < file_len {
+            let available = (file_len - offset).min(plane_bytes as u64) as usize;
+            f.read_exact(&mut stored[..available])
+                .map_err(BioFormatsError::Io)?;
+        }
 
         let mut buf = vec![0u8; plane_bytes];
         for y in 0..meta.size_y as usize {
@@ -1546,6 +1542,7 @@ impl FormatReader for DeltavisionReader {
                         id: o.id.clone(),
                         model: o.model.clone(),
                         manufacturer: o.manufacturer.clone(),
+                        serial_number: None,
                         nominal_magnification: o.nominal_magnification,
                         calibrated_magnification: None,
                         lens_na: o.lens_na,
@@ -1914,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_plane_returns_error_instead_of_zero_filling_tail() {
+    fn truncated_plane_zero_fills_unavailable_tail_like_java() {
         let truncated = [1, 2, 3];
         let path = write_synthetic_dv("truncated_plane", 2, 2, 1, 5, 1, 0, 1, &[&truncated]);
 
@@ -1925,11 +1922,8 @@ mod tests {
         assert_eq!(meta.size_x, 2);
         assert_eq!(meta.size_y, 2);
 
-        let err = reader.open_bytes(0).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("exceeds file length")),
-            "{err:?}"
-        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 0, 1, 2]);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![0, 2]);
 
         fs::remove_file(path).ok();
     }

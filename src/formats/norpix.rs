@@ -790,7 +790,7 @@ impl FormatReader for IplabReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("ipl") || e.eq_ignore_ascii_case("ipm"))
+            .map(|e| e.eq_ignore_ascii_case("ipl"))
             .unwrap_or(false)
     }
 
@@ -1864,6 +1864,20 @@ mod seq_tests {
         let reader = SeqReader::new();
         assert!(!reader.is_this_type_by_name(Path::new("image.seq")));
         assert!(reader.is_this_type_by_name(Path::new("image.ips")));
+    }
+
+    #[test]
+    fn iplab_name_detection_matches_java_registered_suffix() {
+        let reader = IplabReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("image.ipl")));
+        assert!(reader.is_this_type_by_name(Path::new("image.IPL")));
+        assert!(!reader.is_this_type_by_name(Path::new("image.ipm")));
+
+        let mut header = Vec::new();
+        header.extend_from_slice(b"iiii");
+        header.extend_from_slice(&4i32.to_le_bytes());
+        header.extend_from_slice(&0x100ei32.to_le_bytes());
+        assert!(reader.is_this_type_by_bytes(&header));
     }
 
     #[test]

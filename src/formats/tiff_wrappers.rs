@@ -242,9 +242,11 @@ const NDPI_X_POSITION: u16 = 65422;
 const NDPI_Y_POSITION: u16 = 65423;
 const NDPI_Z_POSITION: u16 = 65424;
 const NDPI_MARKER_TAG: u16 = 65426;
+const NDPI_FILTER_SET_NAME: u16 = 65434;
 const NDPI_CAPTURE_MODE: u16 = 65441;
 const NDPI_SERIAL_NUMBER: u16 = 65442;
 const NDPI_METADATA_TAG: u16 = 65449;
+const NDPI_WAVELENGTH: u16 = 65451;
 
 pub(crate) fn ndpi_has_hamamatsu_tags(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
@@ -545,8 +547,9 @@ impl NdpiReader {
         Self::ndpi_pixel_bytes_for_metadata(m, buf)
     }
 
-    /// Build OME image metadata for each flattened series: name "Series N" and
-    /// PhysicalSizeX/Y derived from the IFD resolution tags
+    /// Build OME image metadata for each logical series: base pyramid plus
+    /// trailing macro/map series. PhysicalSizeX/Y are derived from IFD
+    /// resolution tags
     /// (`10000 / XResolution` for ResolutionUnit == cm), mirroring the
     /// FormatTools.getPhysicalSize path Java uses for NDPI.
     fn build_ndpi_ome(&mut self) {
@@ -612,14 +615,32 @@ impl NdpiReader {
             if planes.is_empty() && i == 0 && metadata.image_count > 0 {
                 planes.push(OmePlane::default());
             }
+            let mut channel = OmeChannel {
+                samples_per_pixel: metadata.size_c.max(1),
+                ..Default::default()
+            };
+            if let Some(ifd) = self.inner.ifd(ifd_idx) {
+                if let Some(name) = ifd
+                    .get(NDPI_FILTER_SET_NAME)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim_matches('\0').trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    channel.name = Some(name.to_string());
+                }
+                if let Some(wave) = ifd
+                    .get(NDPI_WAVELENGTH)
+                    .and_then(|v| v.as_vec_f64().first().copied())
+                    .filter(|&w| w > 0.0)
+                {
+                    channel.emission_wavelength = Some(wave);
+                }
+            }
             images.push(OmeImage {
                 name: Some(format!("Series {}", i + 1)),
                 physical_size_x: px,
                 physical_size_y: py,
-                channels: vec![OmeChannel {
-                    samples_per_pixel: metadata.size_c.max(1),
-                    ..Default::default()
-                }],
+                channels: vec![channel],
                 planes,
                 ..Default::default()
             });
@@ -963,9 +984,6 @@ impl FormatReader for NdpiReader {
                 "NDPI TIFF contains no readable image series".into(),
             ));
         }
-        // Java's default ImageReader flattens the pyramid: each resolution is its
-        // own top-level series. Mirror that so seriesCount matches the reference.
-        let _ = self.inner.flatten_resolutions_into_series();
         // Per-series interleaving follows NDPIReader.useTiffParser: a JPEG IFD
         // larger than MAX_SIZE in both dimensions is decoded chunky/interleaved
         // by the custom NDPI service; everything else is read channel-separated.
@@ -1429,9 +1447,9 @@ impl LeicaScnReader {
             s.metadata.is_interleaved = false;
         }
 
-        // Build per-(image, resolution) OME metadata BEFORE flattening, so each
-        // flattened series gets the right name ("image_NAME (Rk)") and physical
-        // size (Leica volume / resolution width), mirroring LeicaSCNReader.
+        // Build one OME image per logical SCN image. Java skips nonzero
+        // resolutions in initMetadataStore when flattened resolutions are
+        // disabled.
         use crate::common::ome_metadata::{OmeChannel, OmeImage};
         let mut ome_images: Vec<OmeImage> = Vec::new();
         for img in images {
@@ -1453,55 +1471,52 @@ impl LeicaScnReader {
             } else {
                 img.size_c.max(1)
             };
-            for r in 0..img.size_r.max(1) {
-                let dim = img.lookup(0, 0, r);
-                let width = dim
-                    .map(|d| d.size_x)
-                    .filter(|&w| w > 0)
-                    .or_else(|| {
-                        dim.and_then(|d| self.inner.ifd(d.ifd))
-                            .and_then(|ifd| ifd.image_width())
-                    })
-                    .unwrap_or(0);
-                let height = dim
-                    .map(|d| d.size_y)
-                    .filter(|&h| h > 0)
-                    .or_else(|| {
-                        dim.and_then(|d| self.inner.ifd(d.ifd))
-                            .and_then(|ifd| ifd.image_length())
-                    })
-                    .unwrap_or(0);
-                let px = if img.v_size_x > 0 && width > 0 {
-                    Some((img.v_size_x as f64 / 1000.0) / width as f64)
-                } else {
-                    None
-                };
-                let py = if img.v_size_y > 0 && height > 0 {
-                    Some((img.v_size_y as f64 / 1000.0) / height as f64)
-                } else {
-                    None
-                };
-                let objective_ref = images
-                    .iter()
-                    .position(|candidate| candidate.name == img.name)
-                    .unwrap_or(0)
-                    .min(1);
-                ome_images.push(OmeImage {
-                    name: Some(format!("{} (R{})", img.name, r)),
-                    physical_size_x: px,
-                    physical_size_y: py,
-                    physical_size_z: (img.v_spacing_z > 0)
-                        .then_some(img.v_spacing_z as f64 / 1000.0),
-                    channels: vec![OmeChannel {
-                        samples_per_pixel: channels,
-                        ..Default::default()
-                    }],
-                    planes: vec![crate::common::ome_metadata::OmePlane::default()],
-                    instrument_ref: Some(0),
-                    objective_ref: Some(objective_ref),
+            let dim = img.lookup(0, 0, 0);
+            let width = dim
+                .map(|d| d.size_x)
+                .filter(|&w| w > 0)
+                .or_else(|| {
+                    dim.and_then(|d| self.inner.ifd(d.ifd))
+                        .and_then(|ifd| ifd.image_width())
+                })
+                .unwrap_or(0);
+            let height = dim
+                .map(|d| d.size_y)
+                .filter(|&h| h > 0)
+                .or_else(|| {
+                    dim.and_then(|d| self.inner.ifd(d.ifd))
+                        .and_then(|ifd| ifd.image_length())
+                })
+                .unwrap_or(0);
+            let px = if img.v_size_x > 0 && width > 0 {
+                Some((img.v_size_x as f64 / 1000.0) / width as f64)
+            } else {
+                None
+            };
+            let py = if img.v_size_y > 0 && height > 0 {
+                Some((img.v_size_y as f64 / 1000.0) / height as f64)
+            } else {
+                None
+            };
+            let objective_ref = images
+                .iter()
+                .position(|candidate| candidate.name == img.name)
+                .unwrap_or(0)
+                .min(1);
+            ome_images.push(OmeImage {
+                name: Some(img.name.clone()),
+                physical_size_x: px,
+                physical_size_y: py,
+                physical_size_z: (img.v_spacing_z > 0).then_some(img.v_spacing_z as f64 / 1000.0),
+                channels: vec![OmeChannel {
+                    samples_per_pixel: channels,
                     ..Default::default()
-                });
-            }
+                }],
+                planes: vec![crate::common::ome_metadata::OmePlane::default()],
+                instrument_ref: Some(0),
+                objective_ref: Some(objective_ref),
+                ..Default::default()
+            });
         }
         self.ome_images = ome_images;
 
@@ -1517,9 +1532,6 @@ impl LeicaScnReader {
             return;
         }
         self.build_scn_series(&images);
-        // Java flattens each image's resolution pyramid into top-level series.
-        let _ = self.inner.flatten_resolutions_into_series();
-        // Flattening copies the parent metadata; re-assert channel-separated.
         for s in self.inner.series_list_mut() {
             s.metadata.is_interleaved = false;
         }
@@ -1960,7 +1972,12 @@ impl VentanaReader {
         if !self.reassemble {
             return;
         }
-        if let Some(&(sx, sy)) = self.stitched_resolution_sizes.get(self.inner.series()) {
+        let level = if self.inner.series() == 0 {
+            self.inner.resolution()
+        } else {
+            return;
+        };
+        if let Some(&(sx, sy)) = self.stitched_resolution_sizes.get(level) {
             let mut meta = self.inner.metadata().clone();
             meta.size_x = sx;
             meta.size_y = sy;
@@ -2258,22 +2275,36 @@ impl VentanaReader {
             }
         }
 
-        let mut reordered = Vec::new();
         let ifd_count = self.inner.ifd_count();
-        for ifd in self.pyramid_start_ifd..ifd_count {
-            let Some(mut s) = by_ifd.remove(&ifd) else {
-                continue;
-            };
-            let level = ifd - self.pyramid_start_ifd;
-            if let Some(&(sx, sy)) = self.stitched_resolution_sizes.get(level) {
-                s.metadata.size_x = sx;
-                s.metadata.size_y = sy;
-            }
-            s.metadata.is_interleaved = false;
-            reordered.push(s);
+        let resolution_count = ifd_count.saturating_sub(self.pyramid_start_ifd);
+        if resolution_count == 0 {
+            return;
         }
+
+        let Some(mut pyramid) = by_ifd.remove(&self.pyramid_start_ifd) else {
+            return;
+        };
+        pyramid.ifd_indices = vec![self.pyramid_start_ifd];
+        pyramid.plane_ifd_indices = Vec::new();
+        pyramid.sub_resolutions = ((self.pyramid_start_ifd + 1)..ifd_count)
+            .map(|ifd| vec![ifd])
+            .collect();
+        if let Some(&(sx, sy)) = self.stitched_resolution_sizes.first() {
+            pyramid.metadata.size_x = sx;
+            pyramid.metadata.size_y = sy;
+        }
+        pyramid.metadata.resolution_count = resolution_count as u32;
+        pyramid.metadata.is_interleaved = false;
+
+        let mut reordered = Vec::new();
+        reordered.push(pyramid);
+
         for ifd in 0..self.pyramid_start_ifd {
             if let Some(mut s) = by_ifd.remove(&ifd) {
+                s.ifd_indices = vec![ifd];
+                s.plane_ifd_indices = Vec::new();
+                s.sub_resolutions = Vec::new();
+                s.metadata.resolution_count = 1;
                 s.metadata.is_interleaved = false;
                 reordered.push(s);
             }
@@ -2309,7 +2340,11 @@ impl VentanaReader {
     /// (`VentanaReader.java:740-743`): `round(fullX / resX)`.
     fn get_scale(&self) -> i64 {
         if self.reassemble {
-            let level = self.inner.series();
+            let level = if self.inner.series() == 0 {
+                self.inner.resolution()
+            } else {
+                0
+            };
             if let (Some(&(full_x, _)), Some(&(res_x, _))) = (
                 self.stitched_resolution_sizes.first(),
                 self.stitched_resolution_sizes.get(level),
@@ -2526,7 +2561,7 @@ impl FormatReader for VentanaReader {
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         // Reassemble the stitched image at the current resolution (Java stitches
         // every resolution by scaling AOI/tile coords; VentanaReader.java:240-312).
-        if self.reassemble && self.inner.series() < self.stitched_resolution_sizes.len() {
+        if self.reassemble && self.inner.series() == 0 {
             if p != 0 {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
@@ -2539,7 +2574,7 @@ impl FormatReader for VentanaReader {
         self.inner.open_bytes(p)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        if self.reassemble && self.inner.series() < self.stitched_resolution_sizes.len() {
+        if self.reassemble && self.inner.series() == 0 {
             if p != 0 {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
@@ -2649,6 +2684,87 @@ mod leica_scn_ventana_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn push_entry(out: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tiff_entry(tag, typ, count, value));
+    }
+
+    fn write_ventana_bif_two_resolution_tiff(path: &Path) {
+        let mut xmp = br#"<root><iScan ScanRes="0.25" Magnification="20"/><SlideStitchInfo><ImageInfo AOIScanned="1" AOIIndex="0" NumRows="1" NumCols="1"/></SlideStitchInfo><AoiOrigin><AOI0 OriginX="0" OriginY="0"/></AoiOrigin></root>"#.to_vec();
+        xmp.push(0);
+        let mut level0 = b"level=0 mag=20".to_vec();
+        level0.push(0);
+        let mut level1 = b"level=1".to_vec();
+        level1.push(0);
+
+        let ifd_count = 4usize;
+        let entries = 14u32;
+        let ifd_size = 2 + entries * 12 + 4;
+        let ifd_offsets: Vec<u32> = (0..ifd_count).map(|i| 8 + i as u32 * ifd_size).collect();
+        let xmp_offset = ifd_offsets[ifd_count - 1] + ifd_size;
+        let level0_offset = xmp_offset + xmp.len() as u32;
+        let level1_offset = level0_offset + level0.len() as u32;
+        let pixel0 = level1_offset + level1.len() as u32;
+        let pixel1 = pixel0 + 1;
+        let pixel2 = pixel1 + 2;
+        let pixel3 = pixel2 + 4;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_offsets[0].to_le_bytes());
+
+        let specs = [
+            (1u32, 1u32, 1u32, pixel0, 0u32, 1u32, 0u32, 1u32),
+            (1, 2, 2, pixel1, 0, 1, 0, 1),
+            (
+                2,
+                2,
+                4,
+                pixel2,
+                level0_offset,
+                level0.len() as u32,
+                xmp_offset,
+                xmp.len() as u32,
+            ),
+            (1, 1, 1, pixel3, level1_offset, level1.len() as u32, 0, 1),
+        ];
+
+        for (i, (w, h, byte_count, pixel_offset, desc_offset, desc_len, xmp_off, xmp_len)) in
+            specs.iter().enumerate()
+        {
+            bytes.extend_from_slice(&(entries as u16).to_le_bytes());
+            push_entry(&mut bytes, 256, 4, 1, *w);
+            push_entry(&mut bytes, 257, 4, 1, *h);
+            push_entry(&mut bytes, 258, 3, 1, 8);
+            push_entry(&mut bytes, 259, 3, 1, 1);
+            push_entry(&mut bytes, 262, 3, 1, 1);
+            push_entry(&mut bytes, 270, 2, *desc_len, *desc_offset);
+            push_entry(&mut bytes, 277, 3, 1, 1);
+            push_entry(&mut bytes, 284, 3, 1, 1);
+            push_entry(&mut bytes, 322, 4, 1, *w);
+            push_entry(&mut bytes, 323, 4, 1, *h);
+            push_entry(&mut bytes, 324, 4, 1, *pixel_offset);
+            push_entry(&mut bytes, 325, 4, 1, *byte_count);
+            push_entry(&mut bytes, 700, 1, *xmp_len, *xmp_off);
+            push_entry(&mut bytes, 279, 4, 1, *byte_count);
+            let next = if i + 1 < ifd_count {
+                ifd_offsets[i + 1]
+            } else {
+                0
+            };
+            bytes.extend_from_slice(&next.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&xmp);
+        bytes.extend_from_slice(&level0);
+        bytes.extend_from_slice(&level1);
+        bytes.push(10);
+        bytes.extend_from_slice(&[20, 21]);
+        bytes.extend_from_slice(&[30, 31, 32, 33]);
+        bytes.push(40);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn leica_scn_treats_photometric_rgb_as_rgb_even_with_one_sample() {
         let path = temp_path("photometric_rgb", "scn");
@@ -2707,6 +2823,35 @@ mod leica_scn_ventana_tests {
             VentanaReader::stitched_size_for_resolution(1000, 901, 777, 333),
             (300, 259)
         );
+    }
+
+    #[test]
+    fn ventana_bif_pyramid_ifds_are_nested_resolutions_like_java_non_flattened() {
+        let path = temp_path("ventana_nested", "bif");
+        write_ventana_bif_two_resolution_tiff(&path);
+
+        let mut reader = VentanaReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 3);
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.metadata().resolution_count, 2);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        reader.set_series(2).unwrap();
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 2));
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 3);
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -12389,12 +12534,15 @@ mod ndpi_offset64_tests {
             } else {
                 None
             };
-            let entry_count = 10u16 + u16::from(spec.first) * 5;
+            let filter_set_name = if spec.first { Some("DAPI") } else { None };
+            let entry_count = 10u16 + u16::from(spec.first) * 7;
             let ifd_start = data.len() as u32;
             let after_ifd = ifd_start + 2 + u32::from(entry_count) * 12 + 4;
             let metadata_len = metadata.map(|s| s.len() as u32 + 1).unwrap_or(0);
             let metadata_offset = after_ifd;
-            let pixel_offset = metadata_offset + metadata_len;
+            let filter_set_name_len = filter_set_name.map(|s| s.len() as u32 + 1).unwrap_or(0);
+            let filter_set_name_offset = metadata_offset + metadata_len;
+            let pixel_offset = filter_set_name_offset + filter_set_name_len;
             let next_ifd = if i + 1 == specs.len() {
                 0
             } else {
@@ -12423,10 +12571,21 @@ mod ndpi_offset64_tests {
                     metadata.len() as u32 + 1,
                     metadata_offset,
                 );
+                push_ifd_ascii(
+                    &mut data,
+                    NDPI_FILTER_SET_NAME,
+                    filter_set_name.unwrap().len() as u32 + 1,
+                    filter_set_name_offset,
+                );
+                push_ifd_short(&mut data, NDPI_WAVELENGTH, 461);
             }
             push_u32_le(&mut data, next_ifd);
             if let Some(metadata) = metadata {
                 data.extend_from_slice(metadata.as_bytes());
+                data.push(0);
+            }
+            if let Some(filter_set_name) = filter_set_name {
+                data.extend_from_slice(filter_set_name.as_bytes());
                 data.push(0);
             }
             data.extend_from_slice(&spec.pixels);
@@ -12454,7 +12613,7 @@ mod ndpi_offset64_tests {
         let mut reader = NdpiReader::new();
         reader.set_id(&path).unwrap();
 
-        assert_eq!(reader.series_count(), 3);
+        assert_eq!(reader.series_count(), 2);
         assert_eq!(reader.pyramid_height(), 2);
 
         reader.set_series(0).unwrap();
@@ -12463,21 +12622,31 @@ mod ndpi_offset64_tests {
         assert!(!full.is_rgb);
         assert_eq!(full.bits_per_pixel, 14);
         assert_eq!(full.pixel_type, PixelType::Uint16);
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!((full.size_x, full.size_y), (4, 4));
 
-        reader.set_series(1).unwrap();
+        reader.set_resolution(1).unwrap();
         let subres = reader.metadata();
         assert_eq!(subres.size_c, 1);
         assert!(!subres.is_rgb);
         assert_eq!(subres.bits_per_pixel, 14);
         assert_eq!(subres.pixel_type, PixelType::Uint16);
+        assert_eq!(reader.resolution(), 1);
+        assert_eq!((subres.size_x, subres.size_y), (2, 2));
 
-        reader.set_series(2).unwrap();
+        reader.set_resolution(0).unwrap();
+        assert_eq!(reader.resolution(), 0);
+
+        reader.set_series(1).unwrap();
         let macro_image = reader.metadata();
         assert_eq!(macro_image.size_c, 3);
         assert!(macro_image.is_rgb);
         assert_eq!(macro_image.bits_per_pixel, 8);
+        assert_eq!(reader.resolution_count(), 1);
 
         let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 2);
         assert_eq!(
             ome.images
                 .iter()
@@ -12487,6 +12656,8 @@ mod ndpi_offset64_tests {
         );
         assert_eq!(ome.images[0].planes[0].position_x, Some(12.5));
         assert_eq!(ome.images[0].planes[0].position_y, Some(25.0));
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(ome.images[0].channels[0].emission_wavelength, Some(461.0));
 
         let _ = std::fs::remove_file(path);
     }
@@ -12584,6 +12755,8 @@ mod ndpi_offset64_tests {
 #[cfg(test)]
 mod leica_scn_tests {
     use super::*;
+    use crate::common::reader::FormatReader;
+    use crate::tiff::ifd::tag;
 
     #[test]
     fn scn_supplemental_image_does_not_close_active_image() {
@@ -12618,6 +12791,116 @@ mod leica_scn_tests {
             images[1].dims.iter().map(|d| d.ifd).collect::<Vec<_>>(),
             vec![2]
         );
+    }
+
+    fn push_entry(out: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&typ.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_scn_two_resolution_tiff(path: &Path) {
+        let xml = r#"<scn xmlns="http://www.leica-microsystems.com/scn/2010/10/01">
+  <collection name="c">
+    <image name="main">
+      <pixels sizeX="4" sizeY="3" sizeZ="1" sizeC="1" sizeR="2">
+        <dimension r="0" z="0" c="0" sizeX="4" sizeY="3" ifd="0"/>
+        <dimension r="1" z="0" c="0" sizeX="2" sizeY="1" ifd="1"/>
+      </pixels>
+      <objective>20</objective>
+      <vSizeX>4000</vSizeX>
+      <vSizeY>3000</vSizeY>
+    </image>
+  </collection>
+</scn>"#;
+        let xml_bytes = {
+            let mut bytes = xml.as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        };
+
+        let ifd0_entries = 10u32;
+        let ifd0_start = 8u32;
+        let ifd0_end = ifd0_start + 2 + ifd0_entries * 12 + 4;
+        let desc_offset = ifd0_end;
+        let pixel0_offset = desc_offset + xml_bytes.len() as u32;
+        let pixel0 = vec![1u8; 12];
+        let ifd1_start = pixel0_offset + pixel0.len() as u32;
+        let ifd1_entries = 9u32;
+        let ifd1_end = ifd1_start + 2 + ifd1_entries * 12 + 4;
+        let pixel1_offset = ifd1_end;
+        let pixel1 = vec![2u8; 2];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&ifd0_start.to_le_bytes());
+
+        data.extend_from_slice(&(ifd0_entries as u16).to_le_bytes());
+        push_entry(&mut data, tag::IMAGE_WIDTH, 4, 1, 4);
+        push_entry(&mut data, tag::IMAGE_LENGTH, 4, 1, 3);
+        push_entry(&mut data, tag::BITS_PER_SAMPLE, 3, 1, 8);
+        push_entry(&mut data, tag::COMPRESSION, 3, 1, 1);
+        push_entry(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 3, 1, 1);
+        push_entry(
+            &mut data,
+            tag::IMAGE_DESCRIPTION,
+            2,
+            xml_bytes.len() as u32,
+            desc_offset,
+        );
+        push_entry(&mut data, tag::STRIP_OFFSETS, 4, 1, pixel0_offset);
+        push_entry(&mut data, tag::SAMPLES_PER_PIXEL, 3, 1, 1);
+        push_entry(&mut data, tag::ROWS_PER_STRIP, 4, 1, 3);
+        push_entry(&mut data, tag::STRIP_BYTE_COUNTS, 4, 1, pixel0.len() as u32);
+        data.extend_from_slice(&ifd1_start.to_le_bytes());
+        data.extend_from_slice(&xml_bytes);
+        data.extend_from_slice(&pixel0);
+
+        data.extend_from_slice(&(ifd1_entries as u16).to_le_bytes());
+        push_entry(&mut data, tag::IMAGE_WIDTH, 4, 1, 2);
+        push_entry(&mut data, tag::IMAGE_LENGTH, 4, 1, 1);
+        push_entry(&mut data, tag::BITS_PER_SAMPLE, 3, 1, 8);
+        push_entry(&mut data, tag::COMPRESSION, 3, 1, 1);
+        push_entry(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 3, 1, 1);
+        push_entry(&mut data, tag::STRIP_OFFSETS, 4, 1, pixel1_offset);
+        push_entry(&mut data, tag::SAMPLES_PER_PIXEL, 3, 1, 1);
+        push_entry(&mut data, tag::ROWS_PER_STRIP, 4, 1, 1);
+        push_entry(&mut data, tag::STRIP_BYTE_COUNTS, 4, 1, pixel1.len() as u32);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&pixel1);
+
+        std::fs::write(path, data).unwrap();
+    }
+
+    #[test]
+    fn scn_pyramid_exposes_resolution_levels_not_flattened_series() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_rs_scn_pyramid_{}.scn",
+            std::process::id()
+        ));
+        write_scn_two_resolution_tiff(&path);
+
+        let mut reader = LeicaScnReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.metadata().resolution_count, 2);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 3));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1u8; 12]);
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!(reader.resolution(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![2u8; 2]);
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 1);
+        assert_eq!(ome.images[0].name.as_deref(), Some("main"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

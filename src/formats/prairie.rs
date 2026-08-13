@@ -266,6 +266,7 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
     // Parse Sequence / Frame / File structure.
     let mut sequences: Vec<Sequence> = Vec::new();
     let mut active_channels: BTreeSet<i32> = BTreeSet::new();
+    let mut channel_wavelengths: HashMap<i32, f64> = HashMap::new();
     let mut cur_seq: Option<Sequence> = None;
     let mut cur_frame: Option<PFrame> = None;
     let mut next_frame_index: i32 = 0;
@@ -443,6 +444,9 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
                         .entry(format!("channel_name[{}]", channel))
                         .or_insert(MetadataValue::String(cname));
                 }
+                if let Some(wave) = prairie_file_emission_wavelength(line) {
+                    channel_wavelengths.entry(channel).or_insert(wave);
+                }
                 let Some(filename) = confined_join(&dir, fname) else {
                     continue;
                 };
@@ -498,6 +502,21 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
         ));
     }
     let size_c = channels.len() as u32;
+    for (channel_index, channel) in channels.iter().enumerate() {
+        let source_name_key = format!("channel_name[{channel}]");
+        if let Some(MetadataValue::String(name)) = meta_map.get(&source_name_key).cloned() {
+            meta_map.insert(
+                format!("channel.{channel_index}.name"),
+                MetadataValue::String(name),
+            );
+        }
+        if let Some(wave) = channel_wavelengths.get(channel).copied() {
+            meta_map.insert(
+                format!("channel.{channel_index}.emission_wavelength"),
+                MetadataValue::Float(wave),
+            );
+        }
+    }
 
     // NB: Both stage positions and time points are rasterized into the list of
     // Sequences. So sequenceCount = sizeT * seriesCount (Java
@@ -685,6 +704,21 @@ fn positions_match(sequences: &[Sequence], size_t: usize, size_p: usize) -> bool
         }
     }
     true
+}
+
+fn prairie_file_emission_wavelength(line: &str) -> Option<f64> {
+    if let Some(wave) = extract_attr(line, "wavelength").and_then(|value| value.parse::<f64>().ok())
+    {
+        return (wave.is_finite() && wave > 0.0).then_some(wave);
+    }
+    let min = extract_attr(line, "wavelengthMin").and_then(|value| value.parse::<f64>().ok());
+    let max = extract_attr(line, "wavelengthMax").and_then(|value| value.parse::<f64>().ok());
+    match (min, max) {
+        (Some(a), Some(b)) if a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0 => {
+            Some((a + b) / 2.0)
+        }
+        _ => None,
+    }
 }
 
 /// Compute (z, c, t) for a plane index under XYCZT order.
@@ -1422,6 +1456,49 @@ mod prairie_tests {
         };
 
         assert!(frame.file_for_channel(2).is_none());
+    }
+
+    #[test]
+    fn prairie_ome_projects_channel_name_and_average_emission_like_java() {
+        let dir = temp_dir("channel_metadata");
+        let tiff = dir.join("scan_ch1.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        ImageWriter::save(&tiff, &meta, &[vec![17]]).unwrap();
+        let xml = dir.join("scan.xml");
+        std::fs::write(
+            &xml,
+            r#"<PVScan>
+<PVStateValue key="pixelsPerLine" value="1"/>
+<PVStateValue key="linesPerFrame" value="1"/>
+<PVStateValue key="bitDepth" value="8"/>
+<Sequence>
+<Frame index="0">
+<File filename="scan_ch1.tif" channel="1" channelName="DAPI" wavelengthMin="450" wavelengthMax="470" page="1"/>
+</Frame>
+</Sequence>
+</PVScan>"#,
+        )
+        .unwrap();
+
+        let mut reader = PrairieReader::new();
+        reader.set_id(&xml).unwrap();
+
+        let ome = reader.ome_metadata().expect("Prairie OME metadata");
+        let channel = &ome.images[0].channels[0];
+        assert_eq!(channel.name.as_deref(), Some("DAPI"));
+        assert_eq!(channel.emission_wavelength, Some(460.0));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

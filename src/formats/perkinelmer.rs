@@ -114,6 +114,9 @@ pub struct PerkinElmerReader {
     origin_x: f64,
     origin_y: f64,
     origin_z: f64,
+    /// Channel wavelengths parsed from HTML Exposure entries. Java `emWaves`/`exWaves`.
+    em_waves: Vec<f64>,
+    ex_waves: Vec<f64>,
 }
 
 impl PerkinElmerReader {
@@ -135,6 +138,8 @@ impl PerkinElmerReader {
             origin_x: 0.0,
             origin_y: 0.0,
             origin_z: 0.0,
+            em_waves: Vec::new(),
+            ex_waves: Vec::new(),
         }
     }
 }
@@ -210,6 +215,8 @@ struct PeMeta {
     origin_x: f64,
     origin_y: f64,
     origin_z: f64,
+    em_waves: Vec<f64>,
+    ex_waves: Vec<f64>,
     metadata: HashMap<String, MetadataValue>,
 }
 
@@ -231,6 +238,8 @@ impl Default for PeMeta {
             origin_x: 0.0,
             origin_y: 0.0,
             origin_z: 0.0,
+            em_waves: Vec::new(),
+            ex_waves: Vec::new(),
             metadata: HashMap::new(),
         }
     }
@@ -352,10 +361,41 @@ fn pe_parse_htm(m: &mut PeMeta, content: &str) {
     while j + 1 < tokens.len() {
         let key = tokens[j].trim().to_string();
         let value = tokens[j + 1].trim().to_string();
+        if key.contains("Exposure") {
+            pe_parse_exposure_wavelengths(m, &key);
+        }
         if !key.is_empty() {
             pe_parse_key_value(m, &key, &value);
         }
         j += 2;
+    }
+}
+
+fn pe_parse_exposure_wavelengths(m: &mut PeMeta, token: &str) {
+    let Some(nm_index) = token.find("nm") else {
+        return;
+    };
+    let paren = token[..nm_index].rfind('(');
+    let slash = token[..nm_index].rfind('/').unwrap_or(nm_index);
+    if let Some(paren) = paren {
+        if paren + 1 < slash {
+            if let Ok(wave) = token[paren + 1..slash].trim().parse::<f64>() {
+                m.em_waves.push(wave);
+            }
+        }
+    }
+
+    let Some(second_nm) = token[nm_index + 2..].find("nm").map(|i| i + nm_index + 2) else {
+        return;
+    };
+    let paren = token[..second_nm].rfind(' ');
+    let slash = token[..second_nm].rfind('/').unwrap_or(second_nm + 2);
+    if let Some(paren) = paren {
+        if paren + 1 < slash && slash <= token.len() {
+            if let Ok(wave) = token[paren + 1..slash].trim().parse::<f64>() {
+                m.ex_waves.push(wave);
+            }
+        }
     }
 }
 
@@ -839,6 +879,8 @@ impl FormatReader for PerkinElmerReader {
         self.origin_x = m.origin_x;
         self.origin_y = m.origin_y;
         self.origin_z = m.origin_z;
+        self.em_waves = m.em_waves.clone();
+        self.ex_waves = m.ex_waves.clone();
 
         let meta = ImageMetadata {
             size_x,
@@ -887,6 +929,8 @@ impl FormatReader for PerkinElmerReader {
         self.origin_x = 0.0;
         self.origin_y = 0.0;
         self.origin_z = 0.0;
+        self.em_waves.clear();
+        self.ex_waves.clear();
         if self.tiff_loaded {
             let _ = self.tiff_reader.close();
             self.tiff_loaded = false;
@@ -1005,6 +1049,21 @@ impl FormatReader for PerkinElmerReader {
         }
         if self.pixel_size_y.is_finite() && self.pixel_size_y > 0.0 {
             img.physical_size_y = Some(self.pixel_size_y);
+        }
+
+        // HTML Exposure wavelengths -> LogicalChannel emission/excitation
+        // (Java PerkinElmerReader.java:629-641).
+        for (i, channel) in img.channels.iter_mut().enumerate() {
+            if let Some(&wave) = self.em_waves.get(i) {
+                if wave > 0.0 && wave.is_finite() {
+                    channel.emission_wavelength = Some(wave);
+                }
+            }
+            if let Some(&wave) = self.ex_waves.get(i) {
+                if wave > 0.0 && wave.is_finite() {
+                    channel.excitation_wavelength = Some(wave);
+                }
+            }
         }
 
         // start/finish time -> per-plane DeltaT (Java initFile, line 647-659):
@@ -2136,6 +2195,52 @@ mod perkinelmer_metadata_tests {
             m.metadata.get("Origin Z"),
             Some(MetadataValue::String(v)) if v == "5.5"
         ));
+    }
+
+    #[test]
+    fn htm_exposure_wavelengths_project_to_ome_channels_like_java() {
+        let mut parsed = PeMeta::default();
+        pe_parse_htm(
+            &mut parsed,
+            "<td>Camera Data 0 Exposure 100 ms (520/35 nm 488/20nm)</td><td>x</td>\
+             <td>Camera Data 1 Exposure 100 ms (610/40 nm 561/20nm)</td><td>x</td>",
+        );
+        assert_eq!(parsed.em_waves, vec![520.0, 610.0]);
+        assert_eq!(parsed.ex_waves, vec![488.0, 561.0]);
+
+        let mut reader = PerkinElmerReader::new();
+        reader.meta = Some(ImageMetadata {
+            size_x: 2,
+            size_y: 1,
+            size_z: 1,
+            size_c: 2,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 2,
+            dimension_order: DimensionOrder::XYCTZ,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        reader.em_waves = parsed.em_waves;
+        reader.ex_waves = parsed.ex_waves;
+
+        let ome = reader.ome_metadata().unwrap();
+        let channels = &ome.images[0].channels;
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].emission_wavelength, Some(520.0));
+        assert_eq!(channels[0].excitation_wavelength, Some(488.0));
+        assert_eq!(channels[1].emission_wavelength, Some(610.0));
+        assert_eq!(channels[1].excitation_wavelength, Some(561.0));
     }
 
     #[test]

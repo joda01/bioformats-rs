@@ -3975,6 +3975,36 @@ impl FormatReader for FilePatternReader {
         }
     }
 
+    fn resolution_count(&self) -> usize {
+        if let Some(stitcher) = &self.stitcher {
+            stitcher.resolution_count()
+        } else {
+            self.meta
+                .as_ref()
+                .map(|m| m.resolution_count.max(1) as usize)
+                .unwrap_or(1)
+        }
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if let Some(stitcher) = &mut self.stitcher {
+            return stitcher.set_resolution(level);
+        }
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if level == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::PlaneOutOfRange(level as u32))
+        }
+    }
+
+    fn resolution(&self) -> usize {
+        self.stitcher
+            .as_ref()
+            .map_or(0, |stitcher| stitcher.resolution())
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         if let Some(stitcher) = &mut self.stitcher {
             return stitcher.open_bytes(plane_index);
@@ -4023,6 +4053,60 @@ impl FormatReader for FilePatternReader {
         }
         let meta = self.meta.as_ref()?;
         Some(crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta))
+    }
+}
+
+#[cfg(test)]
+mod file_pattern_resolution_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("bioformats_filepattern_{tag}_{nanos}_{n}"))
+    }
+
+    #[test]
+    fn forwards_wrapped_reader_resolution_api_like_java() {
+        let dir = unique_dir("pyr");
+        std::fs::create_dir(&dir).unwrap();
+        let fake = dir.join("pyr&sizeX=8&sizeY=4&resolutions=3&resolutionScale=2.fake");
+        let pattern = dir.join("pyr.pattern");
+        std::fs::write(&fake, []).unwrap();
+        std::fs::write(&pattern, fake.to_string_lossy().as_bytes()).unwrap();
+
+        let mut reader = FilePatternReader::new();
+        reader.set_id(&pattern).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 3);
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (8, 4));
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!(reader.resolution(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 2));
+        assert_eq!(reader.open_bytes(0).unwrap().len(), 8);
+
+        reader.set_resolution(2).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert_eq!(reader.open_bytes(0).unwrap().len(), 2);
+
+        assert!(matches!(
+            reader.set_resolution(3),
+            Err(BioFormatsError::PlaneOutOfRange(3))
+        ));
+
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(&pattern);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
 

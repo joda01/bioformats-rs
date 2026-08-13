@@ -10,8 +10,9 @@
 //!
 //! ## Series model (Java parity)
 //!
-//! This is a faithful port of `loci.formats.in.BDVReader`. A *series* is
-//! created per `(ViewSetup × resolution-level)`, NOT per timepoint:
+//! This is a faithful port of `loci.formats.in.BDVReader` with flattened
+//! resolutions disabled. A *series* is created per logical `ViewSetup`, NOT per
+//! timepoint or resolution:
 //!   * `sizeT` = number of timepoints (all timepoints share one series),
 //!   * `sizeC` = number of distinct `channel` attributes in the XML (multiple
 //!     channel ViewSetups collapse into a single multi-channel series),
@@ -19,9 +20,8 @@
 //!   * `imageCount = sizeC * sizeT * sizeZ`,
 //!   * `dimensionOrder = XYZTC`.
 //!
-//! As in upstream Bio-Formats' default `ImageReader` configuration,
-//! resolutions are *flattened*: every resolution level of a setup is exposed
-//! as its own series. Image names follow `P_t{first:05}, W_s{setup:02}_{level}`.
+//! Mipmap levels are exposed via `resolution_count()` / `set_resolution()`.
+//! Image names follow `P_t{first:05}, W_s{setup:02}`.
 //!
 //! ### Known intentional divergence
 //!
@@ -42,8 +42,17 @@ use crate::common::reader::FormatReader;
 
 use hdf5_pure_rust::{HyperslabDim, Selection};
 
-/// One core series: a single resolution level of one logical setup across all
-/// timepoints. Resolutions are flattened, but timepoints stay in `sizeT`.
+/// One resolution level of one logical BDV setup.
+#[derive(Clone)]
+struct ResolutionInfo {
+    /// Resolution level (the `{level}` group number).
+    level: u32,
+    /// Core metadata for this resolution.
+    meta: ImageMetadata,
+}
+
+/// One core series: one logical setup across all timepoints. Resolutions stay
+/// nested under the series; timepoints stay in `sizeT`.
 #[derive(Clone)]
 struct SeriesInfo {
     /// The first-channel/base `sNN` setup id for this logical series.
@@ -52,10 +61,8 @@ struct SeriesInfo {
     channel_setups: Vec<u32>,
     /// Timepoints exposed through this series' T axis.
     timepoints: Vec<u32>,
-    /// Resolution level (the `{level}` group number).
-    level: u32,
-    /// Core metadata for this series.
-    meta: ImageMetadata,
+    /// Nested resolution levels for this setup.
+    resolutions: Vec<ResolutionInfo>,
     /// Physical pixel sizes from the owning setup's voxelSize.
     voxel_size: Option<(f64, f64, f64)>,
 }
@@ -99,9 +106,10 @@ pub struct BdvReader {
     timepoint_increment: u32,
     timepoint_use_pattern: bool,
 
-    /// Flattened series list (one per logical setup/resolution level).
+    /// Logical series list (one per logical setup).
     series: Vec<SeriesInfo>,
     current_series: usize,
+    current_resolution: usize,
 }
 
 impl BdvReader {
@@ -119,6 +127,7 @@ impl BdvReader {
             timepoint_use_pattern: false,
             series: Vec::new(),
             current_series: 0,
+            current_resolution: 0,
         }
     }
 
@@ -128,11 +137,16 @@ impl BdvReader {
             .series
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
+        let ri = si
+            .resolutions
+            .get(self.current_resolution)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &ri.meta;
         let (_z, c, t) = get_zct_coords(
-            si.meta.dimension_order,
-            si.meta.size_z,
-            si.meta.size_c,
-            si.meta.size_t,
+            meta.dimension_order,
+            meta.size_z,
+            meta.size_c,
+            meta.size_t,
             no,
         );
         let timepoint =
@@ -146,8 +160,19 @@ impl BdvReader {
             .unwrap_or(si.setup);
         Ok(format!(
             "t{:05}/s{:02}/{}/cells",
-            timepoint, setup, si.level
+            timepoint, setup, ri.level
         ))
+    }
+
+    fn current_resolution_info(&self) -> Option<&ResolutionInfo> {
+        self.series
+            .get(self.current_series)?
+            .resolutions
+            .get(self.current_resolution)
+    }
+
+    fn current_metadata(&self) -> Option<&ImageMetadata> {
+        self.current_resolution_info().map(|r| &r.meta)
     }
 }
 
@@ -573,6 +598,7 @@ impl FormatReader for BdvReader {
         self.parse_structure()?;
 
         self.current_series = 0;
+        self.current_resolution = 0;
         Ok(())
     }
 
@@ -589,6 +615,7 @@ impl FormatReader for BdvReader {
         self.timepoint_use_pattern = false;
         self.series.clear();
         self.current_series = 0;
+        self.current_resolution = 0;
         Ok(())
     }
 
@@ -604,6 +631,7 @@ impl FormatReader for BdvReader {
             return Err(BioFormatsError::SeriesOutOfRange(s));
         }
         self.current_series = s;
+        self.current_resolution = 0;
         Ok(())
     }
 
@@ -612,16 +640,14 @@ impl FormatReader for BdvReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.series
-            .get(self.current_series)
-            .map(|s| &s.meta)
+        self.current_metadata()
             .unwrap_or_else(|| crate::common::reader::uninitialized_metadata())
     }
 
     fn resolution_count(&self) -> usize {
         self.series
             .get(self.current_series)
-            .map(|s| s.meta.resolution_count as usize)
+            .map(|s| s.resolutions.len())
             .unwrap_or(0)
     }
 
@@ -635,15 +661,18 @@ impl FormatReader for BdvReader {
                 self.resolution_count().saturating_sub(1)
             )));
         }
+        self.current_resolution = level;
         Ok(())
     }
 
+    fn resolution(&self) -> usize {
+        self.current_resolution
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let si = self
-            .series
-            .get(self.current_series)
+        let meta = self
+            .current_metadata()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let meta = &si.meta;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -666,11 +695,9 @@ impl FormatReader for BdvReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let si = self
-            .series
-            .get(self.current_series)
+        let meta = self
+            .current_metadata()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let meta = &si.meta;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -696,11 +723,10 @@ impl FormatReader for BdvReader {
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let si = self
-            .series
-            .get(self.current_series)
+        let meta = self
+            .current_metadata()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let (sx, sy) = (si.meta.size_x, si.meta.size_y);
+        let (sx, sy) = (meta.size_x, meta.size_y);
         let tw = sx.min(256);
         let th = sy.min(256);
         let tx = (sx - tw) / 2;
@@ -721,14 +747,15 @@ impl FormatReader for BdvReader {
                 .copied()
                 .unwrap_or(self.first_timepoint);
             let name = match setup {
-                Some(s) => format!("P_t{first_timepoint:05}, W_s{:02}_{}", s.id, si.level),
-                None => format!("P_t{first_timepoint:05}, W_s{:02}_{}", si.setup, si.level),
+                Some(s) => format!("P_t{first_timepoint:05}, W_s{:02}", s.id),
+                None => format!("P_t{first_timepoint:05}, W_s{:02}", si.setup),
             };
             let (psx, psy, psz) = match si.voxel_size {
                 Some((x, y, z)) => (Some(x), Some(y), Some(z)),
                 None => (None, None, None),
             };
-            let channels: Vec<OmeChannel> = (0..si.meta.size_c.max(1))
+            let base_meta = si.resolutions.first().map(|r| &r.meta)?;
+            let channels: Vec<OmeChannel> = (0..base_meta.size_c.max(1))
                 .map(|_| OmeChannel {
                     samples_per_pixel: 1,
                     ..Default::default()
@@ -826,9 +853,9 @@ impl BdvReader {
 
         let size_c = self.size_c.max(1);
 
-        // Build the flattened series list: logical setup × level. Only first
-        // timepoint coordinates that actually carry a `cells` dataset become
-        // series; other timepoints are resolved at plane-read time through T.
+        // Build the logical series list. Only first-timepoint setup coordinates
+        // that carry at least one `cells` dataset become series; other
+        // timepoints are resolved at plane-read time through T.
         let mut series: Vec<SeriesInfo> = Vec::new();
         let first_channel = self.channel_indexes.first().copied();
         let mut logical_setup_index = 0usize;
@@ -863,6 +890,7 @@ impl BdvReader {
             };
             levels.sort_unstable();
 
+            let mut resolutions = Vec::new();
             for &level in &levels {
                 let cells_path = format!("{setup_group}/{level}/cells");
                 if !dataset_exists(file, &cells_path) {
@@ -893,7 +921,6 @@ impl BdvReader {
                 })?;
                 let (pixel_type, bytes_per_sample) = pixel_type_for_size(dtype_size)?;
 
-                let voxel_size = setup.voxel_size;
                 let meta_map =
                     self.build_series_metadata(Some(setup), setup.id, timepoints[0], level);
                 let size_t = java_timepoint_count(
@@ -921,9 +948,6 @@ impl BdvReader {
                     is_interleaved: false,
                     is_indexed: true,
                     is_little_endian: true,
-                    // This reader exposes each BDV mipmap level as its own
-                    // flattened series, matching Java's core view here; each
-                    // visible series therefore has a single active resolution.
                     resolution_count: 1,
                     thumbnail: false,
                     series_metadata: meta_map,
@@ -933,13 +957,19 @@ impl BdvReader {
                     modulo_t: None,
                 };
 
+                resolutions.push(ResolutionInfo { level, meta });
+            }
+            let resolution_count = resolutions.len() as u32;
+            for resolution in &mut resolutions {
+                resolution.meta.resolution_count = resolution_count;
+            }
+            if !resolutions.is_empty() {
                 series.push(SeriesInfo {
                     setup: setup.id,
                     channel_setups: channel_setups.clone(),
                     timepoints: timepoints.clone(),
-                    level,
-                    meta,
-                    voxel_size,
+                    resolutions,
+                    voxel_size: setup.voxel_size,
                 });
             }
         }
@@ -1098,9 +1128,8 @@ impl BdvReader {
     fn read_block(&self, no: u32, z: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let ds_path = self.image_data_path(no)?;
         let bps = self
-            .series
-            .get(self.current_series)
-            .map(|s| s.meta.pixel_type.bytes_per_sample() as usize)
+            .current_metadata()
+            .map(|m| m.pixel_type.bytes_per_sample() as usize)
             .ok_or(BioFormatsError::NotInitialized)?;
 
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -1326,7 +1355,7 @@ mod tests {
             is_interleaved: false,
             is_indexed: true,
             is_little_endian: true,
-            resolution_count: 1,
+            resolution_count: 2,
             thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
@@ -1343,16 +1372,33 @@ mod tests {
             setup: 10,
             channel_setups: vec![10, 11],
             timepoints: vec![3, 5],
-            level: 2,
-            meta: bdv_test_meta(),
+            resolutions: vec![
+                ResolutionInfo {
+                    level: 2,
+                    meta: bdv_test_meta(),
+                },
+                ResolutionInfo {
+                    level: 4,
+                    meta: ImageMetadata {
+                        size_x: 2,
+                        size_y: 2,
+                        resolution_count: 2,
+                        ..bdv_test_meta()
+                    },
+                },
+            ],
             voxel_size: None,
         });
 
+        assert_eq!(r.resolution_count(), 2);
         assert_eq!(r.image_data_path(0).unwrap(), "t00003/s10/2/cells");
         assert_eq!(r.image_data_path(1).unwrap(), "t00003/s10/2/cells");
         assert_eq!(r.image_data_path(2).unwrap(), "t00005/s10/2/cells");
         assert_eq!(r.image_data_path(4).unwrap(), "t00003/s11/2/cells");
         assert_eq!(r.image_data_path(6).unwrap(), "t00005/s11/2/cells");
+        r.set_resolution(1).unwrap();
+        assert_eq!(r.image_data_path(0).unwrap(), "t00003/s10/4/cells");
+        assert_eq!((r.metadata().size_x, r.metadata().size_y), (2, 2));
     }
 
     #[test]
@@ -1426,10 +1472,16 @@ mod tests {
         let mut r = BdvReader::new();
         r.set_id(path).unwrap();
 
-        assert_eq!(r.series_count(), 34);
+        assert_eq!(r.series_count(), 9);
         assert_eq!(r.metadata().size_t, 1);
         assert_eq!(r.metadata().size_c, 1);
-        assert_eq!(r.metadata().resolution_count, 1);
+        assert_eq!(r.resolution_count(), 4);
+        assert_eq!(r.metadata().resolution_count, 4);
         assert_eq!(r.metadata().image_count, r.metadata().size_z);
+        let full_size = (r.metadata().size_x, r.metadata().size_y);
+        r.set_resolution(1).unwrap();
+        assert_eq!(r.resolution(), 1);
+        assert!(r.metadata().size_x <= full_size.0);
+        assert!(r.metadata().size_y <= full_size.1);
     }
 }

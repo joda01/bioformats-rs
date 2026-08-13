@@ -248,8 +248,18 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
 /// order. TIFF callers pass the IFD endianness; standalone callers keep the
 /// historical little-endian output through [`decompress_jpeg2000`].
 pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> Result<Vec<u8>> {
+    decompress_jpeg2000_with_endianness_and_reduce(data, little_endian, 0)
+}
+
+/// Decompress JPEG 2000 data at a reduced wavelet resolution. `reduce == 0`
+/// decodes full resolution; `reduce == 1` decodes dimensions divided by 2, etc.
+pub fn decompress_jpeg2000_with_endianness_and_reduce(
+    data: &[u8],
+    little_endian: bool,
+    reduce: u32,
+) -> Result<Vec<u8>> {
     use jpeg2k::Image as J2kImage;
-    let image = J2kImage::from_bytes(data)
+    let image = J2kImage::from_bytes_with(data, jpeg2k::DecodeParameters::new().reduce(reduce))
         .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
     let components = image.components();
     if components.is_empty() {

@@ -27,7 +27,7 @@
 //! parity is printed as a scored report. Set `BIOFORMATS_RS_JAVA_PARITY_STRICT=1`
 //! to also fail on pixel divergence.
 
-use bioformats::common::metadata::DimensionOrder;
+use bioformats::common::metadata::{DimensionOrder, MetadataValue};
 use bioformats::common::ome_metadata::OmeAnnotation;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::ImageReader;
@@ -650,7 +650,7 @@ fn java_parity() {
                     js["indexed"], m.is_indexed
                 ));
             }
-            let rust_rgb_channel_count = if m.is_rgb { m.size_c.max(1) } else { 1 };
+            let rust_rgb_channel_count = rust_rgb_channel_count(&m);
             cmp_u(
                 "rgbChannelCount",
                 js["rgbChannelCount"].as_u64().unwrap_or(0),
@@ -1225,4 +1225,23 @@ fn java_parity() {
             ome_failures.join("\n  - ")
         );
     }
+}
+
+fn rust_rgb_channel_count(meta: &bioformats::common::metadata::ImageMetadata) -> u32 {
+    if !meta.is_rgb {
+        return 1;
+    }
+    meta.series_metadata
+        .iter()
+        .find_map(|(key, value)| {
+            key.ends_with("rgb_channel_count").then(|| match value {
+                MetadataValue::Int(value) if *value > 0 => Some(*value as u32),
+                MetadataValue::Float(value) if value.is_finite() && *value > 0.0 => {
+                    Some(*value as u32)
+                }
+                MetadataValue::String(value) => value.trim().parse::<u32>().ok(),
+                _ => None,
+            })?
+        })
+        .unwrap_or_else(|| meta.size_c.max(1))
 }

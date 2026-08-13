@@ -44,6 +44,12 @@ struct IcsHeader {
     scale_units: Vec<String>,
     /// Per-timepoint timestamps in seconds (from `parameter t`).
     timestamps: Vec<Option<f64>>,
+    /// Channel names (from `parameter ch`).
+    channel_names: Vec<Option<String>>,
+    /// Gray Institute lifetime-data marker from `history type`.
+    lifetime: bool,
+    /// Gray Institute lifetime dimension labels from `history labels`.
+    lifetime_labels: Option<String>,
     /// Emission wavelengths (from `sensor s_params LambdaEm`).
     em_waves: Vec<f64>,
     /// Excitation wavelengths (from `sensor s_params LambdaEx`).
@@ -111,7 +117,17 @@ impl IcsHeader {
                     "t" => {
                         hdr.timestamps = parse_ics_optional_doubles(&tokens[2..]);
                     }
-                    _ => {}
+                    "ch" => {
+                        let value = tokens[2..].join(" ");
+                        hdr.channel_names = value
+                            .split(' ')
+                            .map(|name| Some(name.trim().to_string()))
+                            .collect();
+                    }
+                    _ => {
+                        hdr.extra
+                            .insert(format!("history\t{}", tokens[1]), tokens[2..].join(" "));
+                    }
                 },
                 "sensor" if tokens.len() >= 4 && tokens[1].eq_ignore_ascii_case("s_params") => {
                     hdr.extra.insert(
@@ -134,11 +150,26 @@ impl IcsHeader {
                         _ => {}
                     }
                 }
-                "history" if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("software") => {
-                    if tokens[2..].join(" ").contains("SVI") {
-                        hdr.invert_y = true;
+                "history" if tokens.len() >= 3 => match tokens[1].to_ascii_lowercase().as_str() {
+                    "software" => {
+                        if tokens[2..].join(" ").contains("SVI") {
+                            hdr.invert_y = true;
+                        }
                     }
-                }
+                    "type" => {
+                        let value = tokens[2..].join(" ");
+                        if value.eq_ignore_ascii_case("lifetime") {
+                            hdr.lifetime = true;
+                        }
+                        hdr.extra.insert("history\ttype".into(), value);
+                    }
+                    "labels" => {
+                        let value = tokens[2..].join(" ");
+                        hdr.lifetime_labels = Some(value.clone());
+                        hdr.extra.insert("history\tlabels".into(), value);
+                    }
+                    _ => {}
+                },
                 "layout" if tokens.len() >= 3 => match tokens[1].to_ascii_lowercase().as_str() {
                     "order" => {
                         hdr.order = tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
@@ -351,7 +382,7 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         stored_rgb = true;
     }
 
-    let dimension_order = make_sane_dimension_order(&dim_order);
+    let mut dimension_order = make_sane_dimension_order(&dim_order);
 
     if size_z == 0 {
         size_z = 1;
@@ -374,11 +405,6 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
 
     let pixel_type = pixel_type_from_ics(sig, &hdr.format, &hdr.sign);
 
-    // imageCount = sizeZ * sizeT, times sizeC only when not RGB.
-    let mut image_count = size_z * size_t;
-    if !is_rgb {
-        image_count *= size_c;
-    }
     let _ = stored_rgb;
 
     let mut series_metadata: HashMap<String, MetadataValue> = hdr
@@ -404,6 +430,54 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         little_endian = !little_endian;
     }
 
+    let mut is_interleaved = is_rgb;
+    let mut modulo_c = None;
+
+    // Java ICSReader Gray Institute lifetime hack. This happens after normal
+    // core metadata is populated and before imageCount is finalized.
+    if hdr.lifetime {
+        if let Some(labels) = hdr.lifetime_labels.as_deref() {
+            if labels.eq_ignore_ascii_case("t x y") {
+                let bin_count = size_x;
+                size_x = size_y;
+                size_y = size_z;
+                size_z = 1;
+                size_c = bin_count;
+                dimension_order = DimensionOrder::XYCZT;
+                is_interleaved = true;
+                modulo_c = Some(crate::common::metadata::ModuloAnnotation {
+                    parent_dimension: "C".into(),
+                    modulo_type: "lifetime".into(),
+                    start: 0.0,
+                    step: 1.0,
+                    end: bin_count.saturating_sub(1) as f64,
+                    unit: String::new(),
+                    labels: Vec::new(),
+                });
+            } else if labels.eq_ignore_ascii_case("x y t") {
+                let bin_count = size_z;
+                size_z = 1;
+                size_c = bin_count;
+                dimension_order = DimensionOrder::XYCZT;
+                modulo_c = Some(crate::common::metadata::ModuloAnnotation {
+                    parent_dimension: "C".into(),
+                    modulo_type: "lifetime".into(),
+                    start: 0.0,
+                    step: 1.0,
+                    end: bin_count.saturating_sub(1) as f64,
+                    unit: String::new(),
+                    labels: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // imageCount = sizeZ * sizeT, times sizeC only when not RGB.
+    let mut image_count = size_z * size_t;
+    if !is_rgb {
+        image_count *= size_c;
+    }
+
     Ok(ImageMetadata {
         size_x,
         size_y,
@@ -415,7 +489,7 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         image_count,
         dimension_order,
         is_rgb,
-        is_interleaved: is_rgb,
+        is_interleaved,
         is_indexed: false,
         is_little_endian: little_endian,
         resolution_count: 1,
@@ -423,7 +497,7 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         series_metadata,
         lookup_table: None,
         modulo_z: None,
-        modulo_c: None,
+        modulo_c,
         modulo_t: None,
     })
 }
@@ -656,6 +730,44 @@ impl IcsReader {
         Ok(strides)
     }
 
+    fn load_lifetime_plane(&self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let hdr = self
+            .header
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let bytes_per_sample = meta.pixel_type.bytes_per_sample();
+        let plane_bytes = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(bytes_per_sample))
+            .ok_or_else(|| BioFormatsError::InvalidData("ICS plane byte size overflow".into()))?;
+        let start = (plane_index as usize)
+            .checked_mul(plane_bytes)
+            .ok_or_else(|| BioFormatsError::InvalidData("ICS byte offset overflow".into()))?;
+        let end = start
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::InvalidData("ICS byte offset overflow".into()))?;
+        let payload = self.data_payload()?;
+        if end > payload.len() {
+            return Err(BioFormatsError::InvalidData(
+                "plane out of range in ICS data".into(),
+            ));
+        }
+        let mut out = payload[start..end].to_vec();
+        if hdr.invert_y && meta.size_y > 1 {
+            let row_len = meta.size_x as usize * bytes_per_sample;
+            let h = meta.size_y as usize;
+            for r in 0..h / 2 {
+                let top = r * row_len;
+                let bottom = (h - r - 1) * row_len;
+                for i in 0..row_len {
+                    out.swap(top + i, bottom + i);
+                }
+            }
+        }
+        self.normalize_endianness(out)
+    }
+
     fn read_raw_region(&self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let hdr = self
@@ -670,6 +782,11 @@ impl IcsReader {
                 "ICS region {x},{y} {w}x{h} outside {}x{}",
                 meta.size_x, meta.size_y
             )));
+        }
+
+        if hdr.lifetime {
+            let full = self.load_lifetime_plane(plane_index)?;
+            return crop_full_plane("ICS", &full, meta, 1, x, y, w, h);
         }
 
         if hdr.gzip_compressed {
@@ -794,6 +911,10 @@ impl IcsReader {
             .header
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
+
+        if hdr.lifetime {
+            return self.load_lifetime_plane(plane_index);
+        }
 
         let bytes_per_sample = meta.pixel_type.bytes_per_sample();
         let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
@@ -1133,6 +1254,9 @@ impl FormatReader for IcsReader {
 
         // Per-channel emission/excitation wavelengths.
         for (ci, ch) in img.channels.iter_mut().enumerate() {
+            if let Some(Some(name)) = hdr.channel_names.get(ci) {
+                ch.name = Some(name.clone());
+            }
             if let Some(&w) = hdr.em_waves.get(ci) {
                 if w > 0.0 {
                     ch.emission_wavelength = Some(w);
@@ -1351,7 +1475,7 @@ mod tests {
         let companion = dir.join("stored_rgb_with_waves.ids");
 
         let header = format!(
-            "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits ch x y\nlayout\tsizes\t8 2 2 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nsensor\ts_params\tLambdaEm\t510 620\n",
+            "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits ch x y\nlayout\tsizes\t8 2 2 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nparameter\tch\tDAPI FITC\nsensor\ts_params\tLambdaEm\t510 620\n",
             companion.file_name().unwrap().to_string_lossy()
         );
         std::fs::write(&ics, header).unwrap();
@@ -1365,6 +1489,81 @@ mod tests {
         assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
         assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12]);
         assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![12]);
+
+        let ome = reader.ome_metadata().expect("ICS OME metadata");
+        let channels = &ome.images[0].channels;
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(channels[1].name.as_deref(), Some("FITC"));
+        assert_eq!(channels[0].emission_wavelength, Some(510.0));
+        assert_eq!(channels[1].emission_wavelength, Some(620.0));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lifetime_history_labels_x_y_t_remap_z_to_channels_like_java() {
+        let dir = tmp_dir("lifetime_xyt");
+        let ics = dir.join("lifetime_xyt.ics");
+        let companion = dir.join("lifetime_xyt.ids");
+
+        let header = format!(
+            "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits x y z\nlayout\tsizes\t8 2 2 3\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nhistory\ttype\tlifetime\nhistory\tlabels\tx y t\n",
+            companion.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(&ics, header).unwrap();
+        std::fs::write(&companion, [1, 2, 3, 4, 11, 12, 13, 14, 21, 22, 23, 24]).unwrap();
+
+        let mut reader = IcsReader::new();
+        reader.set_id(&ics).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 3);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        assert_eq!(
+            meta.modulo_c.as_ref().map(|m| m.modulo_type.as_str()),
+            Some("lifetime")
+        );
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12, 13, 14]);
+        assert_eq!(reader.open_bytes_region(2, 1, 1, 1, 1).unwrap(), vec![24]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lifetime_history_labels_t_x_y_remap_nominal_xyz_like_java() {
+        let dir = tmp_dir("lifetime_txy");
+        let ics = dir.join("lifetime_txy.ics");
+        let companion = dir.join("lifetime_txy.ids");
+
+        let header = format!(
+            "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits x y z\nlayout\tsizes\t8 3 2 2\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nhistory\ttype\tlifetime\nhistory\tlabels\tt x y\n",
+            companion.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(&ics, header).unwrap();
+        std::fs::write(&companion, [1, 2, 3, 4, 11, 12, 13, 14, 21, 22, 23, 24]).unwrap();
+
+        let mut reader = IcsReader::new();
+        reader.set_id(&ics).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 3);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        assert!(meta.is_interleaved);
+        assert_eq!(
+            meta.modulo_c.as_ref().map(|m| m.modulo_type.as_str()),
+            Some("lifetime")
+        );
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12, 13, 14]);
+        assert_eq!(reader.open_bytes_region(0, 1, 1, 1, 1).unwrap(), vec![4]);
 
         let _ = std::fs::remove_dir_all(dir);
     }

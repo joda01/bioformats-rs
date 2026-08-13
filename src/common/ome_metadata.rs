@@ -52,12 +52,20 @@ pub struct OmeImage {
     /// `<ImagingEnvironment>` temperature (degrees Celsius). Set by readers such
     /// as MicroManager that record the detector/sample temperature.
     pub imaging_environment_temperature: Option<f64>,
+    /// Image-level stage label (`<StageLabel>`).
+    #[serde(default)]
+    pub stage_label: Option<OmeStageLabel>,
     pub channels: Vec<OmeChannel>,
     pub planes: Vec<OmePlane>,
     /// Reference to an instrument (index into `OmeMetadata::instruments`).
     pub instrument_ref: Option<usize>,
     /// Reference to an objective (index into the instrument's objectives).
     pub objective_ref: Option<usize>,
+    /// Image-level ROI references (`<ROIRef ID="..."/>`).
+    #[serde(default)]
+    pub roi_refs: Vec<String>,
+    /// Refractive index from `<ObjectiveSettings RefractiveIndex="...">`.
+    pub objective_settings_refractive_index: Option<f64>,
     /// Per-channel light paths.
     pub light_paths: Vec<OmeLightPath>,
     /// Modulo annotation for Z (sub-dimensions within Z).
@@ -66,6 +74,15 @@ pub struct OmeImage {
     pub modulo_c: Option<crate::metadata::ModuloAnnotation>,
     /// Modulo annotation for T (sub-dimensions within T).
     pub modulo_t: Option<crate::metadata::ModuloAnnotation>,
+}
+
+/// Image-level stage position label.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OmeStageLabel {
+    pub name: Option<String>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub z: Option<f64>,
 }
 
 /// Per-channel metadata.
@@ -115,6 +132,7 @@ pub struct OmeInstrument {
     pub id: Option<String>,
     pub microscope_model: Option<String>,
     pub microscope_manufacturer: Option<String>,
+    pub microscope_serial_number: Option<String>,
     pub objectives: Vec<OmeObjective>,
     pub detectors: Vec<OmeDetector>,
     pub light_sources: Vec<OmeLightSource>,
@@ -128,6 +146,7 @@ pub struct OmeObjective {
     pub id: Option<String>,
     pub model: Option<String>,
     pub manufacturer: Option<String>,
+    pub serial_number: Option<String>,
     /// Nominal magnification (e.g. 40.0 for 40×).
     pub nominal_magnification: Option<f64>,
     /// Calibrated magnification.
@@ -251,6 +270,18 @@ pub enum OmeShape {
     },
     Polyline {
         points: Vec<(f64, f64)>,
+        the_z: Option<u32>,
+        the_t: Option<u32>,
+        the_c: Option<u32>,
+    },
+    Mask {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        stroke_color: Option<i32>,
+        fill_color: Option<i32>,
+        bin_data: Option<Vec<u8>>,
         the_z: Option<u32>,
         the_t: Option<u32>,
         the_c: Option<u32>,
@@ -399,13 +430,19 @@ impl OmeMetadata {
             let inst_id = inst.id.as_deref().unwrap_or(&default_inst_id);
             let _ = write!(xml, r#"<Instrument ID="{}">"#, xml_escape(inst_id));
 
-            if inst.microscope_model.is_some() || inst.microscope_manufacturer.is_some() {
+            if inst.microscope_model.is_some()
+                || inst.microscope_manufacturer.is_some()
+                || inst.microscope_serial_number.is_some()
+            {
                 let _ = write!(xml, "<Microscope");
                 if let Some(m) = &inst.microscope_model {
                     let _ = write!(xml, r#" Model="{}""#, xml_escape(m));
                 }
                 if let Some(m) = &inst.microscope_manufacturer {
                     let _ = write!(xml, r#" Manufacturer="{}""#, xml_escape(m));
+                }
+                if let Some(s) = &inst.microscope_serial_number {
+                    let _ = write!(xml, r#" SerialNumber="{}""#, xml_escape(s));
                 }
                 xml.push_str("/>");
             }
@@ -419,6 +456,9 @@ impl OmeMetadata {
                 }
                 if let Some(v) = &obj.manufacturer {
                     let _ = write!(xml, r#" Manufacturer="{}""#, xml_escape(v));
+                }
+                if let Some(v) = &obj.serial_number {
+                    let _ = write!(xml, r#" SerialNumber="{}""#, xml_escape(v));
                 }
                 if let Some(v) = obj.nominal_magnification {
                     let _ = write!(xml, r#" NominalMagnification="{v}""#);
@@ -556,6 +596,22 @@ impl OmeMetadata {
                     r#"<ImagingEnvironment Temperature="{v}" TemperatureUnit="°C"/>"#
                 );
             }
+            if let Some(stage_label) = &img.stage_label {
+                xml.push_str("<StageLabel");
+                if let Some(name) = &stage_label.name {
+                    let _ = write!(xml, r#" Name="{}""#, xml_escape(name));
+                }
+                if let Some(v) = stage_label.x {
+                    let _ = write!(xml, r#" X="{v}""#);
+                }
+                if let Some(v) = stage_label.y {
+                    let _ = write!(xml, r#" Y="{v}""#);
+                }
+                if let Some(v) = stage_label.z {
+                    let _ = write!(xml, r#" Z="{v}""#);
+                }
+                xml.push_str("/>");
+            }
 
             // InstrumentRef
             if let Some(inst_idx) = img.instrument_ref {
@@ -571,9 +627,17 @@ impl OmeMetadata {
                     if let Some(obj) = inst.objectives.get(obj_idx) {
                         let default_id = format!("Objective:{inst_idx}:{obj_idx}");
                         let obj_id = obj.id.as_deref().unwrap_or(&default_id);
-                        let _ = write!(xml, r#"<ObjectiveSettings ID="{}"/>"#, xml_escape(obj_id));
+                        let _ = write!(xml, r#"<ObjectiveSettings ID="{}""#, xml_escape(obj_id));
+                        if let Some(v) = img.objective_settings_refractive_index {
+                            let _ = write!(xml, r#" RefractiveIndex="{v}""#);
+                        }
+                        xml.push_str("/>");
                     }
                 }
+            }
+
+            for roi_id in &img.roi_refs {
+                let _ = write!(xml, r#"<ROIRef ID="{}"/>"#, xml_escape(roi_id));
             }
 
             // Pixels element
@@ -976,6 +1040,104 @@ fn write_ome_shape_xml(xml: &mut String, shape: &OmeShape) {
             write_shape_indices(xml, *the_z, *the_t, *the_c);
             xml.push_str("/>");
         }
+        OmeShape::Mask {
+            x,
+            y,
+            width,
+            height,
+            stroke_color,
+            fill_color,
+            bin_data,
+            the_z,
+            the_t,
+            the_c,
+        } => {
+            let _ = write!(
+                xml,
+                r#"<Mask X="{x}" Y="{y}" Width="{width}" Height="{height}""#
+            );
+            if let Some(v) = stroke_color {
+                let _ = write!(xml, r#" StrokeColor="{v}""#);
+            }
+            if let Some(v) = fill_color {
+                let _ = write!(xml, r#" FillColor="{v}""#);
+            }
+            write_shape_indices(xml, *the_z, *the_t, *the_c);
+            if let Some(bytes) = bin_data {
+                let encoded = base64_encode(bytes);
+                let _ = write!(
+                    xml,
+                    r#"><BinData Length="{}">{encoded}</BinData></Mask>"#,
+                    bytes.len()
+                );
+            } else {
+                xml.push_str("/>");
+            }
+        }
+    }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Vec<u8> {
+    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut index = 0usize;
+    while index + 3 < bytes.len() {
+        let Some(a) = base64_value(bytes[index]) else {
+            break;
+        };
+        let Some(b) = base64_value(bytes[index + 1]) else {
+            break;
+        };
+        let c_byte = bytes[index + 2];
+        let d_byte = bytes[index + 3];
+        out.push((a << 2) | (b >> 4));
+        if c_byte != b'=' {
+            if let Some(c) = base64_value(c_byte) {
+                out.push((b << 4) | (c >> 2));
+                if d_byte != b'=' {
+                    if let Some(d) = base64_value(d_byte) {
+                        out.push((c << 6) | d);
+                    }
+                }
+            }
+        }
+        index += 4;
+    }
+    out
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 
@@ -1193,6 +1355,8 @@ impl OmeMetadata {
             image.name = generic_image_name_from_metadata(meta);
             image.description = generic_image_description_from_metadata(meta);
             image.acquisition_date = generic_acquisition_date_from_metadata(meta);
+            image.stage_label = generic_stage_label_from_metadata(meta);
+            image.roi_refs = generic_image_roi_refs_from_metadata(meta);
             let channel_count = image.channels.len();
             for channel_index in 0..channel_count {
                 let prefix = format!("channel.{channel_index}");
@@ -1267,6 +1431,22 @@ impl OmeMetadata {
 
             let description = xml_inner_text(img_xml, "Description");
             let acquisition_date = xml_inner_text(img_xml, "AcquisitionDate");
+            let stage_label = all_tag_positions(img_xml, "StageLabel")
+                .into_iter()
+                .next()
+                .map(|p| {
+                    let tag = start_tag_at(img_xml, p);
+                    OmeStageLabel {
+                        name: xml_attr(tag, "Name"),
+                        x: xml_attr(tag, "X").and_then(|s| s.parse::<f64>().ok()),
+                        y: xml_attr(tag, "Y").and_then(|s| s.parse::<f64>().ok()),
+                        z: xml_attr(tag, "Z").and_then(|s| s.parse::<f64>().ok()),
+                    }
+                });
+            let roi_refs = all_tag_positions(img_xml, "ROIRef")
+                .into_iter()
+                .filter_map(|p| xml_attr(start_tag_at(img_xml, p), "ID"))
+                .collect();
 
             let pixels_pos = all_tag_positions(img_xml, "Pixels").into_iter().next();
 
@@ -1305,6 +1485,10 @@ impl OmeMetadata {
             let pixels_xml = pixels_pos.map(|p| &img_xml[p..pixels_end]);
 
             let mut channels = pixels_xml.map(parse_channels).unwrap_or_default();
+            if let Some(pixels_xml) = pixels_xml {
+                let pixels_tag = start_tag_at(pixels_xml, 0);
+                pad_channels_to_declared_size_c(&mut channels, pixels_tag);
+            }
             if channels.is_empty() {
                 let logical_channels = all_tag_positions(img_xml, "LogicalChannel").len();
                 channels.resize_with(logical_channels, || OmeChannel {
@@ -1325,8 +1509,10 @@ impl OmeMetadata {
                 physical_size_y,
                 physical_size_z,
                 time_increment,
+                stage_label,
                 channels,
                 planes,
+                roi_refs,
                 modulo_z,
                 modulo_c,
                 modulo_t,
@@ -1373,6 +1559,8 @@ impl OmeMetadata {
                             .position(|obj| obj.id.as_deref() == Some(ref_id.as_str()));
                     }
                 }
+                images[i].objective_settings_refractive_index =
+                    xml_attr(tag, "RefractiveIndex").and_then(|s| s.parse().ok());
             }
         }
 
@@ -1467,6 +1655,27 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
             }
         })
         .collect()
+}
+
+fn pad_channels_to_declared_size_c(channels: &mut Vec<OmeChannel>, pixels_tag: &str) {
+    let Some(size_c) = xml_attr(pixels_tag, "SizeC").and_then(|s| s.parse::<u32>().ok()) else {
+        return;
+    };
+    if size_c == 0 {
+        return;
+    }
+
+    let mut samples = channels
+        .iter()
+        .map(|channel| channel.samples_per_pixel.max(1))
+        .sum::<u32>();
+    while samples < size_c {
+        channels.push(OmeChannel {
+            samples_per_pixel: 1,
+            ..Default::default()
+        });
+        samples += 1;
+    }
 }
 
 /// Parse a single `<ModuloAlong{dim}>` element, given the slice of XML that
@@ -1616,6 +1825,10 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                 .into_iter()
                 .next()
                 .and_then(|p| xml_attr(start_tag_at(inst_xml, p), "Manufacturer"));
+            let microscope_serial_number = all_tag_positions(inst_xml, "Microscope")
+                .into_iter()
+                .next()
+                .and_then(|p| xml_attr(start_tag_at(inst_xml, p), "SerialNumber"));
 
             // Objectives
             let objectives = all_tag_positions(inst_xml, "Objective")
@@ -1626,6 +1839,7 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                         id: xml_attr(t, "ID"),
                         model: xml_attr(t, "Model"),
                         manufacturer: xml_attr(t, "Manufacturer"),
+                        serial_number: xml_attr(t, "SerialNumber"),
                         nominal_magnification: xml_attr(t, "NominalMagnification")
                             .and_then(|s| s.parse().ok()),
                         calibrated_magnification: xml_attr(t, "CalibratedMagnification")
@@ -1710,6 +1924,7 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                 id,
                 microscope_model,
                 microscope_manufacturer,
+                microscope_serial_number,
                 objectives,
                 detectors,
                 light_sources,
@@ -1873,6 +2088,44 @@ fn parse_rois(xml: &str) -> Vec<OmeROI> {
                 let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
                 shapes.push(OmeShape::Polyline {
                     points,
+                    the_z,
+                    the_t,
+                    the_c,
+                });
+            }
+
+            // Mask
+            for sp in all_tag_positions(union_xml, "Mask") {
+                let t = start_tag_at(union_xml, sp);
+                let x = xml_attr(t, "X").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let y = xml_attr(t, "Y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let width = xml_attr(t, "Width")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let height = xml_attr(t, "Height")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let stroke_color = xml_attr(t, "StrokeColor").and_then(|s| s.parse().ok());
+                let fill_color = xml_attr(t, "FillColor").and_then(|s| s.parse().ok());
+                let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+                let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+                let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+                let bin_data = find_end_tag(union_xml, "Mask", sp).and_then(|end| {
+                    let end = union_xml[end..]
+                        .find('>')
+                        .map(|gt| end + gt + 1)
+                        .unwrap_or(union_xml.len());
+                    let mask_xml = &union_xml[sp..end];
+                    xml_inner_text(mask_xml, "BinData").map(|text| base64_decode(&text))
+                });
+                shapes.push(OmeShape::Mask {
+                    x,
+                    y,
+                    width,
+                    height,
+                    stroke_color,
+                    fill_color,
+                    bin_data,
                     the_z,
                     the_t,
                     the_c,
@@ -2084,6 +2337,24 @@ fn metadata_value_u32(value: Option<&MetadataValue>) -> Option<u32> {
     }
 }
 
+fn metadata_value_i32(value: Option<&MetadataValue>) -> Option<i32> {
+    match value {
+        Some(MetadataValue::Int(v)) => i32::try_from(*v).ok(),
+        Some(MetadataValue::Float(v)) if v.is_finite() && v.fract() == 0.0 => {
+            i32::try_from(*v as i64).ok()
+        }
+        Some(MetadataValue::String(v)) => v.trim().parse::<i32>().ok(),
+        _ => None,
+    }
+}
+
+fn metadata_value_bytes(value: Option<&MetadataValue>) -> Option<Vec<u8>> {
+    match value {
+        Some(MetadataValue::Bytes(v)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
 fn metadata_value_string(value: Option<&MetadataValue>) -> Option<String> {
     match value {
         Some(MetadataValue::String(v)) => {
@@ -2213,6 +2484,37 @@ fn generic_acquisition_date_from_metadata(meta: &ImageMetadata) -> Option<String
     )
 }
 
+fn generic_stage_label_from_metadata(meta: &ImageMetadata) -> Option<OmeStageLabel> {
+    let name = metadata_string_by_suffix(&meta.series_metadata, &["image.stage_label.name"]);
+    let x = metadata_finite_f64_by_suffix(&meta.series_metadata, &["image.stage_label.x"]);
+    let y = metadata_finite_f64_by_suffix(&meta.series_metadata, &["image.stage_label.y"]);
+    let z = metadata_finite_f64_by_suffix(&meta.series_metadata, &["image.stage_label.z"]);
+    if name.is_some() || x.is_some() || y.is_some() || z.is_some() {
+        Some(OmeStageLabel { name, x, y, z })
+    } else {
+        None
+    }
+}
+
+fn generic_image_roi_refs_from_metadata(meta: &ImageMetadata) -> Vec<String> {
+    let mut refs: Vec<(usize, String)> = meta
+        .series_metadata
+        .iter()
+        .filter_map(|(key, value)| {
+            let index = key.strip_prefix("image.roi_ref.")?.parse::<usize>().ok()?;
+            match value {
+                MetadataValue::String(id) if !id.trim().is_empty() => Some((index, id.clone())),
+                MetadataValue::Int(roi_index) if *roi_index >= 0 => {
+                    Some((index, create_lsid("ROI", &[*roi_index as usize])))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    refs.sort_by_key(|(index, _)| *index);
+    refs.into_iter().map(|(_, id)| id).collect()
+}
+
 fn metadata_positive_f64_by_suffix_filtered(
     metadata: &std::collections::HashMap<String, MetadataValue>,
     suffixes: &[&str],
@@ -2243,6 +2545,11 @@ fn metadata_u32_by_suffix(
 fn rgb_channel_count(meta: &ImageMetadata) -> u32 {
     if !meta.is_rgb {
         return 1;
+    }
+    if let Some(count) = metadata_u32_by_suffix(&meta.series_metadata, &["rgb_channel_count"])
+        .filter(|count| *count > 0)
+    {
+        return count;
     }
     let zt = meta.size_z.max(1).saturating_mul(meta.size_t.max(1));
     if zt > 0 && meta.image_count >= zt {
@@ -2559,6 +2866,47 @@ fn generic_roi_shape_from_metadata(meta: &ImageMetadata, prefix: &str) -> Option
         });
     }
 
+    let shape_type = metadata_string_by_suffix(
+        metadata,
+        &[
+            &format!("{prefix}.shape"),
+            &format!("{prefix}.shape_type"),
+            &format!("{prefix}.type"),
+        ],
+    )
+    .unwrap_or_default();
+    if shape_type.eq_ignore_ascii_case("mask") {
+        let width = width?;
+        let height = height?;
+        return Some(OmeShape::Mask {
+            x,
+            y,
+            width,
+            height,
+            stroke_color: metadata_value_i32(metadata_by_suffix(
+                metadata,
+                &[
+                    &format!("{prefix}.stroke_color"),
+                    &format!("{prefix}.strokecolor"),
+                ],
+            )),
+            fill_color: metadata_value_i32(metadata_by_suffix(
+                metadata,
+                &[
+                    &format!("{prefix}.fill_color"),
+                    &format!("{prefix}.fillcolor"),
+                ],
+            )),
+            bin_data: metadata_value_bytes(metadata_by_suffix(
+                metadata,
+                &[&format!("{prefix}.bin_data"), &format!("{prefix}.bindata")],
+            )),
+            the_z,
+            the_t,
+            the_c,
+        });
+    }
+
     let radius_x = metadata_positive_f64_by_suffix(
         metadata,
         &[
@@ -2658,6 +3006,11 @@ fn generic_objective_from_metadata(meta: &ImageMetadata) -> Option<OmeObjective>
             &["objective.manufacturer", "objective.0.manufacturer"],
             &excluded_prefixes,
         ),
+        serial_number: metadata_string_by_suffix_filtered(
+            metadata,
+            &["objective.serial_number", "objective.0.serial_number"],
+            &excluded_prefixes,
+        ),
         nominal_magnification: metadata_positive_f64_by_suffix_filtered(
             metadata,
             &[
@@ -2707,6 +3060,7 @@ fn generic_objective_from_metadata(meta: &ImageMetadata) -> Option<OmeObjective>
 
     (objective.model.is_some()
         || objective.manufacturer.is_some()
+        || objective.serial_number.is_some()
         || objective.nominal_magnification.is_some()
         || objective.calibrated_magnification.is_some()
         || objective.lens_na.is_some()
@@ -3222,6 +3576,207 @@ mod tests {
         assert_eq!(xml.matches("<Channel ").count(), 2);
         assert_eq!(xml.matches(r#"SamplesPerPixel="3""#).count(), 2);
         assert!(xml.contains(r#"<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="6" SizeT="1" BigEndian="false""#));
+    }
+
+    #[test]
+    fn ome_xml_roundtrips_image_roi_refs() {
+        let mut meta = ImageMetadata {
+            size_x: 8,
+            size_y: 8,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata.insert(
+            "image.roi_ref.0".into(),
+            MetadataValue::String("ROI:0".into()),
+        );
+        meta.series_metadata.insert(
+            "roi.0.shape".into(),
+            MetadataValue::String("rectangle".into()),
+        );
+        meta.series_metadata
+            .insert("roi.0.x".into(), MetadataValue::Float(1.0));
+        meta.series_metadata
+            .insert("roi.0.y".into(), MetadataValue::Float(2.0));
+        meta.series_metadata
+            .insert("roi.0.width".into(), MetadataValue::Float(3.0));
+        meta.series_metadata
+            .insert("roi.0.height".into(), MetadataValue::Float(4.0));
+
+        let ome = OmeMetadata::from_image_metadata(&meta);
+        assert_eq!(ome.images[0].roi_refs, vec!["ROI:0".to_string()]);
+        let xml = ome.to_ome_xml(&meta);
+        assert!(xml.contains(r#"<ROIRef ID="ROI:0"/>"#));
+
+        let parsed = OmeMetadata::from_ome_xml(&xml);
+        assert_eq!(parsed.images[0].roi_refs, vec!["ROI:0".to_string()]);
+    }
+
+    #[test]
+    fn ome_xml_roundtrips_stage_label() {
+        let mut meta = ImageMetadata {
+            size_x: 4,
+            size_y: 4,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata.insert(
+            "image.stage_label.name".into(),
+            MetadataValue::String("Position".into()),
+        );
+        meta.series_metadata
+            .insert("image.stage_label.z".into(), MetadataValue::Float(42.5));
+
+        let ome = OmeMetadata::from_image_metadata(&meta);
+        assert_eq!(
+            ome.images[0].stage_label.as_ref().unwrap().name.as_deref(),
+            Some("Position")
+        );
+        assert_eq!(ome.images[0].stage_label.as_ref().unwrap().z, Some(42.5));
+        let xml = ome.to_ome_xml(&meta);
+        assert!(xml.contains(r#"<StageLabel Name="Position" Z="42.5"/>"#));
+
+        let parsed = OmeMetadata::from_ome_xml(&xml);
+        assert_eq!(parsed.images[0].stage_label, ome.images[0].stage_label);
+    }
+
+    #[test]
+    fn ome_xml_pads_sparse_non_rgb_channels_to_declared_size_c() {
+        let xml = r#"
+<OME>
+  <Image ID="Image:0">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint16" SizeX="2" SizeY="2" SizeZ="1" SizeC="3" SizeT="1">
+      <Channel ID="Channel:0:0" Name="DAPI" SamplesPerPixel="1"/>
+    </Pixels>
+  </Image>
+</OME>"#;
+
+        let ome = OmeMetadata::from_ome_xml(xml);
+
+        assert_eq!(ome.images[0].channels.len(), 3);
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(ome.images[0].channels[1].samples_per_pixel, 1);
+        assert_eq!(ome.images[0].channels[2].samples_per_pixel, 1);
+    }
+
+    #[test]
+    fn ome_xml_does_not_split_packed_rgb_channel() {
+        let xml = r#"
+<OME>
+  <Image ID="Image:0">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="3" SizeT="1">
+      <Channel ID="Channel:0:0" SamplesPerPixel="3"/>
+    </Pixels>
+  </Image>
+</OME>"#;
+
+        let ome = OmeMetadata::from_ome_xml(xml);
+
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
+    }
+
+    #[test]
+    fn ome_xml_roundtrips_objective_serial_and_settings_refractive_index() {
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..ImageMetadata::default()
+        };
+        let mut ome = OmeMetadata::from_image_metadata(&meta);
+        ome.instruments = vec![OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            objectives: vec![OmeObjective {
+                id: Some(create_lsid("Objective", &[0, 0])),
+                serial_number: Some("OBJ-123".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        ome.images[0].instrument_ref = Some(0);
+        ome.images[0].objective_ref = Some(0);
+        ome.images[0].objective_settings_refractive_index = Some(1.515);
+
+        let xml = ome.to_ome_xml(&meta);
+
+        assert!(xml.contains(r#"SerialNumber="OBJ-123""#));
+        assert!(xml.contains(r#"<ObjectiveSettings ID="Objective:0:0" RefractiveIndex="1.515"/>"#));
+        let parsed = OmeMetadata::from_ome_xml(&xml);
+        assert_eq!(
+            parsed.instruments[0].objectives[0].serial_number.as_deref(),
+            Some("OBJ-123")
+        );
+        assert_eq!(
+            parsed.images[0].objective_settings_refractive_index,
+            Some(1.515)
+        );
+    }
+
+    #[test]
+    fn ome_xml_roundtrips_mask_shape_with_bin_data() {
+        let mut meta = ImageMetadata {
+            size_x: 8,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata
+            .insert("roi.0.shape".into(), MetadataValue::String("mask".into()));
+        meta.series_metadata
+            .insert("roi.0.x".into(), MetadataValue::Float(0.0));
+        meta.series_metadata
+            .insert("roi.0.y".into(), MetadataValue::Float(0.0));
+        meta.series_metadata
+            .insert("roi.0.width".into(), MetadataValue::Float(8.0));
+        meta.series_metadata
+            .insert("roi.0.height".into(), MetadataValue::Float(1.0));
+        meta.series_metadata
+            .insert("roi.0.stroke_color".into(), MetadataValue::Int(-16776961));
+        meta.series_metadata
+            .insert("roi.0.fill_color".into(), MetadataValue::Int(-16776961));
+        meta.series_metadata.insert(
+            "roi.0.bin_data".into(),
+            MetadataValue::Bytes(vec![0b1010_0000]),
+        );
+
+        let ome = OmeMetadata::from_image_metadata(&meta);
+        let xml = ome.to_ome_xml(&meta);
+
+        assert!(xml.contains(r#"<Mask X="0" Y="0" Width="8" Height="1" StrokeColor="-16776961" FillColor="-16776961"><BinData Length="1">oA==</BinData></Mask>"#));
+        let parsed = OmeMetadata::from_ome_xml(&xml);
+        match &parsed.rois[0].shapes[0] {
+            OmeShape::Mask {
+                width,
+                height,
+                stroke_color,
+                fill_color,
+                bin_data,
+                ..
+            } => {
+                assert_eq!((*width, *height), (8.0, 1.0));
+                assert_eq!(*stroke_color, Some(-16776961));
+                assert_eq!(*fill_color, Some(-16776961));
+                assert_eq!(bin_data.as_deref(), Some(&[0b1010_0000][..]));
+            }
+            other => panic!("expected mask shape, got {other:?}"),
+        }
     }
 
     #[test]

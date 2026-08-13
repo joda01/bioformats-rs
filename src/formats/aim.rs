@@ -400,3 +400,46 @@ impl FormatReader for AimReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_aim_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bioformats_aim_{}_{}_{}.aim",
+            name,
+            std::process::id(),
+            line!()
+        ))
+    }
+
+    #[test]
+    fn aim_v020_core_metadata_and_region_match_java_layout() {
+        let path = temp_aim_path("v020_region");
+        let mut bytes = vec![0u8; 160];
+        bytes[..12].copy_from_slice(b"AIMDATA_V020");
+        bytes[56..60].copy_from_slice(&2i32.to_le_bytes());
+        bytes[60..64].copy_from_slice(&2i32.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1i32.to_le_bytes());
+        bytes.push(0);
+        for sample in [1i16, 2, 3, 4] {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).expect("write synthetic AIM");
+
+        let mut reader = AimReader::new();
+        reader.set_id(&path).expect("open AIM");
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_z), (2, 2, 1));
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(meta.pixel_type, PixelType::Int16);
+        assert!(meta.is_little_endian);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            vec![2, 0, 4, 0]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+}

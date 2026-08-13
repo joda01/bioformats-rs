@@ -2495,6 +2495,7 @@ fn imaris_ome_instrument(instrument: &ImarisInstrumentMetadata) -> Option<OmeIns
             id: Some(create_lsid("Objective", &[0, 0])),
             model: instrument.objective_model.clone(),
             manufacturer: instrument.objective_manufacturer.clone(),
+            serial_number: None,
             nominal_magnification: instrument.objective_nominal_magnification,
             calibrated_magnification: instrument.objective_calibrated_magnification,
             lens_na: instrument.objective_lens_na,

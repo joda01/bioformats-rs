@@ -838,14 +838,8 @@ impl TargaReader {
 ///
 /// Each packet begins with a count byte `n` read as a signed value:
 ///   * `n >= 0`           — raw packet: the next `(n + 1)` pixels are literal.
-///   * `n < 0`            — run packet: one pixel repeated `(n & 0x7f) + 1` times.
-///
-/// Deviation from Java: the upstream `TargaRLECodec` treats `n == -128` (`0x80`)
-/// as a no-op (it falls through both branches). Per the Targa specification a
-/// `0x80` count byte is a valid one-pixel run packet, and spec-compliant
-/// encoders (e.g. the `image` crate's TGA writer) emit it. We therefore handle
-/// it as a run packet so such files decode correctly; for any encoder that
-/// never emits `0x80` the output is identical to Java's.
+///   * `-127 <= n <= -1`  — run packet: one pixel repeated `(n & 0x7f) + 1`.
+///   * `n == -128`        — no-op, matching Java `TargaRLECodec`.
 fn targa_rle_decompress(data: &[u8], max_bytes: usize, bits_per_sample: i32) -> Vec<u8> {
     let mut output: Vec<u8> = Vec::with_capacity(max_bytes);
     let bpp = (bits_per_sample / 8) as usize;
@@ -867,8 +861,8 @@ fn targa_rle_decompress(data: &[u8], max_bytes: usize, bits_per_sample: i32) -> 
                 output.push(data[pos]);
                 pos += 1;
             }
-        } else {
-            // -128 <= n <= -1: run packet of (n & 0x7f) + 1 repeats of one pixel.
+        } else if n != i8::MIN {
+            // -127 <= n <= -1: run packet of (n & 0x7f) + 1 repeats of one pixel.
             let len = ((n as i32) & 0x7f) as usize + 1;
             if pos + bpp > data.len() {
                 break;
@@ -1903,5 +1897,13 @@ mod targa_tests {
         let data = [0x01u8, 0x10, 0x20, 0x82, 0x30];
         let out = targa_rle_decompress(&data, 5, 8);
         assert_eq!(out, vec![0x10, 0x20, 0x30, 0x30, 0x30]);
+    }
+
+    #[test]
+    fn rle_decompress_0x80_packet_is_java_noop() {
+        // Java TargaRLECodec treats signed -128 (0x80) as neither raw nor run.
+        let data = [0x80u8, 0x00, 0x7f];
+        let out = targa_rle_decompress(&data, 1, 8);
+        assert_eq!(out, vec![0x7f]);
     }
 }

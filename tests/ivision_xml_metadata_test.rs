@@ -107,7 +107,7 @@ fn ivision_preserves_embedded_ome_xml_scalars_without_changing_pixels() {
 }
 
 #[test]
-fn ivision_reads_adjacent_ome_xml_sidecar_when_tail_has_no_xml() {
+fn ivision_ignores_adjacent_ome_xml_sidecar_like_java_when_tail_has_no_xml() {
     let path = temp_path("sidecar.ipm");
     let sidecar = path.with_extension("xml");
     let payload = [0x0102u16, 0x0304, 0x0506, 0x0708]
@@ -124,17 +124,11 @@ fn ivision_reads_adjacent_ome_xml_sidecar_when_tail_has_no_xml() {
     let mut reader = IvisionReader::new();
     reader
         .set_id(&path)
-        .expect("iVision fixture with sidecar XML");
+        .expect("iVision fixture with ignored sidecar XML");
     assert_eq!(reader.open_bytes(0).unwrap(), payload);
     let md = &reader.metadata().series_metadata;
-    assert!(matches!(
-        md.get("iVision XML Source"),
-        Some(MetadataValue::String(value)) if value == "sidecar"
-    ));
-    assert!(matches!(
-        md.get("iVision XML Channel 0 Name"),
-        Some(MetadataValue::String(value)) if value == "FITC"
-    ));
+    assert!(md.get("iVision XML Source").is_none());
+    assert!(md.get("iVision XML Channel 0 Name").is_none());
 
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(sidecar);

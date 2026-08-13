@@ -314,6 +314,10 @@ fn url_decode(value: &str) -> String {
                 i += 3;
                 continue;
             }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -525,14 +529,14 @@ impl XlcfDocument {
                 Some(p) => p,
                 None => continue,
             };
-            let lower = corrected.to_string_lossy().to_ascii_lowercase();
-            if lower.ends_with(".xlif") {
+            let corrected_name = corrected.to_string_lossy();
+            if corrected_name.ends_with(".xlif") {
                 if let Some(xlif) = XlifDocument::new(&corrected) {
                     if xlif.is_valid() {
                         self.children.push(CollectionChild::Xlif(xlif));
                     }
                 }
-            } else if lower.ends_with(".xlcf") {
+            } else if corrected_name.ends_with(".xlcf") {
                 if let Some(xlcf) = XlcfDocument::new(&corrected) {
                     self.children.push(CollectionChild::Xlcf(Box::new(xlcf)));
                 }
@@ -2319,9 +2323,13 @@ impl LmsMetadataExtractor {
                 };
 
                 if active {
-                    if let Some(name) = self.buffer.detector_indexes.get(&channel) {
-                        self.buffer.detector_models.push(name.clone());
-                    }
+                    self.buffer.detector_models.push(
+                        self.buffer
+                            .detector_indexes
+                            .get(&channel)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
 
                     let mut multiband: Option<&XmlNode> = None;
                     for mb in &multibands {
@@ -2469,6 +2477,12 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
         meta.series_metadata
             .insert("xlef.lms.image.name".into(), MetadataValue::String(name));
     }
+    if core.rgb {
+        meta.series_metadata
+            .insert("rgb_channel_count".into(), MetadataValue::Int(3));
+        meta.series_metadata
+            .insert("xlef.lms.rgb_channel_count".into(), MetadataValue::Int(3));
+    }
     if let Some(px) = extractor.buffer.physical_size_x {
         if px.is_finite() && px != 0.0 {
             meta.series_metadata.insert(
@@ -2499,6 +2513,18 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
     );
     for (index, channel) in extractor.buffer.channels.iter().enumerate() {
         let prefix = format!("xlef.lms.channel.{index}");
+        if channel.resolution > 0 {
+            meta.series_metadata.insert(
+                format!("{prefix}.resolution"),
+                MetadataValue::Int(channel.resolution as i64),
+            );
+        }
+        if channel.bytes_inc != 0 {
+            meta.series_metadata.insert(
+                format!("{prefix}.bytes_inc"),
+                MetadataValue::Int(channel.bytes_inc),
+            );
+        }
         if !channel.lut_name.is_empty() {
             meta.series_metadata.insert(
                 format!("{prefix}.lut_name"),
@@ -2541,6 +2567,12 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
                     MetadataValue::String(value.trim().to_string()),
                 );
             }
+        }
+    };
+    let put_channel_name = |meta: &mut ImageMetadata, key: &str, value: Option<&str>| {
+        if let Some(value) = value {
+            meta.series_metadata
+                .insert(key.to_string(), MetadataValue::String(value.to_string()));
         }
     };
     let put_f64 = |meta: &mut ImageMetadata, key: &str, value: Option<f64>| {
@@ -2695,7 +2727,7 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
     // Per-channel names + excitation wavelengths (initDetectorModels / scanner).
     for (index, name) in buffer.channel_names.iter().enumerate() {
         if let Some(name) = name {
-            put_str(meta, &format!("xlef.lms.channel.{index}.name"), Some(name));
+            put_channel_name(meta, &format!("xlef.lms.channel.{index}.name"), Some(name));
         }
     }
     for (index, ex) in buffer.ex_waves.iter().enumerate() {
@@ -2717,15 +2749,18 @@ fn lms_get_zct_coords(extractor: &LmsMetadataExtractor, index: i32) -> [i32; 3] 
     let size_z = extractor.core_size_z.max(1) as i32;
     let size_c = extractor.get_effective_size_c().max(1);
     let size_t = extractor.core_size_t.max(1) as i32;
-    let order: Vec<char> = extractor.core_dimension_order.chars().collect();
-    // Position of Z/C/T within the dimension order string (after X,Y).
-    let pos = |dim: char| -> usize {
-        order
-            .iter()
-            .position(|&c| c == dim)
-            .map(|p| p.saturating_sub(2))
-            .unwrap_or(0)
-    };
+    let mut order = Vec::new();
+    for dim in extractor
+        .core_dimension_order
+        .chars()
+        .filter(|dim| matches!(dim, 'Z' | 'C' | 'T'))
+    {
+        if !order.contains(&dim) {
+            order.push(dim);
+        }
+    }
+    // Position of Z/C/T within the filtered middle-dimension order.
+    let pos = |dim: char| -> usize { order.iter().position(|&c| c == dim).unwrap_or(0) };
     let (iz, ic, it) = (pos('Z'), pos('C'), pos('T'));
     // Build the radix per axis according to its position in the order.
     let mut order_len = [0usize; 3];
@@ -3200,5 +3235,64 @@ fn parse_dimension_order(order: &str) -> DimensionOrder {
         "XYZCT" => DimensionOrder::XYZCT,
         "XYZTC" => DimensionOrder::XYZTC,
         _ => DimensionOrder::XYCZT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_lms_{name}_{nonce}"))
+    }
+
+    #[test]
+    fn xlif_reference_path_decodes_plus_as_space_like_java_url_decoder() {
+        let xlif = temp_path("plus_path.xlif");
+        let tif = xlif.with_file_name("plus space.tif");
+        std::fs::write(&tif, []).unwrap();
+        std::fs::write(
+            &xlif,
+            r#"<XLIF><Element Name="Plus path"><Data><Image><Frame File="plus+space.tif"/></Image></Data></Element></XLIF>"#,
+        )
+        .unwrap();
+
+        let doc = XlifDocument::new(&xlif).unwrap();
+        assert_eq!(doc.image_format, ImageFormat::Tif);
+        assert_eq!(doc.image_paths, vec![tif.clone()]);
+
+        let _ = std::fs::remove_file(xlif);
+        let _ = std::fs::remove_file(tif);
+    }
+
+    #[test]
+    fn xlef_collection_child_suffix_is_case_sensitive_like_java() {
+        let dir = temp_path("uppercase_collection");
+        std::fs::create_dir_all(&dir).unwrap();
+        let xlef = dir.join("project.xlef");
+        let child = dir.join("Child.XLIF");
+        let tif = dir.join("plane.tif");
+
+        std::fs::write(&tif, []).unwrap();
+        std::fs::write(
+            &child,
+            r#"<XLIF><Element Name="Upper child"><Data><Image><Frame File="plane.tif"/></Image></Data></Element></XLIF>"#,
+        )
+        .unwrap();
+        std::fs::write(&xlef, r#"<XLEF><Reference File="Child.XLIF"/></XLEF>"#).unwrap();
+
+        let project = XlefDocument::new(&xlef).unwrap();
+        assert_eq!(project.get_xlifs().len(), 0);
+        assert_eq!(project.get_image_count(), 0);
+
+        let _ = std::fs::remove_file(tif);
+        let _ = std::fs::remove_file(child);
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_dir(dir);
     }
 }

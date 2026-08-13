@@ -2548,6 +2548,9 @@ impl FormatReader for ZeissCziReader {
                 }
             }
         }
+        if let Some(meta) = self.meta.as_ref() {
+            let _ = ome.populate_pixels(meta, 0);
+        }
         Some(ome)
     }
 }
@@ -3155,6 +3158,34 @@ mod tests {
         assert_eq!(image.physical_size_x, Some(0.5));
         assert_eq!(image.physical_size_y, Some(0.6));
         assert_eq!(image.physical_size_z, Some(1.25));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_ome_metadata_pads_sparse_xml_channels_like_java() {
+        let entries = vec![
+            (directory_entry(0, 0, 0, 2, 1), vec![1, 2]),
+            (directory_entry(0, 0, 1, 2, 1), vec![3, 4]),
+            (directory_entry(0, 0, 2, 2, 1), vec![5, 6]),
+        ];
+        let xml = r#"<Metadata>
+          <Information><Image><Dimensions><Channels>
+            <Channel Name="DAPI"><EmissionWavelength>461</EmissionWavelength></Channel>
+          </Channels></Dimensions></Image></Information>
+        </Metadata>"#;
+        let path = write_synthetic_czi_with_xml("sparse_channels", entries, xml);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.metadata().size_c, 3);
+        let ome = reader.ome_metadata().unwrap();
+        let channels = &ome.images[0].channels;
+        assert_eq!(channels.len(), 3);
+        assert_eq!(channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(channels[0].emission_wavelength, Some(461.0));
+        assert_eq!(channels[1].samples_per_pixel, 1);
+        assert_eq!(channels[2].samples_per_pixel, 1);
 
         fs::remove_file(path).unwrap();
     }

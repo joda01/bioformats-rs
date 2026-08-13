@@ -264,6 +264,69 @@ fn validate_region(meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32) -> Resu
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_lim_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bioformats_lim_{name}_{}_{}.lim",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_lim(path: &Path, width: u16, height: u16, bits: u16, compressed: bool, pixels: &[u8]) {
+        let mut bytes = vec![0u8; LIM_PIXELS_OFFSET as usize];
+        bytes[0..2].copy_from_slice(&width.to_le_bytes());
+        bytes[2..4].copy_from_slice(&height.to_le_bytes());
+        bytes[4..6].copy_from_slice(&bits.to_le_bytes());
+        bytes[6..8].copy_from_slice(&(u16::from(compressed)).to_le_bytes());
+        bytes.extend_from_slice(pixels);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn lim_reads_fixed_offset_and_swaps_bgr_rgb_like_java() {
+        let path = temp_lim_path("rgb_swap");
+        write_lim(&path, 2, 1, 24, false, &[1, 2, 3, 4, 5, 6]);
+
+        let mut reader = LimReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 1);
+        assert_eq!(meta.size_c, 3);
+        assert!(meta.is_rgb);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 2, 1, 6, 5, 4]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+            vec![6, 5, 4]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lim_rejects_compressed_files_like_java() {
+        let path = temp_lim_path("compressed");
+        write_lim(&path, 1, 1, 8, true, &[0]);
+
+        let err = LimReader::new().set_id(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::UnsupportedFormat(message)
+                if message == "Compressed LIM files not supported."
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 // ── TillVision Reader ─────────────────────────────────────────────────────────
 
 pub struct TillVisionReader {

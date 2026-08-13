@@ -1791,13 +1791,20 @@ tiff_wrapper! {
 pub struct TrestleReader {
     inner: crate::tiff::TiffReader,
     /// `overlaps[coreIndex*2 + {0,1}]` — the per-tile X/Y pixel overlaps parsed
-    /// from the first IFD comment's `OverlapsXY` entry. Indexed by core (=
-    /// resolution) index, mirroring Java's `overlaps[getCoreIndex()*2 + …]`.
+    /// from the first IFD comment's `OverlapsXY` entry. Indexed by flattened
+    /// core (= resolution) index, mirroring Java's `overlaps[getCoreIndex()*2 + …]`.
     overlaps: Vec<i64>,
-    /// IFD index backing each flattened Trestle series, in series order (Java
-    /// `ifds.get(getCoreIndex())`). Empty when the regroup did not run (single
-    /// IFD), in which case pixel reads delegate straight to the inner reader.
+    /// IFD index backing each nested Trestle resolution, in resolution order
+    /// (Java `ifds.get(getCoreIndex())`). Empty when the regroup did not run
+    /// (single IFD), in which case pixel reads delegate straight to the inner
+    /// reader.
     level_ifd: Vec<usize>,
+    /// Overlap-adjusted metadata for each nested resolution. Java computes
+    /// these adjusted core values in `initStandardMetadata`; the shared TIFF
+    /// sub-resolution metadata uses raw IFD dimensions, so Trestle keeps the
+    /// Java-adjusted copies here.
+    level_metadata: Vec<ImageMetadata>,
+    current_metadata: Option<ImageMetadata>,
 }
 
 impl TrestleReader {
@@ -1806,6 +1813,8 @@ impl TrestleReader {
             inner: crate::tiff::TiffReader::new(),
             overlaps: Vec::new(),
             level_ifd: Vec::new(),
+            level_metadata: Vec::new(),
+            current_metadata: None,
         }
     }
 
@@ -1875,15 +1884,16 @@ impl TrestleReader {
         }
 
         // Mirror the core-metadata rebuild in `TrestleReader.initStandardMetadata`:
-        // every main IFD becomes a separate series. SizeX/SizeY are reduced by
-        // the per-tile overlaps.
+        // all main IFDs become resolution levels under series 0. SizeX/SizeY are
+        // reduced by the per-tile overlaps.
         self.regroup_resolutions(overlaps.as_deref());
     }
 
     /// Faithful port of the core-metadata loop in
-    /// `TrestleReader.initStandardMetadata`. Each main IFD is one resolution
-    /// series; `overlaps[index*2 + {0,1}]` are the per-tile X/Y overlaps used to
-    /// shrink each level's `SizeX`/`SizeY`.
+    /// `TrestleReader.initStandardMetadata` with flattened resolutions disabled:
+    /// the first main IFD is the base series and later main IFDs are nested
+    /// resolution levels. `overlaps[index*2 + {0,1}]` are the per-tile X/Y
+    /// overlaps used to shrink each level's `SizeX`/`SizeY`.
     fn regroup_resolutions(&mut self, overlaps: Option<&[i64]>) {
         let ifd_count = self.inner.ifd_count();
         if ifd_count <= 1 {
@@ -1955,7 +1965,16 @@ impl TrestleReader {
             return;
         }
 
-        let mut flattened = Vec::with_capacity(ifd_count);
+        let mut nested = Vec::with_capacity(1);
+        let mut base = series[0].clone();
+        let mut level_metadata = Vec::with_capacity(ifd_count);
+        base.ifd_indices = vec![ifd_for_series[0]];
+        base.plane_ifd_indices = Vec::new();
+        base.sub_resolutions = (1..ifd_count)
+            .map(|index| vec![ifd_for_series[index]])
+            .collect();
+        base.metadata.resolution_count = ifd_count as u32;
+
         for (index, source) in series.iter().cloned().enumerate() {
             let Some(level) = levels.get(index) else {
                 return;
@@ -1992,15 +2011,27 @@ impl TrestleReader {
                         .insert("PhysicalSizeY".to_string(), MetadataValue::Float(value));
                 }
             }
-            flattened.push(s);
+            if index == 0 {
+                base = s;
+                base.sub_resolutions = (1..ifd_count)
+                    .map(|level_index| vec![ifd_for_series[level_index]])
+                    .collect();
+                base.metadata.resolution_count = ifd_count as u32;
+                level_metadata.push(base.metadata.clone());
+            } else {
+                level_metadata.push(s.metadata.clone());
+            }
         }
+        nested.push(base);
 
-        // Record the per-series IFD mapping and the (per-core-index) overlaps so
+        // Record the per-resolution IFD mapping and the (per-core-index) overlaps so
         // `openBytes` can replicate Java's overlap-aware `tiffParser.getSamples`.
         self.level_ifd = ifd_for_series.clone();
         self.overlaps = overlaps.map(|o| o.to_vec()).unwrap_or_default();
+        self.current_metadata = level_metadata.first().cloned();
+        self.level_metadata = level_metadata;
 
-        self.inner.replace_series(flattened);
+        self.inner.replace_series(nested);
     }
 }
 
@@ -2027,6 +2058,8 @@ impl FormatReader for TrestleReader {
         self.inner.close()?;
         self.overlaps.clear();
         self.level_ifd.clear();
+        self.level_metadata.clear();
+        self.current_metadata = None;
         self.inner.set_id(path)?;
         for series in self.inner.series_list_mut() {
             series.metadata.series_metadata.insert(
@@ -2041,6 +2074,8 @@ impl FormatReader for TrestleReader {
     fn close(&mut self) -> Result<()> {
         self.overlaps.clear();
         self.level_ifd.clear();
+        self.level_metadata.clear();
+        self.current_metadata = None;
         self.inner.close()
     }
 
@@ -2052,7 +2087,9 @@ impl FormatReader for TrestleReader {
         if self.inner.series_count() == 0 {
             return Err(BioFormatsError::NotInitialized);
         }
-        self.inner.set_series(s)
+        self.inner.set_series(s)?;
+        self.current_metadata = self.level_metadata.first().cloned();
+        Ok(())
     }
 
     fn series(&self) -> usize {
@@ -2060,7 +2097,9 @@ impl FormatReader for TrestleReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.current_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -2086,11 +2125,7 @@ impl FormatReader for TrestleReader {
         if self.level_ifd.is_empty() {
             return self.inner.open_bytes_region(p, x, y, w, h);
         }
-        let core_index = if self.inner.resolution_count() > 1 {
-            self.inner.resolution()
-        } else {
-            self.inner.series()
-        };
+        let core_index = self.inner.resolution();
         let ifd_index = match self.level_ifd.get(core_index) {
             Some(&i) => i,
             None => return self.inner.open_bytes_region(p, x, y, w, h),
@@ -2271,7 +2306,9 @@ impl FormatReader for TrestleReader {
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner.set_resolution(level)?;
+        self.current_metadata = self.level_metadata.get(level).cloned();
+        Ok(())
     }
 }
 
@@ -4734,7 +4771,7 @@ impl FormatReader for InCell3000Reader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("frm") | Some("xdce"))
+        matches!(ext.as_deref(), Some("frm"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -6258,6 +6295,10 @@ mod operetta {
                         format!("operetta.Channel{c}.Name"),
                         MetadataValue::String(name.clone()),
                     );
+                    m.insert(
+                        format!("channel.{c}.name"),
+                        MetadataValue::String(name.clone()),
+                    );
                 }
                 if let Some(acq) = &p.acq_type {
                     m.insert(
@@ -6283,12 +6324,20 @@ mod operetta {
                             format!("operetta.Channel{c}.EmissionWavelength"),
                             MetadataValue::Float(em),
                         );
+                        m.insert(
+                            format!("channel.{c}.emission_wavelength"),
+                            MetadataValue::Float(em),
+                        );
                     }
                 }
                 if let Some(ex) = p.ex_wavelength {
                     if ex > 0.0 {
                         m.insert(
                             format!("operetta.Channel{c}.ExcitationWavelength"),
+                            MetadataValue::Float(ex),
+                        );
+                        m.insert(
+                            format!("channel.{c}.excitation_wavelength"),
                             MetadataValue::Float(ex),
                         );
                     }
@@ -6822,11 +6871,19 @@ mod columbus {
                         format!("columbus.Channel{c}.Name"),
                         MetadataValue::String(name.clone()),
                     );
+                    m.insert(
+                        format!("channel.{c}.name"),
+                        MetadataValue::String(name.clone()),
+                    );
                 }
                 if let Some(em) = p.em_wavelength {
                     if em as i64 > 0 {
                         m.insert(
                             format!("columbus.Channel{c}.EmissionWavelength"),
+                            MetadataValue::Float(em),
+                        );
+                        m.insert(
+                            format!("channel.{c}.emission_wavelength"),
                             MetadataValue::Float(em),
                         );
                     }
@@ -6835,6 +6892,10 @@ mod columbus {
                     if ex as i64 > 0 {
                         m.insert(
                             format!("columbus.Channel{c}.ExcitationWavelength"),
+                            MetadataValue::Float(ex),
+                        );
+                        m.insert(
+                            format!("channel.{c}.excitation_wavelength"),
                             MetadataValue::Float(ex),
                         );
                     }
@@ -7396,6 +7457,10 @@ mod scanr {
                 if let Some(cname) = h.channel_names.get(c) {
                     meta.series_metadata.insert(
                         format!("Channel {} Name", c),
+                        MetadataValue::String(cname.clone()),
+                    );
+                    meta.series_metadata.insert(
+                        format!("channel.{c}.name"),
                         MetadataValue::String(cname.clone()),
                     );
                 }
@@ -8166,8 +8231,7 @@ mod cellvoyager {
                             .unwrap_or(1.0);
                     }
                 }
-                let number = ch.child_text(&["Number"]).unwrap_or_default();
-                channel_names.push(format!("Channel {}", number.trim()));
+                channel_names.push(read_channel_name(&ch));
             }
         }
         if channel_names.is_empty() {
@@ -8323,7 +8387,7 @@ mod cellvoyager {
             for area in &well.areas {
                 let size_x = area.width.max(tile_w).max(1) as u32;
                 let size_y = area.height.max(tile_h).max(1) as u32;
-                series.push(super::make_series_meta(
+                let mut meta = super::make_series_meta(
                     size_x,
                     size_y,
                     n_z,
@@ -8334,7 +8398,14 @@ mod cellvoyager {
                     little_endian,
                     order,
                     "CellVoyager",
-                ));
+                );
+                for (c, name) in channel_names.iter().enumerate() {
+                    meta.series_metadata.insert(
+                        format!("channel.{c}.name"),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+                series.push(meta);
                 let mut sp = vec![PlaneRef::default(); image_count];
                 for plane in 0..image_count {
                     let (z, c, t) = super::get_zct_coords(order, n_z, n_c, n_t, plane as u32);
@@ -8444,6 +8515,27 @@ mod cellvoyager {
             width: width + tile_w,
             height: height + tile_h,
         }
+    }
+
+    fn read_channel_name(channel_el: &dom::Node) -> String {
+        let excitation_type = channel_el
+            .child(&["Excitation"])
+            .and_then(|node| node.attr("type"))
+            .unwrap_or_default();
+        let excitation_name = channel_el
+            .child_text(&["Excitation", "Name", "Value"])
+            .unwrap_or_default();
+        let emission_name = channel_el
+            .child_text(&["Emission", "Name", "Value"])
+            .unwrap_or_default();
+        let fluorophore_name = channel_el
+            .child_text(&["Emission", "FluorescentProbe", "Value"])
+            .unwrap_or_else(|| "\u{f8}".to_string());
+
+        format!(
+            "Ex: {}({}) / Em: {} / Fl: {}",
+            excitation_type, excitation_name, emission_name, fluorophore_name
+        )
     }
 
     // -- Minimal read-only DOM for navigating MeasurementResult.xml --
@@ -8628,6 +8720,13 @@ mod tests {
         writer.set_id(path).unwrap();
         writer.save_bytes(0, data).unwrap();
         writer.close().unwrap();
+    }
+
+    #[test]
+    fn incell3000_name_suffix_matches_java_frm_only() {
+        let reader = InCell3000Reader::new();
+        assert!(reader.is_this_type_by_name(Path::new("frame.frm")));
+        assert!(!reader.is_this_type_by_name(Path::new("plate.xdce")));
     }
 
     fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
@@ -9018,6 +9117,10 @@ mod tests {
             md.get("columbus.Channel0.EmissionWavelength"),
             Some(MetadataValue::Float(v)) if (*v - 461.0).abs() < 1e-9
         ));
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(ome.images[0].channels[0].emission_wavelength, Some(461.0));
+        assert_eq!(ome.images[0].channels[0].excitation_wavelength, Some(358.0));
         // PositionX 0.001 m -> 1000 um via correct_units("m").
         assert!(matches!(
             md.get("columbus.WellSamplePositionX"),
@@ -9047,6 +9150,47 @@ mod tests {
             md.get("PlateType"),
             Some(MetadataValue::String(v)) if v == "96well"
         ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn operetta_ome_metadata_projects_channel_name_and_wavelengths_like_java() {
+        let dir = temp_path("operetta_channels");
+        let images = dir.join("Images");
+        std::fs::create_dir_all(&images).unwrap();
+
+        let tiff = images.join("img.tif");
+        let meta = test_meta(2, 2);
+        write_tiff(&tiff, &meta, &[1u8, 2, 3, 4]);
+
+        std::fs::write(
+            dir.join("Index.idx.xml"),
+            r#"<EvaluationInputData>
+  <PlateRows>1</PlateRows><PlateColumns>1</PlateColumns>
+  <Entry ChannelID="0">
+    <ChannelName>DAPI</ChannelName>
+    <ImageSizeX>2</ImageSizeX><ImageSizeY>2</ImageSizeY>
+    <MainEmissionWavelength>461</MainEmissionWavelength>
+    <MainExcitationWavelength>358</MainExcitationWavelength>
+  </Entry>
+  <Images><Image>
+    <URL>img.tif</URL>
+    <Row>1</Row><Col>1</Col><FieldID>1</FieldID><PlaneID>0</PlaneID>
+    <TimepointID>0</TimepointID><ChannelID>0</ChannelID>
+  </Image></Images>
+</EvaluationInputData>"#,
+        )
+        .unwrap();
+
+        let mut reader = OperettaReader::new();
+        reader.set_id(&dir.join("Index.idx.xml")).unwrap();
+
+        let ome = reader.ome_metadata().unwrap();
+        let channel = &ome.images[0].channels[0];
+        assert_eq!(channel.name.as_deref(), Some("DAPI"));
+        assert_eq!(channel.emission_wavelength, Some(461.0));
+        assert_eq!(channel.excitation_wavelength, Some(358.0));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9120,6 +9264,85 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn push_tiff_entry(out: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tiff_entry(tag, typ, count, value));
+    }
+
+    fn write_trestle_two_resolution_tiff(path: &Path) {
+        let mut copyright = b"Copyright Trestle Corp.".to_vec();
+        copyright.push(0);
+        let mut desc = b"OverlapsXY=1 2 0 0;Scanner=MedScan".to_vec();
+        desc.push(0);
+
+        let ifd0 = 8u32;
+        let entries = 15u32;
+        let ifd_size = 2 + entries * 12 + 4;
+        let ifd1 = ifd0 + ifd_size;
+        let copyright_offset = ifd1 + ifd_size;
+        let desc_offset = copyright_offset + copyright.len() as u32;
+        let pixel0_offset = desc_offset + desc.len() as u32;
+        let pixel1_offset = pixel0_offset + 16;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd0.to_le_bytes());
+
+        bytes.extend_from_slice(&(entries as u16).to_le_bytes());
+        push_tiff_entry(&mut bytes, 256, 4, 1, 4);
+        push_tiff_entry(&mut bytes, 257, 4, 1, 4);
+        push_tiff_entry(&mut bytes, 258, 3, 1, 8);
+        push_tiff_entry(&mut bytes, 259, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 262, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 270, 2, desc.len() as u32, desc_offset);
+        push_tiff_entry(&mut bytes, 277, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 284, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 322, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 323, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 324, 4, 4, pixel0_offset);
+        push_tiff_entry(&mut bytes, 325, 4, 4, 16);
+        push_tiff_entry(
+            &mut bytes,
+            33432,
+            2,
+            copyright.len() as u32,
+            copyright_offset,
+        );
+        push_tiff_entry(&mut bytes, 273, 4, 1, pixel0_offset);
+        push_tiff_entry(&mut bytes, 279, 4, 1, 16);
+        bytes.extend_from_slice(&ifd1.to_le_bytes());
+
+        bytes.extend_from_slice(&(entries as u16).to_le_bytes());
+        push_tiff_entry(&mut bytes, 256, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 257, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 258, 3, 1, 8);
+        push_tiff_entry(&mut bytes, 259, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 262, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 270, 2, desc.len() as u32, desc_offset);
+        push_tiff_entry(&mut bytes, 277, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 284, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 322, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 323, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 324, 4, 1, pixel1_offset);
+        push_tiff_entry(&mut bytes, 325, 4, 1, 4);
+        push_tiff_entry(
+            &mut bytes,
+            33432,
+            2,
+            copyright.len() as u32,
+            copyright_offset,
+        );
+        push_tiff_entry(&mut bytes, 273, 4, 1, pixel1_offset);
+        push_tiff_entry(&mut bytes, 279, 4, 1, 4);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        bytes.extend_from_slice(&copyright);
+        bytes.extend_from_slice(&desc);
+        bytes.extend_from_slice(&[1u8; 16]);
+        bytes.extend_from_slice(&[2u8; 4]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn trestle_parses_comment_keyvalues_when_copyright_matches() {
         let path = temp_path("trestle.tif");
@@ -9177,6 +9400,30 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn trestle_pyramid_ifds_are_nested_resolutions_like_java_non_flattened() {
+        let path = temp_path("trestle_pyramid.tif");
+        write_trestle_two_resolution_tiff(&path);
+
+        let mut reader = TrestleReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.metadata().resolution_count, 2);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (3, 2));
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 1);
+        assert_eq!(ome.images[0].name.as_deref(), Some("Series 1"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Build a minimal ScanR dataset (experiment_descriptor.xml + one data TIFF)
     /// and confirm the newly-captured ScanrHandler fields surface into
     /// series_metadata: plate name, physical pixel size, channel name,
@@ -9227,6 +9474,8 @@ mod tests {
             matches!(md.get("Channel 0 Name"), Some(MetadataValue::String(v)) if v == "DAPI"),
             "channel name not captured: {md:?}"
         );
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
         assert!(
             matches!(md.get("Channel 0 ExposureTime"), Some(MetadataValue::Float(v)) if (*v - 1.5).abs() < 1e-9),
             "exposure time (s) not captured: {md:?}"
@@ -9237,6 +9486,52 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cellvoyager_ome_metadata_projects_channel_name_like_java() {
+        let dir = temp_path("cellvoyager_channels");
+        let image_dir = dir.join("Image");
+        std::fs::create_dir_all(&image_dir).unwrap();
+
+        let tiff = image_dir.join("W1F001T0001Z01C1.tif");
+        let meta = test_meta(2, 2);
+        write_tiff(&tiff, &meta, &[1u8, 2, 3, 4]);
+
+        std::fs::write(
+            dir.join("MeasurementResult.xml"),
+            r#"<MeasurementResult xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ObjectiveLens><Magnification>1</Magnification></ObjectiveLens>
+  <Channels><Channel>
+    <IsEnabled>true</IsEnabled>
+    <Number>1</Number>
+    <AcquisitionSetting><Camera>
+      <EffectiveHorizontalPixels_pixel>2</EffectiveHorizontalPixels_pixel>
+      <EffectiveVerticalPixels_pixel>2</EffectiveVerticalPixels_pixel>
+      <HorizonalCellSize_um>1</HorizonalCellSize_um>
+      <VerticalCellSize_um>1</VerticalCellSize_um>
+    </Camera></AcquisitionSetting>
+    <Excitation xsi:type="Laser"><Name><Value>488</Value></Name></Excitation>
+    <Emission><Name><Value>525</Value></Name><FluorescentProbe><Value>GFP</Value></FluorescentProbe></Emission>
+  </Channel></Channels>
+  <Wells><Well>
+    <IsEnabled>true</IsEnabled><Number>1</Number>
+    <Areas><Area><Fields><Field><StageX_um>0</StageX_um><StageY_um>0</StageY_um></Field></Fields></Area></Areas>
+  </Well></Wells>
+</MeasurementResult>"#,
+        )
+        .unwrap();
+
+        let mut reader = CellVoyagerReader::new();
+        reader.set_id(&dir.join("MeasurementResult.xml")).unwrap();
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images[0].channels[0].name.as_deref(),
+            Some("Ex: Laser(488) / Em: 525 / Fl: GFP")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Confirm ScanR subposition-list field positions surface as

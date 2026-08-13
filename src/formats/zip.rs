@@ -12,8 +12,10 @@ use std::io::{ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, LookupTable, MetadataOptions};
+use crate::common::ome_metadata::OmeMetadata;
 use crate::common::reader::FormatReader;
 use crate::registry::ImageReader;
 
@@ -330,5 +332,51 @@ impl FormatReader for ZipReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner_mut()?.open_thumb_bytes(plane_index)
+    }
+
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        self.inner()?.compressed_level_info(plane_index, level)
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.inner_mut()?
+            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner().map(|r| r.resolution_count()).unwrap_or(1)
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner_mut()?.set_resolution(level)
+    }
+
+    fn resolution(&self) -> usize {
+        self.inner().map(|r| r.resolution()).unwrap_or(0)
+    }
+
+    fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+        self.inner_mut()?.lookup_table(plane_index)
+    }
+
+    fn set_metadata_options(&mut self, options: MetadataOptions) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_metadata_options(options);
+        }
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        self.inner.as_ref().and_then(|inner| inner.ome_metadata())
     }
 }

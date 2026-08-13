@@ -16,7 +16,7 @@
 //! The setup block contains keys of the form:  sp_img_x, sp_img_y, sp_ADC_RE
 //! (ADC resolution = number of time channels).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -3507,6 +3507,64 @@ impl FormatReader for LiFlimReader {
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{create_lsid, OmeMetadata, OmeROI, OmeShape};
+
+        if self.metas.is_empty() {
+            return None;
+        }
+
+        let file_name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        let mut ome = OmeMetadata::default();
+        for (image_index, meta) in self.metas.iter().enumerate() {
+            if ome.populate_pixels(meta, image_index).is_err() {
+                return None;
+            }
+            let image = ome.images.get_mut(image_index)?;
+            let suffix = if image_index == 0 {
+                "Primary Image #1"
+            } else {
+                "Background Image #1"
+            };
+            image.name = Some(format!("{file_name} {suffix}"));
+            image.modulo_z = meta.modulo_z.clone();
+            image.modulo_t = meta.modulo_t.clone();
+        }
+
+        let primary = &self.metas[0];
+        if let Some(image) = ome.images.get_mut(0) {
+            let stamps = liflim_timestamp_millis(primary);
+            let first_stamp = stamps.first().and_then(|(_, stamp)| *stamp);
+            let exposure = liflim_exposure_time_seconds(primary);
+            if !stamps.is_empty() || exposure.is_some() {
+                image.planes = liflim_ome_planes(primary, &stamps, first_stamp, exposure);
+            }
+        }
+
+        ome.rois = liflim_ome_rois(primary)
+            .into_iter()
+            .enumerate()
+            .map(|(roi_index, points)| OmeROI {
+                id: Some(create_lsid("ROI", &[roi_index])),
+                name: None,
+                shapes: vec![OmeShape::Polygon {
+                    points,
+                    the_z: None,
+                    the_t: None,
+                    the_c: None,
+                }],
+            })
+            .collect();
+
+        Some(ome)
+    }
 }
 
 fn read_liflim_header(file: &mut File) -> Result<(String, u64)> {
@@ -3909,6 +3967,143 @@ fn liflim_convert12_to_16_msb(image: &[u8]) -> Vec<u8> {
     image16
 }
 
+fn liflim_effective_size_c(meta: &ImageMetadata) -> u32 {
+    if meta.is_rgb {
+        1
+    } else {
+        meta.size_c.max(1)
+    }
+}
+
+fn liflim_timestamp_millis(meta: &ImageMetadata) -> Vec<(u32, Option<i64>)> {
+    let mut stamps = BTreeMap::new();
+    for (key, value) in &meta.series_metadata {
+        let Some(index_text) = key.strip_prefix("FLIMIMAGE: TIMESTAMPS - t") else {
+            continue;
+        };
+        let Ok(index) = index_text.parse::<u32>() else {
+            continue;
+        };
+        let Some(text) = liflim_metadata_string(value) else {
+            continue;
+        };
+        let mut words = text.split_whitespace();
+        let (Some(hi), Some(lo)) = (words.next(), words.next()) else {
+            stamps.insert(index, None);
+            continue;
+        };
+        let parsed = hi
+            .parse::<u64>()
+            .ok()
+            .zip(lo.parse::<u64>().ok())
+            .map(|(hi, lo)| {
+                let ticks = ((hi as u128) << 32) | lo as u128;
+                (ticks / 10_000) as i64
+            });
+        stamps.insert(index, parsed);
+    }
+    stamps.into_iter().collect()
+}
+
+fn liflim_exposure_time_seconds(meta: &ImageMetadata) -> Option<f64> {
+    meta.series_metadata.iter().find_map(|(key, value)| {
+        if key != "ExposureTime" && !key.ends_with(" - ExposureTime") {
+            return None;
+        }
+        let text = liflim_metadata_string(value)?;
+        let mut parts = text.split_whitespace();
+        let amount = parts.next()?.parse::<f64>().ok()?;
+        let units = parts.next().unwrap_or("s").to_ascii_lowercase();
+        if units == "ms" {
+            Some(amount / 1000.0)
+        } else {
+            Some(amount)
+        }
+    })
+}
+
+fn liflim_ome_planes(
+    meta: &ImageMetadata,
+    stamps: &[(u32, Option<i64>)],
+    first_stamp: Option<i64>,
+    exposure_time: Option<f64>,
+) -> Vec<crate::common::ome_metadata::OmePlane> {
+    let mut planes = Vec::new();
+    let effective_c = liflim_effective_size_c(meta);
+    for t in 0..meta.size_t.max(1) {
+        let delta_t = stamps
+            .iter()
+            .find(|(index, _)| *index == t)
+            .and_then(|(_, stamp)| stamp.zip(first_stamp))
+            .map(|(stamp, first)| (stamp - first) as f64 / 1000.0);
+        for c in 0..effective_c {
+            for z in 0..meta.size_z.max(1) {
+                planes.push(crate::common::ome_metadata::OmePlane {
+                    the_z: z,
+                    the_c: c,
+                    the_t: t,
+                    delta_t,
+                    exposure_time,
+                    position_x: None,
+                    position_y: None,
+                    position_z: None,
+                });
+            }
+        }
+    }
+    planes
+}
+
+fn liflim_ome_rois(meta: &ImageMetadata) -> Vec<Vec<(f64, f64)>> {
+    let mut rois: BTreeMap<usize, BTreeMap<usize, String>> = BTreeMap::new();
+    for (key, value) in &meta.series_metadata {
+        let Some(rest) = key.strip_prefix("ROI: ROI") else {
+            continue;
+        };
+        let Some((roi_text, point_text)) = rest.split_once(" - p") else {
+            continue;
+        };
+        let (Ok(roi_index), Ok(point_index)) =
+            (roi_text.parse::<usize>(), point_text.parse::<usize>())
+        else {
+            continue;
+        };
+        let Some(text) = liflim_metadata_string(value) else {
+            continue;
+        };
+        rois.entry(roi_index)
+            .or_default()
+            .insert(point_index, text.replace(' ', ","));
+    }
+
+    rois.into_values()
+        .filter_map(|points| {
+            let parsed: Vec<(f64, f64)> = points
+                .into_values()
+                .filter_map(|point| {
+                    let values: Vec<f64> = point
+                        .split(',')
+                        .filter(|v| !v.is_empty())
+                        .filter_map(|v| v.parse::<f64>().ok())
+                        .collect();
+                    values.first().copied().zip(values.get(1).copied())
+                })
+                .collect();
+            (parsed.len() >= 2).then_some(parsed)
+        })
+        .collect()
+}
+
+fn liflim_metadata_string(value: &MetadataValue) -> Option<String> {
+    match value {
+        MetadataValue::String(v) => Some(v.clone()),
+        MetadataValue::Int(v) => Some(v.to_string()),
+        MetadataValue::Float(v) => Some(v.to_string()),
+        MetadataValue::Bool(v) => Some(v.to_string()),
+        MetadataValue::Bytes(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod liflim_tests {
     use super::*;
@@ -4158,6 +4353,70 @@ hasDarkImage=1
             (2, 1, 1, 1, 1, 1)
         );
         assert_eq!(reader.open_bytes(0).unwrap(), vec![99, 0, 100, 0]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn liflim_ome_metadata_projects_java_image_planes_and_roi_polygon() {
+        let path = temp_path("ome.fli");
+        let header = "\
+ExposureTime=25 ms
+[FLIMIMAGE: INFO]
+version=1.0
+compression=0
+[FLIMIMAGE: LAYOUT]
+datatype=UINT16
+packing=lsb
+channels=1
+x=2
+y=1
+z=1
+phases=1
+frequencies=1
+timestamps=2
+hasDarkImage=1
+[FLIMIMAGE: TIMESTAMPS]
+t0=0 0
+t1=0 20000
+[ROI: INFO]
+numregions=1
+[ROI: ROI0]
+name=cell
+p0=1 2
+p1=3 4
+";
+        let mut payload = Vec::new();
+        for value in [1u16, 2, 3, 4, 99, 100] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        write_liflim(&path, header, &payload);
+
+        let mut reader = LiFlimReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().expect("LI-FLIM OME metadata");
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let primary_name = format!("{file_name} Primary Image #1");
+        let background_name = format!("{file_name} Background Image #1");
+
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.images[0].name.as_deref(), Some(primary_name.as_str()));
+        assert_eq!(
+            ome.images[1].name.as_deref(),
+            Some(background_name.as_str())
+        );
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].planes.len(), 2);
+        assert_eq!(ome.images[0].planes[0].delta_t, Some(0.0));
+        assert_eq!(ome.images[0].planes[1].delta_t, Some(0.002));
+        assert_eq!(ome.images[0].planes[0].exposure_time, Some(0.025));
+
+        assert_eq!(ome.rois.len(), 1);
+        match &ome.rois[0].shapes[0] {
+            crate::common::ome_metadata::OmeShape::Polygon { points, .. } => {
+                assert_eq!(points, &vec![(1.0, 2.0), (3.0, 4.0)]);
+            }
+            other => panic!("expected LI-FLIM ROI polygon, got {other:?}"),
+        }
         let _ = std::fs::remove_file(path);
     }
 

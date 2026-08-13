@@ -420,7 +420,7 @@ impl FormatReader for MrcReader {
             .map(|e| {
                 matches!(
                     e.to_ascii_lowercase().as_str(),
-                    "mrc" | "st" | "ali" | "map" | "rec" | "mrcs" | "ccp4"
+                    "mrc" | "st" | "ali" | "map" | "rec" | "mrcs"
                 )
             })
             .unwrap_or(false)
@@ -479,23 +479,11 @@ impl FormatReader for MrcReader {
         let nz = hdr.nz as u32;
 
         let data_offset = HEADER_SIZE + hdr.extended_header_size.max(0) as u64;
-        let plane_bytes = (nx as u64)
+        let _plane_bytes = (nx as u64)
             .checked_mul(ny as u64)
             .and_then(|v| v.checked_mul(spp as u64))
             .and_then(|v| v.checked_mul(pixel_type.bytes_per_sample() as u64))
             .ok_or_else(|| BioFormatsError::Format("MRC plane byte count overflows".into()))?;
-        let pixel_bytes = plane_bytes
-            .checked_mul(nz as u64)
-            .ok_or_else(|| BioFormatsError::Format("MRC pixel byte count overflows".into()))?;
-        let required_len = data_offset
-            .checked_add(pixel_bytes)
-            .ok_or_else(|| BioFormatsError::Format("MRC pixel payload offset overflows".into()))?;
-        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        if file_len < required_len {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "MRC pixel payload is shorter than declared: need {required_len} bytes, found {file_len}"
-            )));
-        }
         // Per MRCReader.java the rows are always flipped (lower-left origin).
         let flip_y = true;
 
@@ -645,9 +633,16 @@ impl FormatReader for MrcReader {
 
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        let full_plane_available = (offset as u128 + plane_bytes as u128) <= file_len as u128;
+        if !full_plane_available {
+            return Ok(buf);
+        }
+
         f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
 
         if !self.flip_y {
@@ -981,9 +976,9 @@ mod tests {
             assert!(reader.is_this_type_by_name(&path), "missing .{ext}");
         }
 
-        // Extra Rust support for CCP4 maps is retained; it does not change
-        // Java-supported MRC suffix behavior.
-        assert!(reader.is_this_type_by_name(Path::new("synthetic.ccp4")));
+        // Java MRCReader registers MRC_SUFFIXES without "ccp4"; a CCP4 map can
+        // still be claimed by byte probing when it carries a valid MRC header.
+        assert!(!reader.is_this_type_by_name(Path::new("synthetic.ccp4")));
         assert!(!reader.is_this_type_by_name(Path::new("synthetic.tif")));
     }
 
@@ -1069,6 +1064,46 @@ mod tests {
         assert_eq!(meta.pixel_type, PixelType::Int8);
         assert_eq!(meta.bits_per_pixel, 8);
         assert_eq!(plane, vec![0x00, 0x7f, 0x80, 0xff]);
+    }
+
+    #[test]
+    fn mrc_reader_accepts_short_declared_payload_and_zero_fills_unavailable_planes_like_java() {
+        let path = write_mrc_fixture("short_declared_payload", 1, 2, 3, 0, 0.0);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.truncate(HEADER_SIZE as usize);
+        bytes[8..12].copy_from_slice(&2i32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        let first = reader.open_bytes(0).unwrap();
+        let second = reader.open_bytes(1).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(first, vec![3, 4, 1, 2]);
+        assert_eq!(second, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn mrc_reader_zero_fills_partially_available_plane_like_java() {
+        let path = write_mrc_fixture("partial_plane_payload", 1, 2, 3, 0, 0.0);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.truncate(HEADER_SIZE as usize);
+        bytes.extend_from_slice(&[1, 2, 3]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let plane = reader.open_bytes(0).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(plane, vec![0, 0, 0, 0]);
     }
 
     #[test]

@@ -656,3 +656,66 @@ impl FormatWriter for EpsWriter {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_eps_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bioformats_rs_eps_{}_{}.eps",
+            std::process::id(),
+            name
+        ))
+    }
+
+    #[test]
+    fn eps_reader_opens_java_inline_hex_raster_subset() {
+        let path = temp_eps_path("inline_hex");
+        std::fs::write(
+            &path,
+            b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 10 20 12 22\n2 2 8 image\n00010203\n%%EOF\n",
+        )
+        .unwrap();
+
+        let mut reader = EpsReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        assert!(matches!(
+            meta.series_metadata.get("X-coordinate of origin"),
+            Some(MetadataValue::Int(10))
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("Y-coordinate of origin"),
+            Some(MetadataValue::Int(20))
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![1, 3]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn eps_reader_rejects_vector_only_postscript_like_java() {
+        let path = temp_eps_path("vector_only");
+        std::fs::write(
+            &path,
+            b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\n%%EOF\n",
+        )
+        .unwrap();
+
+        let err = EpsReader::new().set_id(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::UnsupportedFormat(message)
+                if message.contains("vector data without inline image pixels")
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+}

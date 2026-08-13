@@ -2540,6 +2540,119 @@ impl DicomReader {
         )
     }
 
+    fn read_encapsulated_frame_as_pixels(
+        &self,
+        path: &Path,
+        frame_index: u32,
+        frame_meta: &ImageMetadata,
+    ) -> Result<Vec<u8>> {
+        let syntax = classify_transfer_syntax(&self.transfer_syntax);
+        if matches!(
+            syntax,
+            EncapsulatedSyntax::Deflate | EncapsulatedSyntax::Unknown
+        ) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "DICOM: encapsulated transfer syntax {} is not supported",
+                self.transfer_syntax
+            )));
+        }
+        let frame = self
+            .encapsulated_frames
+            .get(frame_index as usize)
+            .or_else(|| {
+                if frame_index == 0 {
+                    self.encapsulated_frames.first()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| BioFormatsError::Format("DICOM: missing pixel fragments".into()))?;
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut encoded = Vec::new();
+        for fragment in &frame.fragments {
+            f.seek(SeekFrom::Start(fragment.offset))
+                .map_err(BioFormatsError::Io)?;
+            let start = encoded.len();
+            encoded.resize(start + fragment.length as usize, 0);
+            f.read_exact(&mut encoded[start..])
+                .map_err(BioFormatsError::Io)?;
+        }
+        let expected = expected_output_bytes(frame_meta)?;
+
+        match syntax {
+            EncapsulatedSyntax::Jpeg2000 => {
+                let mut decoded = crate::common::codec::decompress_jpeg2000(&encoded)?;
+                if decoded.len() != expected {
+                    return Err(BioFormatsError::Codec(format!(
+                        "DICOM JPEG 2000 decoded {} bytes, expected {expected}",
+                        decoded.len()
+                    )));
+                }
+                if self.photometric_interpretation.trim() == "MONOCHROME1" {
+                    invert_monochrome1(
+                        &mut decoded,
+                        frame_meta,
+                        self.max_pixel_range,
+                        self.center_pixel_value,
+                    );
+                }
+                Ok(decoded)
+            }
+            EncapsulatedSyntax::Jpeg => {
+                let trimmed = trim_dicom_jpeg(encoded);
+                let mut decoded = crate::common::codec::decompress_jpeg(&trimmed)?;
+                if decoded.len() != expected {
+                    return Err(BioFormatsError::Codec(format!(
+                        "DICOM JPEG decoded {} bytes, expected {expected}",
+                        decoded.len()
+                    )));
+                }
+                if self.photometric_interpretation.trim() == "MONOCHROME1" {
+                    invert_monochrome1(
+                        &mut decoded,
+                        frame_meta,
+                        self.max_pixel_range,
+                        self.center_pixel_value,
+                    );
+                }
+                Ok(decoded)
+            }
+            EncapsulatedSyntax::Rle => {
+                let ec = self.source_samples_per_pixel.max(1) as usize;
+                let bpp = (self.bits_allocated.max(8) as usize).div_ceil(8);
+                let native = decode_dicom_rle(
+                    &encoded,
+                    frame_meta.size_x as usize,
+                    frame_meta.size_y as usize,
+                    ec,
+                    bpp,
+                )?;
+                let mut buf = normalize_native_pixels(
+                    &native,
+                    frame_meta,
+                    self.source_samples_per_pixel,
+                    self.bits_allocated,
+                    self.bits_stored,
+                    self.pixel_representation,
+                    &self.palette,
+                );
+                if frame_meta.is_rgb && !frame_meta.is_interleaved {
+                    buf = interleaved_to_planar(&buf, frame_meta);
+                }
+                if self.photometric_interpretation.trim() == "MONOCHROME1" {
+                    invert_monochrome1(
+                        &mut buf,
+                        frame_meta,
+                        self.max_pixel_range,
+                        self.center_pixel_value,
+                    );
+                }
+                Ok(buf)
+            }
+            EncapsulatedSyntax::Deflate | EncapsulatedSyntax::Unknown => unreachable!(),
+        }
+    }
+
     fn read_native_frame_as_tile(
         &self,
         path: &Path,
@@ -2547,9 +2660,7 @@ impl DicomReader {
         tile_meta: &ImageMetadata,
     ) -> Result<Vec<u8>> {
         if self.encapsulated {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "DICOM: tiled WSI stitching for encapsulated transfer syntax is unsupported".into(),
-            ));
+            return self.read_encapsulated_frame_as_pixels(path, frame_index, tile_meta);
         }
         let source_plane_bytes = source_pixel_bytes_for_dims(
             self.source_tile_width,
@@ -2703,14 +2814,7 @@ impl FormatReader for DicomReader {
             .map(|e| e.to_ascii_lowercase());
         matches!(
             ext.as_deref(),
-            Some("dcm")
-                | Some("dicom")
-                | Some("dic")
-                | Some("j2ki")
-                | Some("j2kr")
-                | Some("jp2")
-                | Some("raw")
-                | Some("ima")
+            Some("dcm") | Some("dicom") | Some("dic") | Some("j2ki") | Some("j2kr")
         )
     }
 
@@ -3021,123 +3125,7 @@ impl FormatReader for DicomReader {
         }
 
         if self.encapsulated {
-            let syntax = classify_transfer_syntax(&self.transfer_syntax);
-            if matches!(
-                syntax,
-                EncapsulatedSyntax::Deflate | EncapsulatedSyntax::Unknown
-            ) {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "DICOM: encapsulated transfer syntax {} is not supported",
-                    self.transfer_syntax
-                )));
-            }
-            let frame = self
-                .encapsulated_frames
-                .get(plane_index as usize)
-                .or_else(|| {
-                    if plane_index == 0 {
-                        self.encapsulated_frames.first()
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| BioFormatsError::Format("DICOM: missing pixel fragments".into()))?;
-            let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-            let mut encoded = Vec::new();
-            for fragment in &frame.fragments {
-                f.seek(SeekFrom::Start(fragment.offset))
-                    .map_err(BioFormatsError::Io)?;
-                let start = encoded.len();
-                encoded.resize(start + fragment.length as usize, 0);
-                f.read_exact(&mut encoded[start..])
-                    .map_err(BioFormatsError::Io)?;
-            }
-            let expected = expected_output_bytes(meta)?;
-
-            match syntax {
-                EncapsulatedSyntax::Jpeg2000 => {
-                    let mut decoded = crate::common::codec::decompress_jpeg2000(&encoded)?;
-                    if decoded.len() != expected {
-                        return Err(BioFormatsError::Codec(format!(
-                            "DICOM JPEG 2000 decoded {} bytes, expected {expected}",
-                            decoded.len()
-                        )));
-                    }
-                    // Java DicomReader.openBytes inverts MONOCHROME1 after tile
-                    // decoding for every codec (DicomReader.java:409-430).
-                    if self.photometric_interpretation.trim() == "MONOCHROME1" {
-                        invert_monochrome1(
-                            &mut decoded,
-                            meta,
-                            self.max_pixel_range,
-                            self.center_pixel_value,
-                        );
-                    }
-                    return Ok(decoded);
-                }
-                EncapsulatedSyntax::Jpeg => {
-                    // Trim the fragment to a clean JPEG stream (Java readTile):
-                    // ensure an 0xFF prefix before SOI and a trailing EOI marker.
-                    let trimmed = trim_dicom_jpeg(encoded);
-                    // Both baseline (process 1) and lossless (process 14) JPEG
-                    // are handled by the shared JPEG decoder, which supports the
-                    // lossless SOF3 path.
-                    let mut decoded = crate::common::codec::decompress_jpeg(&trimmed)?;
-                    if decoded.len() != expected {
-                        return Err(BioFormatsError::Codec(format!(
-                            "DICOM JPEG decoded {} bytes, expected {expected}",
-                            decoded.len()
-                        )));
-                    }
-                    // Java DicomReader.openBytes inverts MONOCHROME1 after tile
-                    // decoding for every codec (DicomReader.java:409-430).
-                    if self.photometric_interpretation.trim() == "MONOCHROME1" {
-                        invert_monochrome1(
-                            &mut decoded,
-                            meta,
-                            self.max_pixel_range,
-                            self.center_pixel_value,
-                        );
-                    }
-                    return Ok(decoded);
-                }
-                EncapsulatedSyntax::Rle => {
-                    let ec = self.source_samples_per_pixel.max(1) as usize;
-                    let bpp = (self.bits_allocated.max(8) as usize).div_ceil(8);
-                    let native = decode_dicom_rle(
-                        &encoded,
-                        meta.size_x as usize,
-                        meta.size_y as usize,
-                        ec,
-                        bpp,
-                    )?;
-                    // The RLE decoder reassembles native samples as interleaved
-                    // bytes; Java marks RLE core metadata as non-interleaved, so
-                    // convert RGB buffers back to planar after normalisation.
-                    let mut buf = normalize_native_pixels(
-                        &native,
-                        meta,
-                        self.source_samples_per_pixel,
-                        self.bits_allocated,
-                        self.bits_stored,
-                        self.pixel_representation,
-                        &self.palette,
-                    );
-                    if meta.is_rgb && !meta.is_interleaved {
-                        buf = interleaved_to_planar(&buf, meta);
-                    }
-                    if self.photometric_interpretation.trim() == "MONOCHROME1" {
-                        invert_monochrome1(
-                            &mut buf,
-                            meta,
-                            self.max_pixel_range,
-                            self.center_pixel_value,
-                        );
-                    }
-                    return Ok(buf);
-                }
-                EncapsulatedSyntax::Deflate | EncapsulatedSyntax::Unknown => unreachable!(),
-            }
+            return self.read_encapsulated_frame_as_pixels(path, plane_index, meta);
         }
 
         let source_plane_bytes = source_pixel_bytes_for_dims(
@@ -3563,6 +3551,46 @@ impl crate::common::writer::FormatWriter for DicomWriter {
 mod tests {
     use super::*;
 
+    fn elem_explicit(bytes: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], value: &[u8]) {
+        bytes.extend_from_slice(&group.to_le_bytes());
+        bytes.extend_from_slice(&element.to_le_bytes());
+        bytes.extend_from_slice(vr);
+        if vr_has_long_length(vr) {
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        }
+        bytes.extend_from_slice(value);
+    }
+
+    fn elem_encapsulated_pixel_data(bytes: &mut Vec<u8>, fragments: &[Vec<u8>]) {
+        bytes.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        bytes.extend_from_slice(&0x0010u16.to_le_bytes());
+        bytes.extend_from_slice(b"OB");
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        bytes.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        bytes.extend_from_slice(&0xE000u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        for fragment in fragments {
+            let mut padded = fragment.clone();
+            if padded.len() % 2 == 1 {
+                padded.push(0);
+            }
+            bytes.extend_from_slice(&0xFFFEu16.to_le_bytes());
+            bytes.extend_from_slice(&0xE000u16.to_le_bytes());
+            bytes.extend_from_slice(&(padded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&padded);
+        }
+
+        bytes.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        bytes.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+    }
+
     fn rle_header(offsets: &[u32]) -> Vec<u8> {
         // 64-byte RLE header: segment count + 15 offsets, all little-endian u32.
         let mut h = vec![0u8; 64];
@@ -3631,6 +3659,65 @@ mod tests {
         let input = vec![0xff, 0xd8, 0xff, 0xd9, 0x11, 0x22, 0x33, 0x44];
         let out = trim_dicom_jpeg(input);
         assert_eq!(out, vec![0xff, 0xd8, 0xff, 0xd9]);
+    }
+
+    #[test]
+    fn dicom_wsi_stitches_encapsulated_jpeg_tiles() {
+        let dir = std::env::temp_dir().join(format!("bf_dicom_wsi_jpeg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wsi_jpeg_tiles.dcm");
+        let mut bytes = Vec::new();
+        let mut tile0 = Vec::new();
+        let mut tile1 = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut tile0, 100)
+            .encode_image(&image::GrayImage::from_raw(2, 2, vec![16; 4]).unwrap())
+            .unwrap();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut tile1, 100)
+            .encode_image(&image::GrayImage::from_raw(2, 2, vec![240; 4]).unwrap())
+            .unwrap();
+
+        elem_explicit(
+            &mut bytes,
+            0x0002,
+            0x0010,
+            b"UI",
+            b"1.2.840.10008.1.2.4.50\0",
+        );
+        elem_explicit(
+            &mut bytes,
+            0x0008,
+            0x0016,
+            b"UI",
+            b"1.2.840.10008.5.1.4.1.1.77.1.6\0",
+        );
+        elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+        elem_explicit(&mut bytes, 0x0028, 0x0004, b"CS", b"MONOCHROME2 ");
+        elem_explicit(&mut bytes, 0x0028, 0x0008, b"IS", b"2");
+        elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &2u16.to_le_bytes());
+        elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+        elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+        elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+        elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+        elem_explicit(&mut bytes, 0x0048, 0x0006, b"UL", &4u32.to_le_bytes());
+        elem_explicit(&mut bytes, 0x0048, 0x0007, b"UL", &2u32.to_le_bytes());
+        elem_encapsulated_pixel_data(&mut bytes, &[tile0, tile1]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = DicomReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 2));
+        assert_eq!(reader.metadata().image_count, 1);
+        let pixels = reader.open_bytes(0).unwrap();
+        assert_eq!(pixels.len(), 8);
+        for &px in &[pixels[0], pixels[1], pixels[4], pixels[5]] {
+            assert!(px <= 24, "left tile pixel {px} should decode near 16");
+        }
+        for &px in &[pixels[2], pixels[3], pixels[6], pixels[7]] {
+            assert!(px >= 232, "right tile pixel {px} should decode near 240");
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -3794,18 +3881,21 @@ mod tests {
     }
 
     #[test]
-    fn dicom_name_detection_includes_java_and_fallback_suffixes() {
+    fn dicom_name_detection_matches_java_sufficient_suffixes() {
         let reader = DicomReader::new();
 
         for name in [
             "scan.dcm",
+            "scan.dicom",
+            "scan.dic",
             "scan.j2ki",
             "scan.j2kr",
-            "scan.jp2",
-            "scan.raw",
-            "scan.ima",
         ] {
             assert!(reader.is_this_type_by_name(Path::new(name)), "{name}");
+        }
+
+        for name in ["scan.jp2", "scan.raw", "scan.ima"] {
+            assert!(!reader.is_this_type_by_name(Path::new(name)), "{name}");
         }
     }
 

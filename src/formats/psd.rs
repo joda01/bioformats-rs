@@ -1392,6 +1392,17 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn psd_name_detection_matches_java_suffix_registration() {
+        let reader = PsdReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("image.psd")));
+        assert!(reader.is_this_type_by_name(Path::new("image.PSD")));
+        // Java PSDReader registers only "psd"; PSB-like files can still be
+        // claimed by byte magic because suffixNecessary is false.
+        assert!(!reader.is_this_type_by_name(Path::new("image.psb")));
+        assert!(reader.is_this_type_by_bytes(b"8BPS\x00\x02"));
+    }
+
+    #[test]
     fn packbits_rejects_truncated_literal_payload() {
         let err = decode_packbits(&[2, 10, 11], 3)
             .expect_err("short PackBits literal should be rejected");
@@ -1600,7 +1611,7 @@ impl FormatReader for PsdReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("psd") | Some("psb"))
+        matches!(ext.as_deref(), Some("psd"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {

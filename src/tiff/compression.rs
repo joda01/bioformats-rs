@@ -52,6 +52,40 @@ pub fn decompress(
     nikon_options: Option<&NikonCompressionOptions>,
     jpeg_color: JpegColor,
 ) -> Result<Vec<u8>> {
+    decompress_with_jpeg2000_reduce(
+        data,
+        compression,
+        expected_len,
+        predictor,
+        samples_per_pixel,
+        bits_per_sample,
+        row_width,
+        block_height,
+        little_endian,
+        jpeg_tables,
+        nikon_options,
+        jpeg_color,
+        0,
+    )
+}
+
+/// Decompress one strip or tile, optionally selecting a reduced JPEG-2000
+/// codestream resolution for synthetic TIFF sub-resolutions.
+pub fn decompress_with_jpeg2000_reduce(
+    data: &[u8],
+    compression: Compression,
+    expected_len: usize,
+    predictor: u16,
+    samples_per_pixel: u16,
+    bits_per_sample: u16,
+    row_width: u32,
+    block_height: u32,
+    little_endian: bool,
+    jpeg_tables: Option<&[u8]>,
+    nikon_options: Option<&NikonCompressionOptions>,
+    jpeg_color: JpegColor,
+    jpeg2000_reduce: u32,
+) -> Result<Vec<u8>> {
     let bits_per_pixel = samples_per_pixel as u32 * bits_per_sample as u32;
     let mut out = match compression {
         Compression::None => data.to_vec(),
@@ -74,7 +108,9 @@ pub fn decompress(
             }
         }
         Compression::Zstd => decompress_zstd(data)?,
-        Compression::Jpeg2000 => decompress_jpeg2000_with_endianness(data, little_endian)?,
+        Compression::Jpeg2000 => {
+            decompress_jpeg2000_with_endianness_and_reduce(data, little_endian, jpeg2000_reduce)?
+        }
         Compression::JpegXR => decompress_jpegxr(data)?,
         Compression::Ccitt => {
             if bits_per_pixel != 1 {
