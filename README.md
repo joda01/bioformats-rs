@@ -3,13 +3,16 @@
 A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/)
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 
+The Bio-Formats translation tracks [`ome/bioformats`](https://github.com/ome/bioformats)
+at commit `d87eb853f0f8d1496aec29ace384cdc5b963096a`.
+
 The internal Metakit table reader used for Volocity is translated from
 `ome.metakit.MetakitReader` in
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 
-* 2026-08-13: Broad audit: fixed metadata handling
+* 2026-08-13: Broad audit: fixed metadata handling. Translation updated to track latest Bioformats at commit `d87eb853f0f8d1496aec29ace384cdc5b963096a`
 * 2026-08-04: fixed error handling + speed regression
 * 2026-07-15: Translated jpegxr, fixing a bug in it. Now using jpegxr-pure-rs instead as dependency
 * 2026-07-12: For now assumed to be a feature complete translation, tested on real data. API added to also enable extraction of embedded tile raw data (e.g., to avoid lossy conversion)

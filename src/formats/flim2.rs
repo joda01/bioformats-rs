@@ -13185,6 +13185,11 @@ struct VsiPyramidMeta {
     /// exposures; the prefixed ones land here.
     default_exposure_time: Option<i64>,
     other_exposure_times: Vec<i64>,
+    fill_color: Option<u8>,
+    calibration_slope: Option<f64>,
+    calibration_origin: Option<f64>,
+    calibration_final: Option<f64>,
+    calibration_points: Option<i64>,
     /// Generic named-tag original metadata: `(tagPrefix + getTagName(tag))`
     /// keyed raw string values, mirroring Java's
     /// `addMetaList(tagPrefix + tagName, value, ...)` /
@@ -13527,6 +13532,19 @@ impl EtsVolume {
         }
     }
 
+    fn plane_fill_byte(&self) -> u8 {
+        if self
+            .background
+            .first()
+            .copied()
+            .is_some_and(|value| value != 0xff)
+        {
+            self.background[0]
+        } else {
+            self.meta.fill_color.unwrap_or(0)
+        }
+    }
+
     fn compressed_support(
         &self,
         plane_index: u32,
@@ -13843,7 +13861,7 @@ impl EtsVolume {
         let out_w = level.size_x as usize;
         let out_h = level.size_y as usize;
         let out_row_len = out_w * pixel;
-        let mut out = vec![0u8; out_row_len * out_h];
+        let mut out = vec![self.plane_fill_byte(); out_row_len * out_h];
 
         let width = self.tile_x as i64;
         let height = self.tile_y as i64;
@@ -13940,7 +13958,7 @@ impl EtsVolume {
         let out_w = w as usize;
         let out_h = h as usize;
         let out_row_len = out_w * pixel;
-        let mut out = vec![0u8; out_row_len * out_h];
+        let mut out = vec![self.plane_fill_byte(); out_row_len * out_h];
 
         if w == 0 || h == 0 {
             return Ok(out);
@@ -14135,6 +14153,30 @@ fn insert_cellsens_acquisition_metadata(
             MetadataValue::Int(x),
         );
     }
+    if let Some(x) = m.calibration_slope {
+        sm.insert(
+            format!("{prefix}.calibration_function_slope"),
+            MetadataValue::Float(x),
+        );
+    }
+    if let Some(x) = m.calibration_origin {
+        sm.insert(
+            format!("{prefix}.calibration_function_origin"),
+            MetadataValue::Float(x),
+        );
+    }
+    if let Some(x) = m.calibration_final {
+        sm.insert(
+            format!("{prefix}.calibration_function_final"),
+            MetadataValue::Float(x),
+        );
+    }
+    if let Some(x) = m.calibration_points {
+        sm.insert(
+            format!("{prefix}.calibration_function_npoints"),
+            MetadataValue::Int(x),
+        );
+    }
     for (idx, x) in m.other_exposure_times.iter().enumerate() {
         sm.insert(
             format!("{prefix}.other_exposure_time.{idx}"),
@@ -14227,6 +14269,7 @@ const VSI_TCHAR: i32 = 13;
 const VSI_DWORD: i32 = 14;
 const VSI_TIMESTAMP: i32 = 17;
 const VSI_DATE: i32 = 18;
+const VSI_DOUBLE_2: i32 = 261;
 const VSI_FIELD_TYPE: i32 = 271;
 const VSI_MEM_MODEL: i32 = 272;
 const VSI_COLOR_SPACE: i32 = 273;
@@ -14287,6 +14330,7 @@ const VSI_Z_VALUE: i32 = 2014;
 const VSI_TIME_VALUE: i32 = 2017;
 const VSI_CHANNEL_NAME: i32 = 2419;
 const VSI_STACK_NAME: i32 = 2030;
+const VSI_DEFAULT_BACKGROUND_COLOR: i32 = 2034;
 const VSI_OPTICAL_PATH: i32 = 2043;
 const VSI_CALIBRATION: i32 = 20051;
 // Volume tags whose getVolumeName(tag) yields the empty (structural) prefix
@@ -14515,7 +14559,7 @@ impl<'a> VsiTagParser<'a> {
                 // Leaf field: read the value for the types we care about.
                 let mut value: Option<String> = None;
                 if !inline_data && data_size > 0 {
-                    value = self.read_leaf_value(real_type, cur, data_size, tag);
+                    value = self.read_leaf_value(real_type, cur, data_size, tag, tag_prefix);
                 }
                 if let Some(v) = &value {
                     self.stored_value = Some(v.clone());
@@ -14678,6 +14722,13 @@ impl<'a> VsiTagParser<'a> {
                     }
                 }
             }
+            VSI_DEFAULT_BACKGROUND_COLOR => {
+                m.fill_color = v
+                    .parse::<i8>()
+                    .ok()
+                    .map(|value| value as u8)
+                    .or_else(|| v.parse::<u8>().ok());
+            }
             VSI_OBJECTIVE_MAG => m.magnification = as_f64(),
             VSI_NUMERICAL_APERTURE => m.numerical_aperture = as_f64(),
             VSI_WORKING_DISTANCE => m.working_distance = as_f64(),
@@ -14713,6 +14764,7 @@ impl<'a> VsiTagParser<'a> {
         off: i64,
         data_size: i32,
         tag: i32,
+        tag_prefix: &str,
     ) -> Option<String> {
         match real_type {
             VSI_CHAR | VSI_UCHAR => Some((self.rd(off, 1).map(|b| b[0]).unwrap_or(0)).to_string()),
@@ -14805,6 +14857,26 @@ impl<'a> VsiTagParser<'a> {
                     if m.origin_x.is_none() {
                         m.origin_x = Some(vals[0]);
                         m.origin_y = Some(vals[1]);
+                    }
+                } else if tag == VSI_VALUE
+                    && tag_prefix == "Calibration Function "
+                    && real_type == VSI_DOUBLE_2
+                    && vals.len() >= 4
+                    && vals.len() % 2 == 0
+                    && self.metadata_index >= 0
+                {
+                    let n_pairs = vals.len() / 2;
+                    let raw_first = vals[0];
+                    let cal_first = vals[1];
+                    let raw_last = vals[2 * (n_pairs - 1)];
+                    let cal_last = vals[2 * (n_pairs - 1) + 1];
+                    let d_raw = raw_last - raw_first;
+                    if d_raw.abs() > f64::EPSILON {
+                        let m = &mut self.pyramids[self.metadata_index as usize].meta;
+                        m.calibration_slope = Some((cal_last - cal_first) / d_raw);
+                        m.calibration_origin = Some(cal_first);
+                        m.calibration_final = Some(cal_last);
+                        m.calibration_points = Some(n_pairs as i64);
                     }
                 }
                 Some(format!("{vals:?}"))
@@ -23497,6 +23569,14 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         v
     }
 
+    fn double_values(vals: &[f64]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for x in vals {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v
+    }
+
     #[test]
     fn vsi_tags_parse_image_boundary_and_tile_origin() {
         // IMAGE_FRAME_VOLUME then EXTERNAL_FILE_PROPERTIES bumps metadata_index to
@@ -23792,6 +23872,54 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         assert_eq!(
             vol.assemble_region(0, 0, 0, 0, 1, 0, 2, 2).unwrap(),
             vec![0, 1, 0, 0]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ets_assemble_plane_prefills_with_cellsens_background_rules() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bioformats_ets_fill_{nanos}.bin"));
+        let tile = vec![1u8, 2, 3, 4];
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&tile).unwrap();
+        drop(f);
+
+        let mut vol = EtsVolume {
+            path: path.clone(),
+            n_dimensions: 2,
+            size_c: 1,
+            compression: ETS_RAW,
+            tile_x: 2,
+            tile_y: 2,
+            pixel_type_code: ETS_PT_UCHAR,
+            use_pyramid: false,
+            background: vec![0xff],
+            tiles: vec![(vec![0, 0], 0, 4)],
+            pyramid_width: Some(3),
+            pyramid_height: Some(3),
+            tile_origin_x: Some(1),
+            tile_origin_y: Some(1),
+            meta: VsiPyramidMeta {
+                fill_color: Some(9),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        vol.compute_levels();
+        assert_eq!(
+            vol.assemble_plane(0, 0, 0, 0).unwrap(),
+            vec![1, 2, 9, 3, 4, 9, 9, 9, 9]
+        );
+
+        vol.background = vec![5];
+        assert_eq!(
+            vol.assemble_plane(0, 0, 0, 0).unwrap(),
+            vec![1, 2, 5, 3, 4, 5, 5, 5, 5]
         );
 
         let _ = std::fs::remove_file(path);
@@ -24283,6 +24411,42 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         assert_eq!(m.numerical_aperture, Some(0.95));
         assert_eq!(m.bit_depth, Some(12));
         assert_eq!(m.exposure_times, vec![25000]);
+    }
+
+    #[test]
+    fn vsi_captures_fill_color_and_calibration_summary() {
+        let fields = vec![
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_IMAGE_FRAME_VOLUME,
+                data: 0i32.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_EXTERNAL_FILE_PROPERTIES,
+                data: 0i32.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_CHAR,
+                tag: VSI_DEFAULT_BACKGROUND_COLOR,
+                data: 7i8.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_DOUBLE_2,
+                tag: VSI_VALUE,
+                data: double_values(&[10.0, 1.5, 20.0, 6.5]),
+            },
+        ];
+        let stream = build_vsi_tag_stream(&fields);
+        let mut parser = VsiTagParser::new(&stream);
+        parser.read_tags(8, true, "Calibration Function ");
+
+        let m = &parser.pyramids[0].meta;
+        assert_eq!(m.fill_color, Some(7));
+        assert_eq!(m.calibration_slope, Some(0.5));
+        assert_eq!(m.calibration_origin, Some(1.5));
+        assert_eq!(m.calibration_final, Some(6.5));
+        assert_eq!(m.calibration_points, Some(2));
     }
 
     #[test]

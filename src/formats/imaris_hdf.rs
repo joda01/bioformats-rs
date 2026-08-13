@@ -60,6 +60,7 @@ pub struct ImarisHdfReader {
     channel_emission_wavelengths: Vec<Option<f64>>,
     channel_excitation_wavelengths: Vec<Option<f64>>,
     instrument: ImarisInstrumentMetadata,
+    path_prefix: String,
     // Cache of the most recently decoded plane so that repeated reads of the
     // same plane do not re-read from disk. Keyed by (resolution, t, c, z).
     // Mirrors the per-Z-block buffer cache in ImarisHDFReader.java. The new
@@ -96,6 +97,7 @@ impl ImarisHdfReader {
             channel_emission_wavelengths: Vec::new(),
             channel_excitation_wavelengths: Vec::new(),
             instrument: ImarisInstrumentMetadata::default(),
+            path_prefix: String::new(),
             cache: None,
         }
     }
@@ -229,6 +231,55 @@ mod tests {
         assert!(matches!(
             meta_map.get("imaris.channel.0.microscopy_mode"),
             Some(MetadataValue::String(v)) if v == "Confocal"
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_reads_dataset_under_java_path_prefix() {
+        let path = tmp_ims_path("path_prefix");
+        let mut writable = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        {
+            let mut root = writable.create_group("Container").unwrap();
+            let mut imaris = root.create_group("ImarisData").unwrap();
+            let mut info = imaris.create_group("DataSetInfo").unwrap();
+            info.create_group("Image").unwrap();
+            let mut channel_info = info.create_group("Channel 0").unwrap();
+            channel_info
+                .add_fixed_ascii_attr("Name", "DAPI", 8)
+                .unwrap();
+
+            let mut data_set = imaris.create_group("DataSet").unwrap();
+            let mut resolution = data_set.create_group("ResolutionLevel 0").unwrap();
+            let mut timepoint = resolution.create_group("TimePoint 0").unwrap();
+            let mut channel = timepoint.create_group("Channel 0").unwrap();
+            channel
+                .new_dataset_builder("Data")
+                .shape(&[1, 1, 1])
+                .write::<u8>(&[42])
+                .unwrap();
+        }
+        writable.flush().unwrap();
+
+        let mut reader = ImarisHdfReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.path_prefix, "Container/ImarisData");
+        assert_eq!(
+            (
+                reader.metadata().size_x,
+                reader.metadata().size_y,
+                reader.metadata().size_z,
+                reader.metadata().size_c,
+                reader.metadata().size_t,
+            ),
+            (1, 1, 1, 1, 1)
+        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+        assert!(matches!(
+            reader.metadata().series_metadata.get("channel_0_name"),
+            Some(MetadataValue::String(value)) if value == "DAPI"
         ));
 
         let _ = std::fs::remove_file(path);
@@ -507,7 +558,7 @@ mod tests {
 
         let file = hdf5_pure_rust::File::open(&path).unwrap();
         let mut metadata = HashMap::new();
-        collect_imaris_surpass_metadata(&file, &mut metadata);
+        collect_imaris_surpass_metadata(&file, "", &mut metadata);
 
         assert!(matches!(
             metadata.get("imaris.surpass.Scene.hdf5_path"),
@@ -605,6 +656,7 @@ struct ImsParse {
     channel_emission_wavelengths: Vec<Option<f64>>,
     channel_excitation_wavelengths: Vec<Option<f64>>,
     instrument: ImarisInstrumentMetadata,
+    path_prefix: String,
 }
 
 #[derive(Clone, Default)]
@@ -633,10 +685,11 @@ struct ImarisInstrumentMetadata {
 fn parse_ims(path: &Path) -> Result<ImsParse> {
     let file = hdf5_pure_rust::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
+    let path_prefix = ims_discover_path_prefix(&file);
 
     // ── Read dimensions from DataSetInfo/Image ──────────────────────────────
     let img_group = file
-        .group("DataSetInfo/Image")
+        .group(&ims_path(&path_prefix, "DataSetInfo/Image"))
         .map_err(|e| BioFormatsError::Format(format!("DataSetInfo/Image missing: {e}")))?;
 
     // Spatial extents (ExtMin0..2 / ExtMax0..2) for deriving physical sizes.
@@ -665,12 +718,12 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     // writers store 1/1/1 (observed in real .ims files). The authoritative pixel
     // dimensions are the full-resolution Data dataset shape [z, y, x], so derive
     // X/Y/Z from it instead of the attributes.
-    let (size_z, size_y, size_x) = ims_level_dims(&file, 0)?;
+    let (size_z, size_y, size_x) = ims_level_dims(&file, &path_prefix, 0)?;
 
     // ── Count channels ──────────────────────────────────────────────────────
     // Count groups named "Channel N" or "Channel_N" under DataSetInfo.
     let ds_info = file
-        .group("DataSetInfo")
+        .group(&ims_path(&path_prefix, "DataSetInfo"))
         .map_err(|e| BioFormatsError::Format(format!("DataSetInfo missing: {e}")))?;
     let mut size_c: u32 = 0;
     if let Ok(members) = hdf5_group_members(&ds_info) {
@@ -678,7 +731,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
             .max(count_imaris_indexed_members(&members, "Channel_")?);
     }
     if size_c == 0 {
-        let tp0_path = ims_timepoint_group_path(&file, 0, 0).ok_or_else(|| {
+        let tp0_path = ims_timepoint_group_path(&file, &path_prefix, 0, 0).ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(
                 "Imaris: no channel metadata and TimePoint 0 missing".into(),
             )
@@ -704,7 +757,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     }
 
     // ── Count timepoints from DataSet/ResolutionLevel 0 ────────────────────
-    let size_t: u32 = if let Some(rl0_path) = ims_resolution_group_path(&file, 0) {
+    let size_t: u32 = if let Some(rl0_path) = ims_resolution_group_path(&file, &path_prefix, 0) {
         let rl0 = file
             .group(&rl0_path)
             .map_err(|e| BioFormatsError::Format(format!("Imaris: cannot open {rl0_path}: {e}")))?;
@@ -724,7 +777,8 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     }
 
     // ── Count resolution levels ─────────────────────────────────────────────
-    let n_resolutions: usize = if let Ok(ds_group) = file.group("DataSet") {
+    let n_resolutions: usize = if let Ok(ds_group) = file.group(&ims_path(&path_prefix, "DataSet"))
+    {
         if let Ok(members) = hdf5_group_members(&ds_group) {
             count_imaris_indexed_members(&members, "ResolutionLevel ")?
                 .max(count_imaris_indexed_members(&members, "ResolutionLevel_")?)
@@ -742,7 +796,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     }
 
     // ── Determine pixel type from first Data dataset ────────────────────────
-    let (data_path, ds) = ims_data_dataset(&file, 0, 0, 0).ok_or_else(|| {
+    let (data_path, ds) = ims_data_dataset(&file, &path_prefix, 0, 0, 0).ok_or_else(|| {
         BioFormatsError::UnsupportedFormat(
             "Imaris: missing DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data or \
              DataSet/ResolutionLevel_0/TimePoint_0/Channel_0/Data"
@@ -776,17 +830,32 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     // ── Collect channel metadata ────────────────────────────────────────────
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     meta_map.insert("format".into(), MetadataValue::String("Imaris IMS".into()));
-    copy_group_attrs(&file, "DataSetInfo/Image", "imaris.image", &mut meta_map);
-    copy_group_attrs(&file, "DataSetInfo/Imaris", "imaris.info", &mut meta_map);
-    copy_group_attrs(&file, "DataSetInfo/Log", "imaris.log", &mut meta_map);
     copy_group_attrs(
         &file,
-        "DataSetInfo/TimeInfo",
+        &ims_path(&path_prefix, "DataSetInfo/Image"),
+        "imaris.image",
+        &mut meta_map,
+    );
+    copy_group_attrs(
+        &file,
+        &ims_path(&path_prefix, "DataSetInfo/Imaris"),
+        "imaris.info",
+        &mut meta_map,
+    );
+    copy_group_attrs(
+        &file,
+        &ims_path(&path_prefix, "DataSetInfo/Log"),
+        "imaris.log",
+        &mut meta_map,
+    );
+    copy_group_attrs(
+        &file,
+        &ims_path(&path_prefix, "DataSetInfo/TimeInfo"),
         "imaris.time_info",
         &mut meta_map,
     );
-    collect_imaris_surpass_metadata(&file, &mut meta_map);
-    let instrument = collect_imaris_instrument_metadata(&file, &mut meta_map);
+    collect_imaris_surpass_metadata(&file, &path_prefix, &mut meta_map);
+    let instrument = collect_imaris_instrument_metadata(&file, &path_prefix, &mut meta_map);
     insert_optional_float(
         &mut meta_map,
         "imaris.recording_spacing_x",
@@ -809,7 +878,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     let mut channel_emission_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
     let mut channel_excitation_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
     for c in 0..size_c {
-        if let Some(ch_path) = ims_dataset_info_channel_path(&file, c) {
+        if let Some(ch_path) = ims_dataset_info_channel_path(&file, &path_prefix, c) {
             let Ok(ch_group) = file.group(&ch_path) else {
                 continue;
             };
@@ -972,11 +1041,12 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         let mut lvl = base_meta.clone();
         // Derive this level's dimensions from its own Data dataset shape rather
         // than the ImageSize* attributes (same rationale as level 0).
-        let (lz, ly, lx) = ims_level_dims(&file, level)?;
+        let (lz, ly, lx) = ims_level_dims(&file, &path_prefix, level)?;
         lvl.size_z = lz;
         lvl.size_y = ly;
         lvl.size_x = lx;
-        let (level_data_path, level_ds) = ims_data_dataset(&file, level, 0, 0).ok_or_else(|| {
+        let (level_data_path, level_ds) =
+            ims_data_dataset(&file, &path_prefix, level, 0, 0).ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(format!(
                 "Imaris: missing DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_{level}/TimePoint_0/Channel_0/Data"
             ))
@@ -1010,6 +1080,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         channel_emission_wavelengths,
         channel_excitation_wavelengths,
         instrument,
+        path_prefix,
     })
 }
 
@@ -1345,6 +1416,7 @@ fn attr_to_metadata_value(attr: &hdf5_pure_rust::Attribute) -> Option<MetadataVa
 
 fn collect_imaris_surpass_metadata(
     file: &hdf5_pure_rust::File,
+    path_prefix: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
 ) {
     let roots = [
@@ -1358,12 +1430,13 @@ fn collect_imaris_surpass_metadata(
     let mut found = Vec::new();
     let mut visited = 0usize;
     for root in roots {
-        if file.group(root).is_err() {
+        let path = ims_path(path_prefix, root);
+        if file.group(&path).is_err() {
             continue;
         }
         found.push(root.to_string());
         let key_root = format!("imaris.surpass.{}", imaris_metadata_path_key(root));
-        collect_imaris_hdf5_metadata_tree(file, root, &key_root, meta_map, &mut visited);
+        collect_imaris_hdf5_metadata_tree(file, &path, &key_root, meta_map, &mut visited);
         if visited >= IMARIS_SURPASS_METADATA_NODE_LIMIT {
             break;
         }
@@ -2331,11 +2404,13 @@ fn imaris_nonnegative_plane_index(value: f64) -> Option<u32> {
 
 fn collect_imaris_instrument_metadata(
     file: &hdf5_pure_rust::File,
+    path_prefix: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
 ) -> ImarisInstrumentMetadata {
-    let microscope = first_existing_group(file, &["DataSetInfo/Microscope"]);
+    let microscope = first_existing_group(file, path_prefix, &["DataSetInfo/Microscope"]);
     let objective = first_existing_group(
         file,
+        path_prefix,
         &[
             "DataSetInfo/Objective",
             "DataSetInfo/Objective 0",
@@ -2345,6 +2420,7 @@ fn collect_imaris_instrument_metadata(
     );
     let detector = first_existing_group(
         file,
+        path_prefix,
         &[
             "DataSetInfo/Detector",
             "DataSetInfo/Detector 0",
@@ -2353,6 +2429,7 @@ fn collect_imaris_instrument_metadata(
     );
     let light_source = first_existing_group(
         file,
+        path_prefix,
         &[
             "DataSetInfo/LightSource",
             "DataSetInfo/LightSource 0",
@@ -2455,12 +2532,12 @@ fn collect_imaris_instrument_metadata(
 
 fn first_existing_group(
     file: &hdf5_pure_rust::File,
+    path_prefix: &str,
     paths: &[&str],
 ) -> Option<(String, hdf5_pure_rust::Group)> {
     paths.iter().find_map(|path| {
-        file.group(path)
-            .ok()
-            .map(|group| ((*path).to_string(), group))
+        let full_path = ims_path(path_prefix, path);
+        file.group(&full_path).ok().map(|group| (full_path, group))
     })
 }
 
@@ -2620,11 +2697,64 @@ fn imaris_indexed_member_number(name: &str, prefix: &str) -> Option<u32> {
     name.strip_prefix(&escaped_prefix)?.parse::<u32>().ok()
 }
 
-fn ims_resolution_group_path(file: &hdf5_pure_rust::File, level: usize) -> Option<String> {
+fn ims_path(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        path.to_string()
+    } else {
+        format!("{prefix}/{path}")
+    }
+}
+
+fn ims_discover_path_prefix(file: &hdf5_pure_rust::File) -> String {
+    if file.group("DataSet").is_ok() && file.group("DataSetInfo").is_ok() {
+        return String::new();
+    }
+    ims_find_prefixed_root(file, "", 0).unwrap_or_default()
+}
+
+fn ims_find_prefixed_root(
+    file: &hdf5_pure_rust::File,
+    parent: &str,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let members = if parent.is_empty() {
+        file.member_names().ok()?
+    } else {
+        file.group(parent).ok()?.member_names().ok()?
+    };
+    for member in members {
+        let path = if parent.is_empty() {
+            member
+        } else {
+            format!("{parent}/{member}")
+        };
+        if file.group(&path).is_err() {
+            continue;
+        }
+        if file.group(&ims_path(&path, "DataSet")).is_ok()
+            && file.group(&ims_path(&path, "DataSetInfo")).is_ok()
+        {
+            return Some(path);
+        }
+        if let Some(found) = ims_find_prefixed_root(file, &path, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn ims_resolution_group_path(
+    file: &hdf5_pure_rust::File,
+    path_prefix: &str,
+    level: usize,
+) -> Option<String> {
     [
-        format!("DataSet/ResolutionLevel {level}"),
-        format!("DataSet/ResolutionLevel\\ {level}"),
-        format!("DataSet/ResolutionLevel_{level}"),
+        ims_path(path_prefix, &format!("DataSet/ResolutionLevel {level}")),
+        ims_path(path_prefix, &format!("DataSet/ResolutionLevel\\ {level}")),
+        ims_path(path_prefix, &format!("DataSet/ResolutionLevel_{level}")),
     ]
     .into_iter()
     .find(|path| file.group(path).is_ok())
@@ -2632,10 +2762,11 @@ fn ims_resolution_group_path(file: &hdf5_pure_rust::File, level: usize) -> Optio
 
 fn ims_timepoint_group_path(
     file: &hdf5_pure_rust::File,
+    path_prefix: &str,
     level: usize,
     timepoint: usize,
 ) -> Option<String> {
-    let resolution = ims_resolution_group_path(file, level)?;
+    let resolution = ims_resolution_group_path(file, path_prefix, level)?;
     [
         format!("{resolution}/TimePoint {timepoint}"),
         format!("{resolution}/TimePoint\\ {timepoint}"),
@@ -2647,11 +2778,13 @@ fn ims_timepoint_group_path(
 
 fn ims_data_dataset(
     file: &hdf5_pure_rust::File,
+    path_prefix: &str,
     level: usize,
     timepoint: usize,
     channel: usize,
 ) -> Option<(String, hdf5_pure_rust::Dataset)> {
-    let data_set = file.group("DataSet").ok()?;
+    let data_set_path = ims_path(path_prefix, "DataSet");
+    let data_set = file.group(&data_set_path).ok()?;
     let (resolution_name, resolution) = imaris_child_group(
         &data_set,
         &[
@@ -2671,15 +2804,20 @@ fn ims_data_dataset(
         &[format!("Channel {channel}"), format!("Channel_{channel}")],
     )?;
     let (data_name, ds) = imaris_child_dataset(&channel_group, &["Data"])?;
-    let path = format!("DataSet/{resolution_name}/{timepoint_name}/{channel_name}/{data_name}");
+    let path =
+        format!("{data_set_path}/{resolution_name}/{timepoint_name}/{channel_name}/{data_name}");
     Some((path, ds))
 }
 
-fn ims_dataset_info_channel_path(file: &hdf5_pure_rust::File, channel: u32) -> Option<String> {
+fn ims_dataset_info_channel_path(
+    file: &hdf5_pure_rust::File,
+    path_prefix: &str,
+    channel: u32,
+) -> Option<String> {
     [
-        format!("DataSetInfo/Channel {channel}"),
-        format!("DataSetInfo/Channel\\ {channel}"),
-        format!("DataSetInfo/Channel_{channel}"),
+        ims_path(path_prefix, &format!("DataSetInfo/Channel {channel}")),
+        ims_path(path_prefix, &format!("DataSetInfo/Channel\\ {channel}")),
+        ims_path(path_prefix, &format!("DataSetInfo/Channel_{channel}")),
     ]
     .into_iter()
     .find(|path| file.group(path).is_ok())
@@ -2723,8 +2861,12 @@ fn imaris_hdf_basename(path: &str) -> &str {
 /// Read the (z, y, x) pixel dimensions of a resolution level from its
 /// full-resolution Channel-0 `Data` dataset shape (the authoritative source,
 /// vs. the unreliable DataSetInfo X/Y/Z and per-level ImageSize* attributes).
-fn ims_level_dims(file: &hdf5_pure_rust::File, level: usize) -> Result<(u32, u32, u32)> {
-    let (path, ds) = ims_data_dataset(file, level, 0, 0).ok_or_else(|| {
+fn ims_level_dims(
+    file: &hdf5_pure_rust::File,
+    path_prefix: &str,
+    level: usize,
+) -> Result<(u32, u32, u32)> {
+    let (path, ds) = ims_data_dataset(file, path_prefix, level, 0, 0).ok_or_else(|| {
         BioFormatsError::UnsupportedFormat(format!(
             "Imaris: missing DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_{level}/TimePoint_0/Channel_0/Data"
         ))
@@ -2843,6 +2985,7 @@ impl FormatReader for ImarisHdfReader {
         self.channel_emission_wavelengths = parsed.channel_emission_wavelengths;
         self.channel_excitation_wavelengths = parsed.channel_excitation_wavelengths;
         self.instrument = parsed.instrument;
+        self.path_prefix = parsed.path_prefix;
         Ok(())
     }
 
@@ -2862,6 +3005,7 @@ impl FormatReader for ImarisHdfReader {
         self.channel_emission_wavelengths.clear();
         self.channel_excitation_wavelengths.clear();
         self.instrument = ImarisInstrumentMetadata::default();
+        self.path_prefix.clear();
         self.cache = None;
         Ok(())
     }
@@ -2983,7 +3127,8 @@ impl FormatReader for ImarisHdfReader {
         };
         if need_load {
             let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-            let (_data_path, ds) = ims_data_dataset(&file, res, t, c).ok_or_else(|| {
+            let (_data_path, ds) =
+                ims_data_dataset(&file, &self.path_prefix, res, t, c).ok_or_else(|| {
                 BioFormatsError::UnsupportedFormat(format!(
                     "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
                 ))
@@ -3058,7 +3203,8 @@ impl FormatReader for ImarisHdfReader {
             .ok_or_else(|| BioFormatsError::Format("Imaris region byte count overflows".into()))?;
 
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let (_data_path, ds) = ims_data_dataset(&file, res, t, c).ok_or_else(|| {
+        let (_data_path, ds) =
+            ims_data_dataset(&file, &self.path_prefix, res, t, c).ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(format!(
                 "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
             ))
