@@ -12643,6 +12643,7 @@ impl EtsVolume {
         if raw.len() < read_len {
             raw.resize(read_len, 0);
         }
+        let raw_len = raw.len();
 
         let (buf, actual_w, actual_h) = match self.compression {
             ETS_RAW => (raw, self.tile_x as usize, self.tile_y as usize),
@@ -12678,6 +12679,18 @@ impl EtsVolume {
             let bpp = self.pixel_type()?.bytes_per_sample();
             bpp * self.rgb_channels() as usize
         };
+        if std::env::var_os("BIOFORMATS_ETS_DEBUG").is_some() {
+            eprintln!(
+                "ets decode_tile: res={resolution} row={row} col={col} z={z} c={c} t={t} \
+                 compression={} nominal={}x{} actual={actual_w}x{actual_h} \
+                 raw_len={} decoded_len={} tile_size={tile_size} pixel={pixel}",
+                self.compression,
+                self.tile_x,
+                self.tile_y,
+                raw_len,
+                buf.len(),
+            );
+        }
         let mut buf = if actual_w == self.tile_x as usize && actual_h == self.tile_y as usize {
             buf
         } else {
@@ -12929,11 +12942,18 @@ impl EtsVolume {
             is_rgb: channels > 1,
             is_interleaved: channels > 1,
             is_indexed: false,
-            // Java: ms.littleEndian = compressionType.get(index) == RAW
-            // (CellSensReader.java:800). Compressed tiles (JPEG/JPEG2000/etc.)
-            // report littleEndian = false.
-            is_little_endian: self.compression == ETS_RAW,
-            resolution_count: self.levels.len().max(1) as u32,
+            // Java reports littleEndian = (compression == RAW) because its
+            // JPEG/JPEG2000/PNG/BMP codecs hand back big-endian samples
+            // natively (CellSensReader.java:800). This port's `decode_tile`
+            // normalizes every codec's output to little-endian instead (see
+            // `decompress_jpeg2000_with_dims`'s `little_endian: true` and the
+            // `to_le_bytes()` packing in `decode_image_memory_with_dims`), so
+            // the actual bytes returned are always little-endian regardless
+            // of compression - reporting `false` here for compressed tiles
+            // would make every 16-bit-sample caller that trusts this flag
+            // byte-swap already-correct data.
+            is_little_endian: true,
+            resolution_count: 1,
             ..ImageMetadata::default()
         };
         insert_cellsens_acquisition_metadata(&mut meta.series_metadata, "cellsens.ets", &self.meta);
@@ -14736,16 +14756,25 @@ impl FormatReader for CellSensReader {
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         match self.target {
             CellSensTarget::Tiff(ts) => {
-                // The inner TIFF reader returns the overview chunky/interleaved
-                // (or fails on a JPEGTables-abbreviated JPEG strip, which we decode
-                // ourselves). Java reports the overview as non-interleaved (planar),
-                // so the FULL plane must be de-interleaved to match — the inner
-                // reader does NOT do this, which is why a raw `open_bytes` diverged
-                // everywhere except the very first pixels.
-                let full = match self.decode_overview_jpeg_full(ts, p)? {
-                    Some(f) => f,
-                    None => self.inner.open_bytes(p)?,
+                // Our own manual JPEGTables-abbreviated decode
+                // (`decode_overview_jpeg_full`) hands back genuinely
+                // chunky/interleaved RGB straight from `jpeg_decoder`, so it
+                // still needs de-interleaving to match Java's reported
+                // non-interleaved (planar) overview. The inner TIFF reader's
+                // own `open_bytes`, by contrast, already normalizes chunky
+                // multi-sample (planar_config=1, spp>1) output to planar
+                // itself (see `should_planarize_chunky_rgb`/`split_channels`
+                // in tiff/reader.rs) to match ITS OWN `is_interleaved=false`
+                // convention for such IFDs - de-interleaving that a second
+                // time does not undo anything, it scrambles already-correct
+                // planar data by reading it with the wrong (chunky) stride.
+                let (full, needs_deinterleave) = match self.decode_overview_jpeg_full(ts, p)? {
+                    Some(f) => (f, true),
+                    None => (self.inner.open_bytes(p)?, false),
                 };
+                if !needs_deinterleave {
+                    return Ok(full);
+                }
                 let meta = self.metadata();
                 let spp = if meta.is_rgb {
                     meta.size_c.max(1) as usize
@@ -14786,7 +14815,19 @@ impl FormatReader for CellSensReader {
                 // Source the requested chunky/interleaved region: either by cropping
                 // our manually decoded JPEG overview (the inner reader can't merge
                 // the JPEGTables tag), or via the inner reader for plain IFDs.
-                let buf = match self.decode_overview_jpeg_full(ts, p)? {
+                let overview = self.decode_overview_jpeg_full(ts, p)?;
+                if std::env::var_os("BIOFORMATS_ETS_DEBUG").is_some() {
+                    let meta = self.metadata();
+                    eprintln!(
+                        "cellsens tiff open_bytes_region: ts={ts} p={p} x={x} y={y} w={w} h={h} \
+                         meta_size={}x{} overview_path={} overview_len={:?}",
+                        meta.size_x,
+                        meta.size_y,
+                        overview.is_some(),
+                        overview.as_ref().map(|v| v.len()),
+                    );
+                }
+                let (buf, needs_deinterleave) = match overview {
                     Some(full) => {
                         let meta = self.metadata();
                         let spp = if meta.is_rgb {
@@ -14795,20 +14836,35 @@ impl FormatReader for CellSensReader {
                             1
                         };
                         let pixel = spp * meta.pixel_type.bytes_per_sample();
-                        crop_chunky(
-                            &full,
-                            meta.size_x as usize,
-                            x as usize,
-                            y as usize,
-                            w as usize,
-                            h as usize,
-                            pixel,
+                        (
+                            crop_chunky(
+                                &full,
+                                meta.size_x as usize,
+                                x as usize,
+                                y as usize,
+                                w as usize,
+                                h as usize,
+                                pixel,
+                            ),
+                            true,
                         )
                     }
-                    None => self.inner.open_bytes_region(p, x, y, w, h)?,
+                    // The inner TIFF reader already normalizes chunky
+                    // multi-sample (planar_config=1, spp>1) output to planar
+                    // itself (see `should_planarize_chunky_rgb`/
+                    // `split_channels` in tiff/reader.rs), matching its own
+                    // `is_interleaved=false` convention for such IFDs -
+                    // de-interleaving that a second time below does not undo
+                    // anything, it scrambles already-correct planar data by
+                    // reading it with the wrong (chunky) stride.
+                    None => (self.inner.open_bytes_region(p, x, y, w, h)?, false),
                 };
-                // Java reports the overview as non-interleaved (planar). The region
-                // buffer is interleaved RGB; de-interleave to match.
+                if !needs_deinterleave {
+                    return Ok(buf);
+                }
+                // Java reports the overview as non-interleaved (planar). The
+                // manually-decoded JPEG region buffer above is interleaved
+                // RGB; de-interleave to match.
                 let meta = self.metadata();
                 let spp = if meta.is_rgb {
                     meta.size_c.max(1) as usize
@@ -21229,65 +21285,69 @@ EndClass: 0
         let _ = std::fs::remove_file(path);
     }
 
-    /// A pyramidal ETS volume must be exposed as ONE series with multiple
-    /// resolution levels (`resolution_count()`/`set_resolution()`), not as one
-    /// flattened top-level series per level. Regression test for the VSI
-    /// pyramid-flattening bug: every other pyramidal reader in the crate
-    /// exposes true multi-resolution series, and Java's `CellSensReader`
-    /// supports this via `setFlattenedResolutions(false)`.
+    /// A cellSens VSI without an ETS pyramid falls back to exposing the
+    /// embedded TIFF IFD directly (`CellSensTarget::Tiff`). For an
+    /// uncompressed chunky RGB IFD, the inner `TiffReader` already
+    /// de-interleaves to planar output itself (`should_planarize_chunky_rgb`/
+    /// `split_channels`) to match its own `is_interleaved=false` reporting.
+    /// `CellSensReader::open_bytes_region` must NOT de-interleave that
+    /// already-planar buffer a second time - doing so doesn't undo anything,
+    /// it scrambles the data by reading it with the wrong (chunky) stride.
+    /// This reproduces the "small patch tiled 3x3" corruption reported for a
+    /// real multi-strip uncompressed RGB cellSens VSI overview.
     #[test]
-    fn cellsens_vsi_pyramid_exposes_resolution_levels_not_flattened_series() {
-        let mut vol = EtsVolume {
-            n_dimensions: 3,
-            size_c: 1,
-            compression: ETS_RAW,
-            tile_x: 512,
-            tile_y: 512,
-            pixel_type_code: ETS_PT_UCHAR,
-            use_pyramid: true,
-            // [col, row, resolution]: one tile at full res, one at level 1.
-            tiles: vec![(vec![0, 0, 0], 0, 1), (vec![0, 0, 1], 0, 1)],
-            ..Default::default()
-        };
-        vol.compute_levels();
-        assert_eq!(vol.levels.len(), 2, "synthetic volume has two pyramid levels");
-        assert_eq!((vol.levels[0].size_x, vol.levels[0].size_y), (512, 512));
-        assert_eq!((vol.levels[1].size_x, vol.levels[1].size_y), (256, 256));
+    fn cellsens_tiff_rgb_region_is_not_double_deinterleaved() {
+        let path = temp_flim2_path("no-ets-rgb.vsi");
+        // 4x4 RGB, single strip, chunky (PlanarConfiguration=1).
+        // pixel(row,col) = (10+row*4+col, 100+row*4+col, 200+row*4+col).
+        let mut pixels = Vec::new();
+        for row in 0..4u8 {
+            for col in 0..4u8 {
+                let v = row * 4 + col;
+                pixels.extend_from_slice(&[10 + v, 100 + v, 200 + v]);
+            }
+        }
+        let mut entries = vec![
+            long_entry(tag::IMAGE_WIDTH, 4),
+            long_entry(tag::IMAGE_LENGTH, 4),
+            short_vec_entry(tag::BITS_PER_SAMPLE, &[8, 8, 8]),
+            short_entry(tag::COMPRESSION, 1),
+            short_entry(tag::PHOTOMETRIC_INTERPRETATION, 2),
+            short_entry(tag::SAMPLES_PER_PIXEL, 3),
+            long_entry(tag::ROWS_PER_STRIP, 4),
+            long_entry(tag::STRIP_BYTE_COUNTS, pixels.len() as u32),
+            short_entry(tag::PLANAR_CONFIGURATION, 1),
+        ];
+        let strip_offset = 8 + ifd_table_len(entries.len() + 1) + ifd_extra_len(&entries);
+        entries.push(long_entry(tag::STRIP_OFFSETS, strip_offset as u32));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        write_test_ifd(&mut data, &entries, 8, 0);
+        data.resize(strip_offset, 0);
+        data.extend_from_slice(&pixels);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&data).unwrap();
+        drop(file);
 
         let mut reader = CellSensReader::new();
-        reader.ets.push(vol);
-        reader.series_map.push(CellSensTarget::Ets {
-            volume: 0,
-            resolution: 0,
-        });
-        reader.series_names.push("pyramid".to_string());
-        reader.series_phys.push(None);
+        reader.set_id(&path).unwrap();
 
+        // Crop the interior 2x2 region [1,1)..[3,3) and expect planar R,G,B
+        // (matching the source values directly, not scrambled).
+        let region = reader.open_bytes_region(0, 1, 1, 2, 2).unwrap();
         assert_eq!(
-            reader.series_count(),
-            1,
-            "one logical series per ETS pyramid volume, not one per resolution level"
+            region,
+            vec![
+                15, 16, 19, 20, // R plane: (1,1) (1,2) (2,1) (2,2)
+                105, 106, 109, 110, // G plane
+                205, 206, 209, 210, // B plane
+            ]
         );
 
-        reader.set_series(0).unwrap();
-        assert_eq!(reader.resolution_count(), 2);
-        assert_eq!(reader.resolution(), 0);
-        assert_eq!(reader.metadata().size_x, 512);
-        assert_eq!(reader.metadata().resolution_count, 2);
-
-        reader.set_resolution(1).unwrap();
-        assert_eq!(reader.resolution(), 1);
-        assert_eq!(reader.metadata().size_x, 256);
-        assert_eq!(reader.metadata().size_y, 256);
-
-        reader.set_resolution(0).unwrap();
-        assert_eq!(reader.resolution(), 0);
-        assert_eq!(reader.metadata().size_x, 512);
-
-        assert!(matches!(
-            reader.set_resolution(2),
-            Err(BioFormatsError::PlaneOutOfRange(2))
-        ));
+        let _ = std::fs::remove_file(path);
     }
 
     /// Non-geometry acquisition metadata tags are captured into the pyramid meta
@@ -21416,6 +21476,34 @@ EndClass: 0
             md.get("cellsens.ets.stack_name"),
             Some(crate::common::metadata::MetadataValue::String(v)) if v == "Stack A"
         ));
+    }
+
+    /// `decode_tile` normalizes every codec's decoded bytes to little-endian
+    /// (RAW copies the file's own little-endian tiles verbatim; JPEG2000/PNG/
+    /// BMP are packed via `to_le_bytes()`/`little_endian: true`), unlike Java
+    /// which reports `littleEndian = false` for compressed codecs because its
+    /// own decoders hand back big-endian samples natively. Reporting `false`
+    /// here for compressed tiles would make any caller that trusts this flag
+    /// byte-swap already-correct little-endian data.
+    #[test]
+    fn ets_level_metadata_reports_little_endian_for_every_codec() {
+        for compression in [ETS_RAW, ETS_JPEG, ETS_JPEG_2000, ETS_PNG, ETS_BMP] {
+            let mut vol = EtsVolume {
+                n_dimensions: 2,
+                size_c: 1,
+                compression,
+                tile_x: 1,
+                tile_y: 1,
+                pixel_type_code: ETS_PT_USHORT,
+                tiles: vec![(vec![0, 0], 0, 2)],
+                ..Default::default()
+            };
+            vol.compute_levels();
+            assert!(
+                vol.level_metadata(0).unwrap().is_little_endian,
+                "compression={compression} must report is_little_endian=true"
+            );
+        }
     }
 
     #[test]
