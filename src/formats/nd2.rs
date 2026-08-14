@@ -248,18 +248,18 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
     }
 
     f.seek(SeekFrom::Start(entries_offset))?;
-    let mut chunks = Vec::new();
-    let mut image_count = 0usize;
-    let mut max_image_index: Option<usize> = None;
+    let mut raw_entries = Vec::new();
+    let mut pos = entries_offset;
 
-    while f.stream_position()? + 1 + 16 <= entries_end {
+    while pos + 1 + 16 <= entries_end {
         let mut name_bytes = Vec::new();
         loop {
-            if f.stream_position()? >= entries_end {
+            if pos >= entries_end {
                 return Ok(None);
             }
             let mut b = [0u8; 1];
             f.read_exact(&mut b)?;
+            pos += 1;
             if b[0] == b'!' {
                 break;
             }
@@ -274,53 +274,37 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
         let mut length_bytes = [0u8; 8];
         f.read_exact(&mut position_bytes)?;
         f.read_exact(&mut length_bytes)?;
+        pos += 16;
         let position = u64::from_le_bytes(position_bytes);
         let length = u64::from_le_bytes(length_bytes);
-        let map_entry_offset = f.stream_position()?;
         if position + length > file_len || position + 16 > file_len {
             return Ok(None);
         }
+        raw_entries.push((name, position));
+    }
 
+    let mut chunks = Vec::with_capacity(raw_entries.len());
+    let mut image_count = 0usize;
+    let mut max_image_index: Option<usize> = None;
+
+    for (name, position) in raw_entries {
         let image_index = image_data_index(&name);
-        let (data_offset, data_length) = if image_index.is_some() {
-            f.seek(SeekFrom::Start(position))?;
-            let mut chunk_magic = [0u8; 4];
-            f.read_exact(&mut chunk_magic)?;
-            if chunk_magic != ND2_MAGIC {
-                return Ok(None);
-            }
-            let mut actual_name_len_bytes = [0u8; 4];
-            let mut actual_data_len_bytes = [0u8; 8];
-            f.read_exact(&mut actual_name_len_bytes)?;
-            f.read_exact(&mut actual_data_len_bytes)?;
-            let actual_name_len = u32::from_le_bytes(actual_name_len_bytes) as u64;
-            let actual_data_len = u64::from_le_bytes(actual_data_len_bytes);
-            let data_offset = position + 16 + actual_name_len;
-            if data_offset > file_len || data_offset + actual_data_len > file_len {
-                return Ok(None);
-            }
-            f.seek(SeekFrom::Start(map_entry_offset))?;
-            (data_offset, actual_data_len)
-        } else {
-            f.seek(SeekFrom::Start(position))?;
-            let mut chunk_magic = [0u8; 4];
-            f.read_exact(&mut chunk_magic)?;
-            if chunk_magic != ND2_MAGIC {
-                return Ok(None);
-            }
-            let mut actual_name_len_bytes = [0u8; 4];
-            let mut actual_data_len_bytes = [0u8; 8];
-            f.read_exact(&mut actual_name_len_bytes)?;
-            f.read_exact(&mut actual_data_len_bytes)?;
-            let actual_name_len = u32::from_le_bytes(actual_name_len_bytes) as u64;
-            let actual_data_len = u64::from_le_bytes(actual_data_len_bytes);
-            let data_offset = position + 16 + actual_name_len;
-            if data_offset > file_len || data_offset + actual_data_len > file_len {
-                return Ok(None);
-            }
-            f.seek(SeekFrom::Start(map_entry_offset))?;
-            (data_offset, actual_data_len)
-        };
+        f.seek(SeekFrom::Start(position))?;
+        let mut chunk_magic = [0u8; 4];
+        f.read_exact(&mut chunk_magic)?;
+        if chunk_magic != ND2_MAGIC {
+            return Ok(None);
+        }
+        let mut actual_name_len_bytes = [0u8; 4];
+        let mut actual_data_len_bytes = [0u8; 8];
+        f.read_exact(&mut actual_name_len_bytes)?;
+        f.read_exact(&mut actual_data_len_bytes)?;
+        let actual_name_len = u32::from_le_bytes(actual_name_len_bytes) as u64;
+        let actual_data_len = u64::from_le_bytes(actual_data_len_bytes);
+        let data_offset = position + 16 + actual_name_len;
+        if data_offset > file_len || data_offset + actual_data_len > file_len {
+            return Ok(None);
+        }
 
         if let Some(index) = image_index {
             image_count += 1;
@@ -330,7 +314,7 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
             name: format!("{name}!"),
             block_offset: position,
             data_offset,
-            data_length,
+            data_length: actual_data_len,
         });
     }
 
@@ -6088,17 +6072,20 @@ impl FormatReader for Nd2Reader {
             }
             validate_region("ND2", meta.size_x, meta.size_y, x, y, w, h)?;
 
-            if self.old_jp2_planes.is_empty()
-                && !self.is_lossless
-                && !self.split_channels
-                && meta.size_c == 1
-            {
+            let split = self.split_channels && meta.size_c > 1;
+            let supports_raw_window = (!self.split_channels && meta.size_c == 1) || split;
+            if self.old_jp2_planes.is_empty() && !self.is_lossless && supports_raw_window {
                 let series_chunks = self
                     .series_image_chunks
                     .get(self.current_series)
                     .unwrap_or(&self.image_chunks);
+                let stored_plane_index = if split {
+                    plane_index / meta.size_c
+                } else {
+                    plane_index
+                };
                 let chunk_idx = series_chunks
-                    .get(plane_index as usize)
+                    .get(stored_plane_index as usize)
                     .copied()
                     .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
                 let chunk = &self.chunks[chunk_idx];
@@ -6106,8 +6093,27 @@ impl FormatReader for Nd2Reader {
                 let chunk_data_length = chunk.data_length;
 
                 let bps = meta.pixel_type.bytes_per_sample();
-                let raw_scanline_pad = ((bps * meta.size_x as usize) % 4) / bps;
-                let stored_row = (meta.size_x as usize + raw_scanline_pad) * bps;
+                let size_x = meta.size_x as usize;
+                let size_c = meta.size_c.max(1) as usize;
+                let scanline_pad = if meta.size_x % 2 != 0 && meta.size_c % 2 != 0 {
+                    1usize
+                } else {
+                    0usize
+                };
+                let split_java_buffer_branch =
+                    split && (meta.size_c <= 4 || scanline_pad == 0) && self.n_x_fields == 1;
+                let stored_row = if split {
+                    if split_java_buffer_branch {
+                        (size_x + scanline_pad) * size_c * bps
+                    } else {
+                        let row_length = size_x * size_c * bps;
+                        let row_mod = row_length % 4;
+                        row_length + if row_mod == 0 { 0 } else { 4 - row_mod }
+                    }
+                } else {
+                    let raw_scanline_pad = ((bps * size_x) % 4) / bps;
+                    (size_x + raw_scanline_pad) * bps
+                };
                 let stored_expected = stored_row * meta.size_y as usize;
                 let expected = stored_expected as u64;
 
@@ -6150,20 +6156,45 @@ impl FormatReader for Nd2Reader {
                     let out_row = w as usize * bps;
                     let mut out = vec![0u8; out_row * h as usize];
                     let base = chunk_data_offset + payload_offset as u64;
+                    let channel = if split {
+                        (plane_index % meta.size_c) as usize
+                    } else {
+                        0
+                    };
+                    let row_span = if split {
+                        w as usize * size_c * bps
+                    } else {
+                        out_row
+                    };
+                    let start_x_bytes = if split {
+                        x as usize * size_c * bps
+                    } else {
+                        x as usize * bps
+                    };
+                    let mut row_buf = vec![0u8; row_span];
                     for row in 0..h as usize {
-                        let src =
-                            base + ((y as usize + row) * stored_row + x as usize * bps) as u64;
+                        let src = base + ((y as usize + row) * stored_row + start_x_bytes) as u64;
                         let dst = row * out_row;
                         f.seek(SeekFrom::Start(src)).map_err(BioFormatsError::Io)?;
+                        row_buf.fill(0);
                         let mut filled = 0usize;
-                        while filled < out_row {
+                        while filled < row_span {
                             let n = f
-                                .read(&mut out[dst + filled..dst + out_row])
+                                .read(&mut row_buf[filled..row_span])
                                 .map_err(BioFormatsError::Io)?;
                             if n == 0 {
                                 break;
                             }
                             filled += n;
+                        }
+                        if split {
+                            for px in 0..w as usize {
+                                let src = px * size_c * bps + channel * bps;
+                                let target = dst + px * bps;
+                                out[target..target + bps].copy_from_slice(&row_buf[src..src + bps]);
+                            }
+                        } else {
+                            out[dst..dst + out_row].copy_from_slice(&row_buf[..out_row]);
                         }
                     }
                     return Ok(out);

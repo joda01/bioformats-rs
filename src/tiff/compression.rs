@@ -36,39 +36,6 @@ pub(crate) fn decompress_jpeg_color(data: &[u8], color: JpegColor) -> Result<Vec
     }
 }
 
-/// Decompress one strip or tile using the specified TIFF compression scheme.
-/// `jpeg_tables` may contain JFIF tables from tag 347 for old-style JPEG tiles.
-pub fn decompress(
-    data: &[u8],
-    compression: Compression,
-    expected_len: usize,
-    predictor: u16,
-    samples_per_pixel: u16,
-    bits_per_sample: u16,
-    row_width: u32,
-    block_height: u32,
-    little_endian: bool,
-    jpeg_tables: Option<&[u8]>,
-    nikon_options: Option<&NikonCompressionOptions>,
-    jpeg_color: JpegColor,
-) -> Result<Vec<u8>> {
-    decompress_with_jpeg2000_reduce(
-        data,
-        compression,
-        expected_len,
-        predictor,
-        samples_per_pixel,
-        bits_per_sample,
-        row_width,
-        block_height,
-        little_endian,
-        jpeg_tables,
-        nikon_options,
-        jpeg_color,
-        0,
-    )
-}
-
 /// Decompress one strip or tile, optionally selecting a reduced JPEG-2000
 /// codestream resolution for synthetic TIFF sub-resolutions.
 pub fn decompress_with_jpeg2000_reduce(
@@ -453,6 +420,37 @@ fn add_sample(
 mod tests {
     use super::*;
     use crate::common::error::BioFormatsError;
+
+    fn decompress(
+        data: &[u8],
+        compression: Compression,
+        expected_len: usize,
+        predictor: u16,
+        samples_per_pixel: u16,
+        bits_per_sample: u16,
+        row_width: u32,
+        block_height: u32,
+        little_endian: bool,
+        jpeg_tables: Option<&[u8]>,
+        nikon_options: Option<&NikonCompressionOptions>,
+        jpeg_color: JpegColor,
+    ) -> Result<Vec<u8>> {
+        decompress_with_jpeg2000_reduce(
+            data,
+            compression,
+            expected_len,
+            predictor,
+            samples_per_pixel,
+            bits_per_sample,
+            row_width,
+            block_height,
+            little_endian,
+            jpeg_tables,
+            nikon_options,
+            jpeg_color,
+            0,
+        )
+    }
 
     fn assert_unsupported(result: Result<Vec<u8>>, expected: &str) {
         match result {

@@ -2,7 +2,7 @@ use bioformats::common::metadata::MetadataValue;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::formats::flim2::XlefReader;
 use bioformats::formats::leica_lms::{image_metadata_from_xlif, XlifDocument};
-use bioformats::{FormatReader, OmeShape};
+use bioformats::{FormatReader, ImageReader, OmeShape};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -876,4 +876,41 @@ fn xlef_mixed_project_opens_supported_attribute_leaf_with_unsupported_sibling_li
 
     let _ = std::fs::remove_file(xlef);
     let _ = std::fs::remove_file(bmp);
+}
+
+#[test]
+fn public_ome_leica_xlef_fixture_opens_when_downloaded() {
+    let Some(root) = std::env::var_os("BIOFORMATS_RS_EXTERNAL_FIXTURES").map(PathBuf::from) else {
+        eprintln!("set BIOFORMATS_RS_EXTERNAL_FIXTURES to run public Leica-XLEF fixture smoke");
+        return;
+    };
+    let path = root.join(
+        "leica-xlef/downloads.openmicroscopy.org/2020_06_23_sample%203%20U2OS/XLEF-LOF%202020_06_23_sample%203%20U2OS/XLEF-LOF%202020_06_23_sample%203%20U2OS.xlef",
+    );
+    if !path.exists() {
+        eprintln!(
+            "skipping missing public Leica-XLEF fixture {}",
+            path.display()
+        );
+        return;
+    }
+
+    let mut reader = ImageReader::open(&path)
+        .unwrap_or_else(|err| panic!("failed to open {}: {err}", path.display()));
+    let meta = reader.metadata().clone();
+    assert!(meta.size_x > 0, "zero width for {}", path.display());
+    assert!(meta.size_y > 0, "zero height for {}", path.display());
+    assert!(
+        meta.image_count > 0,
+        "zero plane count for {}",
+        path.display()
+    );
+    assert!(
+        !reader
+            .open_bytes(0)
+            .expect("read first XLEF plane")
+            .is_empty(),
+        "empty first plane for {}",
+        path.display()
+    );
 }
