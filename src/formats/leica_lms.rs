@@ -852,8 +852,18 @@ impl Dimension {
             self.length /= 1000.0;
             self.off_by_one_length /= 1000.0;
         } else if self.unit == "m" {
-            self.length *= METER_MULTIPLY;
-            self.off_by_one_length *= METER_MULTIPLY;
+            let multiplier = if self.length > 0.001 {
+                1000.0
+            } else {
+                METER_MULTIPLY
+            };
+            let off_by_one_multiplier = if self.off_by_one_length > 0.001 {
+                1000.0
+            } else {
+                METER_MULTIPLY
+            };
+            self.length *= multiplier;
+            self.off_by_one_length *= off_by_one_multiplier;
         }
     }
 
@@ -2705,23 +2715,32 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
         }
     }
 
-    // Filter (MetadataStoreInitializer.initFilterModels): first cut-in/out pair.
-    if !buffer.filter_models.is_empty() || !buffer.cut_ins.is_empty() {
-        put_str(
-            meta,
-            "xlef.lms.filter.0.name",
-            buffer.filter_models.first().map(|s| s.as_str()),
-        );
-        put_f64(
-            meta,
-            "xlef.lms.filter.0.cut_in",
-            buffer.cut_ins.first().copied(),
-        );
-        put_f64(
-            meta,
-            "xlef.lms.filter.0.cut_out",
-            buffer.cut_outs.first().copied(),
-        );
+    // Filter (MetadataStoreInitializer.initFilterModels): Java trims surplus
+    // cut-ins after the model list, then emits one Filter per remaining cut-in.
+    if !buffer.cut_ins.is_empty() && !buffer.filter_models.is_empty() {
+        let mut filter_cut_ins = buffer.cut_ins.clone();
+        if filter_cut_ins.len() >= buffer.filter_models.len() * 2 {
+            let diff = filter_cut_ins.len() - buffer.filter_models.len();
+            for _ in 0..diff {
+                if buffer.filter_models.len() < filter_cut_ins.len() {
+                    filter_cut_ins.remove(buffer.filter_models.len());
+                }
+            }
+        }
+        for (filter, cut_in) in filter_cut_ins.iter().enumerate() {
+            let prefix = format!("xlef.lms.filter.{filter}");
+            put_str(
+                meta,
+                &format!("{prefix}.name"),
+                buffer.filter_models.get(filter).map(|s| s.as_str()),
+            );
+            put_f64(meta, &format!("{prefix}.cut_in"), Some(*cut_in));
+            put_f64(
+                meta,
+                &format!("{prefix}.cut_out"),
+                buffer.cut_outs.get(filter).copied(),
+            );
+        }
     }
 
     // Per-channel names + excitation wavelengths (initDetectorModels / scanner).
@@ -2732,6 +2751,9 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
     }
     for (index, ex) in buffer.ex_waves.iter().enumerate() {
         if let Some(ex) = ex {
+            put_f64(meta, &format!("xlef.lms.raw.ex_wave.{index}"), Some(*ex));
+        }
+        if let Some(ex) = ex {
             if *ex > 1.0 {
                 put_f64(
                     meta,
@@ -2740,6 +2762,46 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
                 );
             }
         }
+    }
+    for (index, wavelength) in buffer.laser_wavelength.iter().enumerate() {
+        put_f64(
+            meta,
+            &format!("xlef.lms.raw.laser_wavelength.{index}"),
+            Some(*wavelength),
+        );
+    }
+    for (index, intensity) in buffer.laser_intensity.iter().enumerate() {
+        put_f64(
+            meta,
+            &format!("xlef.lms.raw.laser_intensity.{index}"),
+            Some(*intensity),
+        );
+    }
+    for (index, active) in buffer.laser_active.iter().enumerate() {
+        meta.series_metadata.insert(
+            format!("xlef.lms.raw.laser_active.{index}"),
+            MetadataValue::Bool(*active),
+        );
+    }
+    for (index, frap) in buffer.laser_frap.iter().enumerate() {
+        meta.series_metadata.insert(
+            format!("xlef.lms.raw.laser_frap.{index}"),
+            MetadataValue::Bool(*frap),
+        );
+    }
+    meta.series_metadata.insert(
+        "xlef.lms.raw.detector_model_count".into(),
+        MetadataValue::Int(buffer.detector_models.len() as i64),
+    );
+    meta.series_metadata.insert(
+        "xlef.lms.raw.detector_offset_count".into(),
+        MetadataValue::Int(buffer.detector_offsets.len() as i64),
+    );
+    for (index, active) in buffer.active_detector.iter().enumerate() {
+        meta.series_metadata.insert(
+            format!("xlef.lms.raw.active_detector.{index}"),
+            MetadataValue::Bool(*active),
+        );
     }
 }
 
@@ -2953,6 +3015,18 @@ fn emit_lms_channel_detectors(extractor: &LmsMetadataExtractor, meta: &mut Image
     let buffer = &extractor.buffer;
     let effective_c = extractor.get_effective_size_c();
     let size_c = extractor.core_size_c.max(1) as i32;
+    let mut filter_cut_ins = buffer.cut_ins.clone();
+    if !filter_cut_ins.is_empty()
+        && !buffer.filter_models.is_empty()
+        && filter_cut_ins.len() >= buffer.filter_models.len() * 2
+    {
+        let diff = filter_cut_ins.len() - buffer.filter_models.len();
+        for _ in 0..diff {
+            if buffer.filter_models.len() < filter_cut_ins.len() {
+                filter_cut_ins.remove(buffer.filter_models.len());
+            }
+        }
+    }
 
     let detectors: &Vec<String> = &buffer.detector_models;
     let detectors_present = !detectors.is_empty();
@@ -2971,13 +3045,13 @@ fn emit_lms_channel_detectors(extractor: &LmsMetadataExtractor, meta: &mut Image
 
     // Special case: trailing active detectors imply a filter-detector offset.
     if active_present
-        && active_detectors.len() as i32 > buffer.cut_ins.len() as i32
+        && active_detectors.len() as i32 > filter_cut_ins.len() as i32
         && *active_detectors.last().unwrap()
         && active_detectors.len() >= 2
         && active_detectors[active_detectors.len() - 2]
     {
-        next_filter_detector = active_detectors.len() as i32 - buffer.cut_ins.len() as i32;
-        if buffer.cut_ins.len() as i32 > buffer.filter_models.len() as i32 {
+        next_filter_detector = active_detectors.len() as i32 - filter_cut_ins.len() as i32;
+        if filter_cut_ins.len() as i32 > buffer.filter_models.len() as i32 {
             next_filter_detector += buffer.filter_models.len() as i32;
             next_filter += buffer.filter_models.len() as i32;
         }
@@ -3055,7 +3129,7 @@ fn emit_lms_channel_detectors(extractor: &LmsMetadataExtractor, meta: &mut Image
         // per channel under xlef.lms.channel.N.emission_filter_ref.
         if channel_color != -1 && next_filter >= 0 {
             if next_detector - first_detector != size_c
-                && next_detector >= buffer.cut_ins.len() as i32
+                && next_detector >= filter_cut_ins.len() as i32
             {
                 while next_filter_detector < first_detector {
                     // store.setFilterID(Filter:series:nextFilter) — instrument-level

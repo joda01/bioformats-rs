@@ -4284,6 +4284,10 @@ fn slidebook7_filename_fixed_number(name: &str, marker: &str, digits: usize) -> 
     value.parse::<u32>().ok()
 }
 
+fn slidebook7_java_filename_channel_index(name: &str) -> Option<u32> {
+    slidebook7_filename_fixed_number(name, "_Ch", 1)
+}
+
 fn slidebook7_npy_zyx_shape(shape: &[u32], _declared_z: u32) -> Result<(u32, u32, u32)> {
     match shape {
         [y, x] => Ok((1, *y, *x)),
@@ -4836,7 +4840,13 @@ impl SlideBook7Reader {
 
         let max_c_from_files = files
             .iter()
-            .map(|f| f.channel + 1)
+            .filter_map(|f| {
+                f.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(slidebook7_java_filename_channel_index)
+                    .map(|channel| channel + 1)
+            })
             .max()
             .unwrap_or(declared_c);
         let max_t_from_files = files
@@ -9041,8 +9051,231 @@ impl XlefReader {
             metadata.push(meta);
         }
 
+        self.apply_xlef_project_excitation_projection(&mut metadata);
         self.project_metadata = metadata;
         Ok(())
+    }
+
+    fn apply_xlef_project_excitation_projection(&self, metadata: &mut [ImageMetadata]) {
+        let mut next_channel = 0i32;
+        for (series, meta) in metadata.iter_mut().enumerate() {
+            let effective_c = xlef_lms_effective_channel_count(meta) as i32;
+            for c in 0..effective_c.max(0) as usize {
+                let prefix = format!("xlef.lms.channel.{c}");
+                meta.series_metadata
+                    .remove(&format!("{prefix}.excitation_wavelength"));
+                meta.series_metadata
+                    .remove(&format!("{prefix}.light_source_settings_id"));
+                meta.series_metadata
+                    .remove(&format!("{prefix}.light_source_settings_attenuation"));
+            }
+
+            let mut lasers = Vec::new();
+            while let Some(value) = xlef_lms_metadata_float(
+                meta,
+                &format!("xlef.lms.raw.laser_wavelength.{}", lasers.len()),
+            ) {
+                lasers.push(value);
+            }
+            let mut laser_intensities = Vec::new();
+            while let Some(value) = xlef_lms_metadata_float(
+                meta,
+                &format!("xlef.lms.raw.laser_intensity.{}", laser_intensities.len()),
+            ) {
+                laser_intensities.push(value);
+            }
+            let mut active = Vec::new();
+            while let Some(value) =
+                xlef_lms_metadata_bool(meta, &format!("xlef.lms.raw.laser_active.{}", active.len()))
+            {
+                active.push(value);
+            }
+            let mut frap = Vec::new();
+            while let Some(value) =
+                xlef_lms_metadata_bool(meta, &format!("xlef.lms.raw.laser_frap.{}", frap.len()))
+            {
+                frap.push(value);
+            }
+            if !lasers.is_empty() && !laser_intensities.is_empty() {
+                let mut laser_index = 0usize;
+                while laser_index < lasers.len() {
+                    if lasers[laser_index] == 0.0 {
+                        lasers.remove(laser_index);
+                    } else {
+                        laser_index += 1;
+                    }
+                }
+
+                if !lasers.is_empty() {
+                    let mut ignored_channels = std::collections::HashSet::new();
+                    let mut valid_intensities = Vec::new();
+                    let mut channels = std::collections::HashSet::new();
+                    let size = lasers.len() as i32;
+                    for laser in 0..laser_intensities.len() {
+                        let intensity = laser_intensities[laser];
+                        let channel = laser as i32 / size;
+                        if intensity < 100.0 {
+                            valid_intensities.push(laser as i32);
+                            channels.insert(channel);
+                        }
+                        ignored_channels.insert(channel);
+                    }
+                    for channel in &channels {
+                        ignored_channels.remove(channel);
+                    }
+
+                    let mut to_remove = std::collections::HashSet::new();
+                    let active_len = active.len() as i32;
+                    for j in 0..valid_intensities.len() {
+                        if (j as i32) < active_len && !active[j] {
+                            to_remove.insert(valid_intensities[j]);
+                        }
+                        let jj = j + 1;
+                        if jj < valid_intensities.len() {
+                            let v = valid_intensities[j] / size;
+                            let vv = valid_intensities[jj] / size;
+                            if vv == v {
+                                to_remove.insert(valid_intensities[j]);
+                                to_remove.insert(valid_intensities[jj]);
+                                ignored_channels.insert(j as i32);
+                            }
+                        }
+                    }
+                    if !to_remove.is_empty() {
+                        valid_intensities.retain(|v| !to_remove.contains(v));
+                    }
+
+                    let mut no_names = true;
+                    for c in 0..effective_c.max(0) as usize {
+                        if let Some(name) =
+                            xlef_lms_channel_name(meta, &format!("xlef.lms.channel.{c}.name"))
+                        {
+                            if !name.is_empty() {
+                                no_names = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !no_names {
+                        for is_frap in &frap {
+                            if !*is_frap {
+                                no_names = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    let mut next_filter = 0i32;
+                    let mut cut_ins = Vec::new();
+                    while let Some(cut_in) = xlef_lms_metadata_float(
+                        meta,
+                        &format!("xlef.lms.filter.{}.cut_in", cut_ins.len()),
+                    ) {
+                        cut_ins.push(cut_in);
+                    }
+                    for laser_array_index in valid_intensities {
+                        let intensity = laser_intensities[laser_array_index as usize];
+                        let laser = laser_array_index % lasers.len() as i32;
+                        let wavelength = lasers[laser as usize];
+                        if wavelength != 0.0 {
+                            while ignored_channels.contains(&next_channel) {
+                                next_channel += 1;
+                            }
+                            while next_channel < effective_c
+                                && xlef_lms_channel_name(
+                                    meta,
+                                    &format!("xlef.lms.channel.{next_channel}.name"),
+                                )
+                                .map(|name| name.is_empty() && !no_names)
+                                .unwrap_or(!no_names)
+                            {
+                                next_channel += 1;
+                            }
+                            if next_channel < effective_c {
+                                let prefix = format!("xlef.lms.channel.{next_channel}");
+                                meta.series_metadata.insert(
+                                    format!("{prefix}.light_source_settings_id"),
+                                    MetadataValue::String(format!("LightSource:{series}:{laser}")),
+                                );
+                                meta.series_metadata.insert(
+                                    format!("{prefix}.light_source_settings_attenuation"),
+                                    MetadataValue::Float((intensity as f32 / 100.0_f32) as f64),
+                                );
+                                if wavelength > 0.0 {
+                                    meta.series_metadata.insert(
+                                        format!("{prefix}.excitation_wavelength"),
+                                        MetadataValue::Float(wavelength),
+                                    );
+                                }
+
+                                if wavelength > 0.0 {
+                                    if next_filter >= cut_ins.len() as i32 {
+                                        next_channel += 1;
+                                        continue;
+                                    }
+                                    let mut cut_in = cut_ins[next_filter as usize];
+                                    while cut_in - wavelength > 20.0 {
+                                        next_filter += 1;
+                                        if next_filter < cut_ins.len() as i32 {
+                                            cut_in = cut_ins[next_filter as usize];
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if next_filter < cut_ins.len() as i32 {
+                                        next_filter += 1;
+                                    }
+                                }
+                            }
+                        }
+                        next_channel += 1;
+                    }
+                }
+            }
+
+            for c in 0..effective_c.max(0) as usize {
+                if let Some(ex) =
+                    xlef_lms_metadata_float(meta, &format!("xlef.lms.raw.ex_wave.{c}"))
+                {
+                    if ex > 1.0 {
+                        meta.series_metadata.insert(
+                            format!("xlef.lms.channel.{c}.excitation_wavelength"),
+                            MetadataValue::Float(ex),
+                        );
+                    }
+                }
+            }
+
+            let detector_count = xlef_lms_metadata_int(meta, "xlef.lms.raw.detector_model_count")
+                .unwrap_or(0) as i32;
+            next_channel = 0;
+            if detector_count > 0 {
+                let mut active_detectors = Vec::new();
+                while let Some(active) = xlef_lms_metadata_bool(
+                    meta,
+                    &format!("xlef.lms.raw.active_detector.{}", active_detectors.len()),
+                ) {
+                    active_detectors.push(active);
+                }
+                let detector_offset_count =
+                    xlef_lms_metadata_int(meta, "xlef.lms.raw.detector_offset_count").unwrap_or(0)
+                        as i32;
+                let start = (detector_count - effective_c).max(0);
+                for detector in start..detector_count {
+                    let d_index = detector - start;
+                    if !active_detectors.is_empty() {
+                        let detector_index = active_detectors.len() as i32 - effective_c + d_index;
+                        if detector_index >= 0
+                            && (detector_index as usize) < active_detectors.len()
+                            && active_detectors[detector_index as usize]
+                            && next_channel < detector_offset_count
+                        {
+                            next_channel += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn reorder_multi_images_like_java(&mut self) {
@@ -10838,6 +11071,7 @@ fn xlef_lms_physical_size_um(
     let length = attrs.get("Length").and_then(|v| xlef_parse_f64(v))?;
     let mut value = length / (elements as f64 - 1.0);
     match attrs.get("Unit").map(|v| v.as_str()) {
+        Some("m") if value > 0.001 => value *= 1_000.0,
         Some("m") => value *= 1_000_000.0,
         Some("mm") => value *= 1_000.0,
         Some("nm") => value /= 1_000.0,
@@ -10866,6 +11100,16 @@ fn xlef_lms_metadata_int(meta: &ImageMetadata, key: &str) -> Option<i64> {
         }
         Some(crate::common::metadata::MetadataValue::String(value)) => {
             value.trim().parse::<i64>().ok()
+        }
+        _ => None,
+    }
+}
+
+fn xlef_lms_metadata_bool(meta: &ImageMetadata, key: &str) -> Option<bool> {
+    match meta.series_metadata.get(key) {
+        Some(crate::common::metadata::MetadataValue::Bool(value)) => Some(*value),
+        Some(crate::common::metadata::MetadataValue::String(value)) => {
+            value.trim().parse::<bool>().ok()
         }
         _ => None,
     }
@@ -10915,20 +11159,15 @@ fn xlef_lms_implicit_rgb_filter_count(meta: &ImageMetadata) -> usize {
 }
 
 fn xlef_lms_emission_filter_ref_count(meta: &ImageMetadata) -> usize {
-    let mut count = 0usize;
-    loop {
-        if xlef_lms_metadata_string(
-            meta,
-            &format!("xlef.lms.channel.{count}.emission_filter_ref"),
-        )
-        .is_some()
-        {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count
+    (0..xlef_lms_effective_channel_count(meta))
+        .filter(|channel_index| {
+            xlef_lms_metadata_string(
+                meta,
+                &format!("xlef.lms.channel.{channel_index}.emission_filter_ref"),
+            )
+            .is_some()
+        })
+        .count()
 }
 
 fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::OmeMetadata {
@@ -10950,17 +11189,14 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
                 crate::common::ome_metadata::OmeChannel::default,
             );
         }
-        let suppress_series_excitation =
-            xlef_lms_metadata_int(meta, "xlef.project.series_index").is_some_and(|index| index > 0);
         for (channel_index, channel) in image.channels.iter_mut().enumerate() {
             let prefix = format!("xlef.lms.channel.{channel_index}");
             channel.name = xlef_lms_channel_name(meta, &format!("{prefix}.name"))
                 .or_else(|| xlef_lms_channel_name(meta, &format!("{prefix}.dye_name")))
                 .or_else(|| xlef_lms_channel_name(meta, &format!("{prefix}.dye")));
-            channel.excitation_wavelength = (!suppress_series_excitation)
-                .then(|| xlef_lms_metadata_float(meta, &format!("{prefix}.excitation_wavelength")))
-                .flatten()
-                .filter(|v| *v > 0.0);
+            channel.excitation_wavelength =
+                xlef_lms_metadata_float(meta, &format!("{prefix}.excitation_wavelength"))
+                    .filter(|v| *v > 0.0);
             channel.emission_wavelength =
                 xlef_lms_metadata_float(meta, &format!("{prefix}.emission_wavelength"))
                     .filter(|v| *v > 0.0);
@@ -11009,19 +11245,12 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
             image.light_paths = light_paths;
         }
 
-        // Per-plane metadata (Java initImageDetails plane loop): positions, deltaT,
-        // exposure times. One OmePlane per image plane, in plane index order.
-        let mut plane_index = 0usize;
-        while meta
-            .series_metadata
-            .keys()
-            .any(|k| k.starts_with(&format!("xlef.lms.plane.{plane_index}.")))
-        {
-            plane_index += 1;
-        }
-        if plane_index > 0 {
-            let mut planes = Vec::with_capacity(plane_index);
-            for index in 0..plane_index {
+        // Per-plane metadata (Java populatePixels(..., true, false) plus
+        // initImageDetails): baseline plane records exist for every image plane,
+        // even if the optional position/time/exposure fields are absent.
+        if meta.image_count > 0 {
+            let mut planes = Vec::with_capacity(meta.image_count as usize);
+            for index in 0..meta.image_count as usize {
                 let prefix = format!("xlef.lms.plane.{index}");
                 planes.push(crate::common::ome_metadata::OmePlane {
                     the_z: 0,
@@ -11143,13 +11372,23 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
             n += 1;
         }
     }
-    let has_filter_metadata = meta
-        .series_metadata
-        .keys()
-        .any(|k| k.starts_with("xlef.lms.filter.0."));
-    let filter_count = usize::from(has_filter_metadata)
-        .max(xlef_lms_implicit_rgb_filter_count(meta))
-        .max(xlef_lms_emission_filter_ref_count(meta));
+    let mut explicit_filter_count = 0usize;
+    for key in meta.series_metadata.keys() {
+        if let Some(rest) = key.strip_prefix("xlef.lms.filter.") {
+            if let Some(index) = rest
+                .split('.')
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                explicit_filter_count = explicit_filter_count.max(index + 1);
+            }
+        }
+    }
+    let filter_count = if explicit_filter_count > 0 {
+        explicit_filter_count
+    } else {
+        xlef_lms_implicit_rgb_filter_count(meta).max(xlef_lms_emission_filter_ref_count(meta))
+    };
     for filter_index in 0..filter_count {
         let prefix = format!("xlef.lms.filter.{filter_index}");
         instrument
@@ -11618,6 +11857,30 @@ struct OirNative {
     /// Physical files containing native pixel blocks, matching Java
     /// `getSeriesUsedFiles(false)`.
     used_files: Vec<PathBuf>,
+    instrument: crate::common::ome_metadata::OmeInstrument,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OirLaser {
+    id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OirDetector {
+    id: Option<String>,
+    voltage: Option<f64>,
+    offset: Option<f64>,
+    gain: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OirObjective {
+    name: Option<String>,
+    magnification: Option<f64>,
+    na: Option<f64>,
+    wd: Option<f64>,
+    immersion: Option<String>,
 }
 
 /// Internal state of an initialized [`OirReader`].
@@ -12074,6 +12337,8 @@ fn parse_oir_native(path: &Path) -> Result<OirNative> {
         );
     }
 
+    let instrument = oir_instrument_from_xml(&xml_blocks);
+
     // Parse XML metadata for dimensions and channels.
     oir_apply_xml(&xml_blocks, &mut meta, &mut channel_ids);
 
@@ -12212,7 +12477,312 @@ fn parse_oir_native(path: &Path) -> Result<OirNative> {
         meta,
         czt_blocks,
         used_files,
+        instrument,
     })
+}
+
+fn oir_push_unique_laser(lasers: &mut Vec<OirLaser>, laser: OirLaser) {
+    if laser.id.is_none() && laser.name.is_none() {
+        return;
+    }
+    if lasers
+        .iter()
+        .any(|existing| existing.id == laser.id && existing.name == laser.name)
+    {
+        return;
+    }
+    lasers.push(laser);
+}
+
+fn oir_push_unique_detector(detectors: &mut Vec<OirDetector>, detector: OirDetector) {
+    if detector.id.is_none() {
+        return;
+    }
+    if detectors.iter().any(|existing| existing.id == detector.id) {
+        return;
+    }
+    detectors.push(detector);
+}
+
+fn oir_push_unique_objective(objectives: &mut Vec<OirObjective>, objective: OirObjective) {
+    if objective.name.is_none()
+        && objective.magnification.is_none()
+        && objective.na.is_none()
+        && objective.wd.is_none()
+        && objective.immersion.is_none()
+    {
+        return;
+    }
+    if objectives.iter().any(|existing| {
+        existing.name == objective.name
+            && existing.magnification == objective.magnification
+            && existing.na == objective.na
+    }) {
+        return;
+    }
+    objectives.push(objective);
+}
+
+fn oir_instrument_from_xml(xml_blocks: &[String]) -> crate::common::ome_metadata::OmeInstrument {
+    let mut lasers = Vec::new();
+    let mut detectors = Vec::new();
+    let mut objectives = Vec::new();
+    for xml in xml_blocks {
+        oir_collect_instrument_xml(xml, &mut lasers, &mut detectors, &mut objectives);
+    }
+
+    let mut instrument = crate::common::ome_metadata::OmeInstrument {
+        id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+        ..Default::default()
+    };
+    for (i, objective) in objectives.into_iter().enumerate() {
+        instrument
+            .objectives
+            .push(crate::common::ome_metadata::OmeObjective {
+                id: Some(crate::common::ome_metadata::create_lsid(
+                    "Objective",
+                    &[0, i],
+                )),
+                model: objective.name,
+                nominal_magnification: objective.magnification,
+                lens_na: objective.na,
+                working_distance: objective.wd,
+                immersion: objective.immersion,
+                ..Default::default()
+            });
+    }
+    for (i, detector) in detectors.into_iter().enumerate() {
+        instrument
+            .detectors
+            .push(crate::common::ome_metadata::OmeDetector {
+                id: Some(crate::common::ome_metadata::create_lsid(
+                    "Detector",
+                    &[0, i],
+                )),
+                model: detector.id,
+                gain: detector.gain,
+                offset: detector.offset,
+                ..Default::default()
+            });
+    }
+    for (i, laser) in lasers.into_iter().enumerate() {
+        instrument
+            .light_sources
+            .push(crate::common::ome_metadata::OmeLightSource {
+                id: Some(crate::common::ome_metadata::create_lsid(
+                    "LightSource",
+                    &[0, i],
+                )),
+                model: laser.id.or(laser.name),
+                light_source_type: Some("Laser".to_string()),
+                ..Default::default()
+            });
+    }
+    instrument
+}
+
+fn oir_collect_instrument_xml(
+    xml: &str,
+    lasers: &mut Vec<OirLaser>,
+    detectors: &mut Vec<OirDetector>,
+    objectives: &mut Vec<OirObjective>,
+) {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut current_laser: Option<OirLaser> = None;
+    let mut current_detector: Option<OirDetector> = None;
+    let mut current_objective: Option<OirObjective> = None;
+    let mut active_text_for: Option<&'static str> = None;
+    let mut active_text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                match name {
+                    b"commonimage:laser" => {
+                        current_laser = Some(OirLaser::default());
+                        active_text_for = None;
+                        active_text.clear();
+                    }
+                    b"lsmparam:pmt" => {
+                        current_detector = Some(OirDetector {
+                            id: oir_xml_attr_value(&e, b"detectorId"),
+                            ..Default::default()
+                        });
+                        active_text_for = None;
+                        active_text.clear();
+                    }
+                    b"commonimage:objectiveLens" => {
+                        current_objective = Some(OirObjective::default());
+                        active_text_for = None;
+                        active_text.clear();
+                    }
+                    b"commonimage:id" if current_laser.is_some() => {
+                        active_text_for = Some("laser_id");
+                        active_text.clear();
+                    }
+                    b"commonimage:name" if current_laser.is_some() => {
+                        active_text_for = Some("laser_name");
+                        active_text.clear();
+                    }
+                    b"lsmparam:voltage" if current_detector.is_some() => {
+                        active_text_for = Some("detector_voltage");
+                        active_text.clear();
+                    }
+                    b"lsmparam:offset" if current_detector.is_some() => {
+                        active_text_for = Some("detector_offset");
+                        active_text.clear();
+                    }
+                    b"lsmparam:gain" if current_detector.is_some() => {
+                        active_text_for = Some("detector_gain");
+                        active_text.clear();
+                    }
+                    b"opticalelement:displayName" if current_objective.is_some() => {
+                        active_text_for = Some("objective_name");
+                        active_text.clear();
+                    }
+                    b"opticalelement:magnification" if current_objective.is_some() => {
+                        active_text_for = Some("objective_magnification");
+                        active_text.clear();
+                    }
+                    b"opticalelement:naValue" if current_objective.is_some() => {
+                        active_text_for = Some("objective_na");
+                        active_text.clear();
+                    }
+                    b"opticalelement:wdValue" if current_objective.is_some() => {
+                        active_text_for = Some("objective_wd");
+                        active_text.clear();
+                    }
+                    b"opticalelement:immersion" if current_objective.is_some() => {
+                        active_text_for = Some("objective_immersion");
+                        active_text.clear();
+                    }
+                    _ => {
+                        active_text_for = None;
+                        active_text.clear();
+                    }
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                if e.name().as_ref() == b"lsmparam:pmt" {
+                    oir_push_unique_detector(
+                        detectors,
+                        OirDetector {
+                            id: oir_xml_attr_value(&e, b"detectorId"),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if active_text_for.is_some() {
+                    if let Some(s) = crate::common::xml::decode_xml_text(&t) {
+                        active_text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if active_text_for.is_some() {
+                    if let Some(s) = crate::common::xml::decode_xml_ref(&r) {
+                        active_text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                if active_text_for.is_some() {
+                    if let Ok(s) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
+                        active_text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let text = active_text.trim();
+                match (e.name().as_ref(), active_text_for) {
+                    (b"commonimage:id", Some("laser_id")) => {
+                        if let Some(laser) = current_laser.as_mut() {
+                            laser.id = (!text.is_empty()).then(|| text.to_string());
+                        }
+                    }
+                    (b"commonimage:name", Some("laser_name")) => {
+                        if let Some(laser) = current_laser.as_mut() {
+                            laser.name = (!text.is_empty()).then(|| text.to_string());
+                        }
+                    }
+                    (b"lsmparam:voltage", Some("detector_voltage")) => {
+                        if let Some(detector) = current_detector.as_mut() {
+                            detector.voltage = text.parse::<f64>().ok();
+                        }
+                    }
+                    (b"lsmparam:offset", Some("detector_offset")) => {
+                        if let Some(detector) = current_detector.as_mut() {
+                            detector.offset = text.parse::<f64>().ok();
+                        }
+                    }
+                    (b"lsmparam:gain", Some("detector_gain")) => {
+                        if let Some(detector) = current_detector.as_mut() {
+                            detector.gain = text.parse::<f64>().ok();
+                        }
+                    }
+                    (b"opticalelement:displayName", Some("objective_name")) => {
+                        if let Some(objective) = current_objective.as_mut() {
+                            objective.name = (!text.is_empty()).then(|| text.to_string());
+                        }
+                    }
+                    (b"opticalelement:magnification", Some("objective_magnification")) => {
+                        if let Some(objective) = current_objective.as_mut() {
+                            objective.magnification = text.parse::<f64>().ok();
+                        }
+                    }
+                    (b"opticalelement:naValue", Some("objective_na")) => {
+                        if let Some(objective) = current_objective.as_mut() {
+                            objective.na = text.parse::<f64>().ok();
+                        }
+                    }
+                    (b"opticalelement:wdValue", Some("objective_wd")) => {
+                        if let Some(objective) = current_objective.as_mut() {
+                            objective.wd = text.parse::<f64>().ok();
+                        }
+                    }
+                    (b"opticalelement:immersion", Some("objective_immersion")) => {
+                        if let Some(objective) = current_objective.as_mut() {
+                            objective.immersion = (!text.is_empty()).then(|| text.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+
+                match e.name().as_ref() {
+                    b"commonimage:laser" => {
+                        if let Some(laser) = current_laser.take() {
+                            oir_push_unique_laser(lasers, laser);
+                        }
+                    }
+                    b"lsmparam:pmt" => {
+                        if let Some(detector) = current_detector.take() {
+                            oir_push_unique_detector(detectors, detector);
+                        }
+                    }
+                    b"commonimage:objectiveLens" => {
+                        if let Some(objective) = current_objective.take() {
+                            oir_push_unique_objective(objectives, objective);
+                        }
+                    }
+                    _ => {
+                        if active_text_for.is_some() {
+                            active_text_for = None;
+                            active_text.clear();
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
 }
 
 /// Apply parsed OIR XML blocks to metadata (dimensions, pixel type, channels).
@@ -12881,7 +13451,6 @@ impl FormatReader for OirReader {
                 image.physical_size_z = Some(*value);
             }
             image.instrument_ref = Some(0);
-            image.objective_ref = Some(0);
             if image.planes.is_empty() {
                 for plane in 0..meta.image_count {
                     let (z, c, t) = oir_zct_coords(meta, plane);
@@ -12895,41 +13464,20 @@ impl FormatReader for OirReader {
             }
         }
         if ome.instruments.is_empty() {
-            let mut instrument = crate::common::ome_metadata::OmeInstrument {
-                id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
-                ..Default::default()
+            let instrument = match &self.state {
+                Some(OirState::Native(n)) => n.instrument.clone(),
+                _ => crate::common::ome_metadata::OmeInstrument {
+                    id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                    ..Default::default()
+                },
             };
-            instrument
-                .objectives
-                .push(crate::common::ome_metadata::OmeObjective {
-                    id: Some(crate::common::ome_metadata::create_lsid(
-                        "Objective",
-                        &[0, 0],
-                    )),
-                    ..Default::default()
-                });
-            for detector_index in 0..4 {
-                instrument
-                    .detectors
-                    .push(crate::common::ome_metadata::OmeDetector {
-                        id: Some(crate::common::ome_metadata::create_lsid(
-                            "Detector",
-                            &[0, detector_index],
-                        )),
-                        ..Default::default()
-                    });
-            }
-            instrument
-                .light_sources
-                .push(crate::common::ome_metadata::OmeLightSource {
-                    id: Some(crate::common::ome_metadata::create_lsid(
-                        "LightSource",
-                        &[0, 0],
-                    )),
-                    light_source_type: Some("Laser".to_string()),
-                    ..Default::default()
-                });
+            let has_objective = !instrument.objectives.is_empty();
             ome.instruments.push(instrument);
+            if has_objective {
+                if let Some(image) = ome.images.get_mut(0) {
+                    image.objective_ref = Some(0);
+                }
+            }
         }
         Some(ome)
     }
@@ -18647,6 +19195,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oir_instrument_graph_uses_java_laser_and_pmt_counts() {
+        let xml = r#"
+<root>
+  <commonimage:lsm>
+    <commonimage:laser>
+      <commonimage:id>LD405</commonimage:id>
+      <commonimage:name>405 nm</commonimage:name>
+    </commonimage:laser>
+    <commonimage:laser>
+      <commonimage:id>LD488</commonimage:id>
+      <commonimage:name>488 nm</commonimage:name>
+    </commonimage:laser>
+  </commonimage:lsm>
+  <commonimage:acquisition>
+    <commonimage:microscopeConfiguration>
+      <commonimage:objectiveLens>
+        <opticalelement:displayName>UPLXAPO20X</opticalelement:displayName>
+        <opticalelement:magnification>20</opticalelement:magnification>
+        <opticalelement:naValue>0.8</opticalelement:naValue>
+        <opticalelement:wdValue>0.6</opticalelement:wdValue>
+      </commonimage:objectiveLens>
+    </commonimage:microscopeConfiguration>
+    <lsmimage:imagingParam>
+      <lsmparam:pmt channelId="c0" detectorId="PMT-A">
+        <lsmparam:voltage>700</lsmparam:voltage>
+        <lsmparam:offset>1.5</lsmparam:offset>
+        <lsmparam:gain>2.5</lsmparam:gain>
+      </lsmparam:pmt>
+      <lsmparam:pmt channelId="c1" detectorId="PMT-B" />
+    </lsmimage:imagingParam>
+  </commonimage:acquisition>
+</root>"#;
+        let instrument = oir_instrument_from_xml(&[xml.to_string(), xml.to_string()]);
+
+        assert_eq!(instrument.id.as_deref(), Some("Instrument:0"));
+        assert_eq!(instrument.light_sources.len(), 2);
+        assert_eq!(instrument.detectors.len(), 2);
+        assert_eq!(instrument.objectives.len(), 1);
+        assert_eq!(instrument.light_sources[0].model.as_deref(), Some("LD405"));
+        assert_eq!(instrument.detectors[0].model.as_deref(), Some("PMT-A"));
+        assert_eq!(instrument.detectors[0].gain, Some(2.5));
+        assert_eq!(instrument.detectors[0].offset, Some(1.5));
+        assert_eq!(
+            instrument.objectives[0].model.as_deref(),
+            Some("UPLXAPO20X")
+        );
+        assert_eq!(instrument.objectives[0].nominal_magnification, Some(20.0));
+        assert_eq!(instrument.objectives[0].lens_na, Some(0.8));
+    }
+
     fn push_oir_u32(buf: &mut Vec<u8>, value: u32) {
         buf.extend_from_slice(&value.to_le_bytes());
     }
@@ -20824,7 +21423,7 @@ theUnknownAnnotation70ListSize: 0
     }
 
     #[test]
-    fn slidebook7_parses_multi_digit_channel_indices() {
+    fn slidebook7_sparse_fallback_counts_only_one_channel_digit_like_java() {
         let path = temp_flim2_path("native-ch10.sldy");
         std::fs::write(&path, b"SlideBook 7 native placeholder").unwrap();
         let root = path.with_extension("dir");
@@ -20850,13 +21449,12 @@ theUnknownAnnotation70ListSize: 0
         reader
             .set_id(&path)
             .expect("native SlideBook 7 Ch10 fixture");
-        assert_eq!(reader.metadata().size_c, 11);
-        assert_eq!(reader.metadata().image_count, 11);
-        assert_eq!(reader.open_bytes(10).unwrap(), payload);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().image_count, 2);
         assert!(matches!(
-            reader.open_bytes(9),
+            reader.open_bytes(1),
             Err(BioFormatsError::UnsupportedFormat(ref message))
-                if message.contains("missing ImageData plane")
+                if message.contains("missing ImageData plane for T=0 C=1 Z=0")
         ));
 
         let _ = std::fs::remove_dir_all(root);

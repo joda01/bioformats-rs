@@ -12,6 +12,9 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{
     DimensionOrder, ImageMetadata, LookupTable, MetadataValue, ModuloAnnotation,
 };
+use crate::common::ome_metadata::{
+    create_lsid, OmeMetadata, OmePlane, OmePlate, OmeWell, OmeWellSample,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::stitcher::{FilePattern, FileStitcher};
@@ -1246,19 +1249,27 @@ impl FormatReader for I2iReader {
 /// well/field becomes one Bio-Formats series and pixel reads are delegated to
 /// the matching TIFF via [`crate::tiff::TiffReader`].
 ///
-/// Blind translation (no sample). The plate/channel/timestamp metadata that the
-/// Java reader pushes into the OME store is not represented in `ImageMetadata`
-/// and is therefore parsed only as far as needed to size the planes; per-plane
-/// CSV sizes fall back to the first TIFF's dimensions.
+/// The Java reader writes JDCE plate/channel/plane CSV fields directly to the
+/// OME store after `MetadataTools.populatePixels`; Rust carries the same fields
+/// through the assembled series and mirrors that in `ome_metadata()`.
 pub struct JdceReader {
     series_list: Vec<JdceSeries>,
     series: usize,
+    plate_name: Option<String>,
+    plate_rows: u32,
+    plate_columns: u32,
+    channels: Vec<JdceChannel>,
 }
 
 struct JdceSeries {
     meta: ImageMetadata,
     /// Plane index -> absolute TIFF path (None = missing plane, zero-filled).
     files: Vec<Option<String>>,
+    well_row: i32,
+    well_col: i32,
+    well_index: usize,
+    field_index: u32,
+    plane_metadata: Vec<Option<JdcePlaneMetadata>>,
 }
 
 #[derive(Default)]
@@ -1270,6 +1281,24 @@ struct JdceWell {
     files: HashMap<(u32, u32), String>,
     /// (field, plane) -> CSV plane dimensions.
     plane_sizes: HashMap<(u32, u32), (u32, u32)>,
+    /// (field, plane) -> CSV timing/position metadata.
+    plane_metadata: HashMap<(u32, u32), JdcePlaneMetadata>,
+}
+
+#[derive(Clone, Default)]
+struct JdceChannel {
+    name: Option<String>,
+    emission_wavelength: Option<f64>,
+    excitation_wavelength: Option<f64>,
+}
+
+#[derive(Clone, Default)]
+struct JdcePlaneMetadata {
+    timestamp: Option<f64>,
+    exposure_time_ms: Option<f64>,
+    position_x: Option<f64>,
+    position_y: Option<f64>,
+    position_z: Option<f64>,
 }
 
 impl JdceReader {
@@ -1277,6 +1306,10 @@ impl JdceReader {
         JdceReader {
             series_list: Vec::new(),
             series: 0,
+            plate_name: None,
+            plate_rows: 0,
+            plate_columns: 0,
+            channels: Vec::new(),
         }
     }
 
@@ -1289,6 +1322,56 @@ impl JdceReader {
     fn json_obj<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Value> {
         v.get(key)
             .ok_or_else(|| BioFormatsError::Format(format!("JDCE: missing JSON element \"{key}\"")))
+    }
+
+    fn json_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
+        v.get(key).and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))
+        })
+    }
+
+    fn json_string(v: &serde_json::Value, key: &str) -> Option<String> {
+        v.get(key)
+            .and_then(|value| value.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    fn length_to_micrometers(value: f64, unit: &str) -> f64 {
+        let unit = unit.trim().to_ascii_lowercase();
+        match unit.as_str() {
+            "nm" | "nanometer" | "nanometers" => value / 1000.0,
+            "mm" | "millimeter" | "millimeters" => value * 1000.0,
+            "cm" | "centimeter" | "centimeters" => value * 10_000.0,
+            "m" | "meter" | "meters" => value * 1_000_000.0,
+            _ => value,
+        }
+    }
+
+    fn wavelength_to_nanometers(value: f64, unit: &str) -> f64 {
+        let unit = unit.trim().to_ascii_lowercase();
+        match unit.as_str() {
+            "um" | "µm" | "micrometer" | "micrometers" => value * 1000.0,
+            "mm" | "millimeter" | "millimeters" => value * 1_000_000.0,
+            "m" | "meter" | "meters" => value * 1_000_000_000.0,
+            _ => value,
+        }
+    }
+
+    fn well_name(row: i32, col: i32) -> String {
+        let mut r = row.max(0);
+        let mut letters = String::new();
+        loop {
+            let rem = (r % 26) as u8;
+            letters.insert(0, (b'A' + rem) as char);
+            r = r / 26 - 1;
+            if r < 0 {
+                break;
+            }
+        }
+        format!("{}{:02}", letters, col.max(0) + 1)
     }
 }
 
@@ -1316,6 +1399,10 @@ impl FormatReader for JdceReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.series_list.clear();
         self.series = 0;
+        self.plate_name = None;
+        self.plate_rows = 0;
+        self.plate_columns = 0;
+        self.channels.clear();
 
         let parent_dir = path
             .parent()
@@ -1342,6 +1429,26 @@ impl FormatReader for JdceReader {
         }
 
         let acquisition = Self::json_obj(image_stack, "AutoLeadAcquisitionProtocol")?;
+        let (physical_size_x, physical_size_y) = acquisition
+            .get("ObjectiveCalibration")
+            .map(|objective| {
+                let unit = objective
+                    .get("Unit")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("um");
+                (
+                    Self::json_f64(objective, "PixelWidth")
+                        .map(|v| Self::length_to_micrometers(v, unit)),
+                    Self::json_f64(objective, "PixelHeight")
+                        .map(|v| Self::length_to_micrometers(v, unit)),
+                )
+            })
+            .unwrap_or((None, None));
+        if let Some(plate) = acquisition.get("Plate") {
+            self.plate_name = Self::json_string(plate, "Name");
+            self.plate_rows = plate.get("Rows").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            self.plate_columns = plate.get("Columns").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        }
         let plate_map = Self::json_obj(acquisition, "PlateMap")?;
         let time_schedule = Self::json_obj(plate_map, "TimeSchedule")?;
         let timepoints = Self::json_obj(time_schedule, "Times")?
@@ -1361,11 +1468,39 @@ impl FormatReader for JdceReader {
                 BioFormatsError::Format("JDCE: Wavelengths is not an array".to_string())
             })?;
         let wavelength_count = wavelengths.len().max(1) as u32;
+        self.channels = vec![JdceChannel::default(); wavelength_count as usize];
 
         // Reset Z to 1 when every channel is a "Max Intensity Projection".
         let mut single_z = true;
         let mut first_mode: Option<String> = None;
         for w in wavelengths {
+            let channel_index = w
+                .get("Index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(self.channels.len() as u64) as usize;
+            if let Some(channel) = self.channels.get_mut(channel_index) {
+                if let Some(emission) = w.get("EmissionFilter") {
+                    channel.name = Self::json_string(emission, "Name");
+                    if let Some(wavelength) = Self::json_f64(emission, "Wavelength") {
+                        let unit = emission
+                            .get("Unit")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("nm");
+                        channel.emission_wavelength =
+                            Some(Self::wavelength_to_nanometers(wavelength, unit));
+                    }
+                }
+                if let Some(excitation) = w.get("ExcitationFilter") {
+                    if let Some(wavelength) = Self::json_f64(excitation, "Wavelength") {
+                        let unit = excitation
+                            .get("Unit")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("nm");
+                        channel.excitation_wavelength =
+                            Some(Self::wavelength_to_nanometers(wavelength, unit));
+                    }
+                }
+            }
             let mode = w.get("ImagingMode").and_then(|m| m.as_str()).unwrap_or("");
             let first = first_mode.get_or_insert_with(|| mode.to_string()).clone();
             if mode != "Max Intensity Projection" || mode != first {
@@ -1411,6 +1546,11 @@ impl FormatReader for JdceReader {
         let filename_index = col("ImageFileName");
         let width_index = col("ImageSizeXPx");
         let height_index = col("ImageSizeYPx");
+        let timestamp_index = col("TimeStampSec");
+        let exposure_time_index = col("ExposureTimeMs");
+        let position_x_index = col("PositionXUm");
+        let position_y_index = col("PositionYUm");
+        let position_z_index = col("PositionZUm");
 
         let (
             well_row_index,
@@ -1486,6 +1626,7 @@ impl FormatReader for JdceReader {
                         field_count: 0,
                         files: HashMap::new(),
                         plane_sizes: HashMap::new(),
+                        plane_metadata: HashMap::new(),
                     });
                     wells.last_mut().unwrap()
                 }
@@ -1502,6 +1643,14 @@ impl FormatReader for JdceReader {
                 .and_then(|i| get(i).parse::<u32>().ok())
                 .unwrap_or(0);
             well.plane_sizes.insert((field, plane), (csv_w, csv_h));
+            let plane_metadata = JdcePlaneMetadata {
+                timestamp: timestamp_index.and_then(|i| get(i).parse::<f64>().ok()),
+                exposure_time_ms: exposure_time_index.and_then(|i| get(i).parse::<f64>().ok()),
+                position_x: position_x_index.and_then(|i| get(i).parse::<f64>().ok()),
+                position_y: position_y_index.and_then(|i| get(i).parse::<f64>().ok()),
+                position_z: position_z_index.and_then(|i| get(i).parse::<f64>().ok()),
+            };
+            well.plane_metadata.insert((field, plane), plane_metadata);
 
             if first_file {
                 let mut tiff = crate::tiff::TiffReader::new();
@@ -1538,11 +1687,17 @@ impl FormatReader for JdceReader {
 
         // Sort wells by (row, column), then expand fields into series.
         wells.sort_by_key(|w| (w.row, w.col));
-        for well in &wells {
+        let smallest_timestamp = wells
+            .iter()
+            .flat_map(|w| w.plane_metadata.values())
+            .filter_map(|p| p.timestamp)
+            .reduce(f64::min);
+        for (well_index, well) in wells.iter().enumerate() {
             for field in 0..well.field_count as u32 {
                 let mut series_size_x = size_x;
                 let mut series_size_y = size_y;
                 let mut files = vec![None; image_count as usize];
+                let mut plane_metadata = vec![None; image_count as usize];
                 for (plane, slot) in files.iter_mut().enumerate() {
                     if let Some(f) = well.files.get(&(field, plane as u32)) {
                         *slot = Some(f.clone());
@@ -1551,6 +1706,21 @@ impl FormatReader for JdceReader {
                         series_size_x = series_size_x.max(*w);
                         series_size_y = series_size_y.max(*h);
                     }
+                    if let Some(p) = well.plane_metadata.get(&(field, plane as u32)) {
+                        let mut p = p.clone();
+                        if let (Some(timestamp), Some(smallest)) = (p.timestamp, smallest_timestamp)
+                        {
+                            p.timestamp = Some(timestamp - smallest);
+                        }
+                        plane_metadata[plane] = Some(p);
+                    }
+                }
+                let mut series_metadata = HashMap::new();
+                if let Some(v) = physical_size_x {
+                    series_metadata.insert("jdce.physical_size_x".into(), MetadataValue::Float(v));
+                }
+                if let Some(v) = physical_size_y {
+                    series_metadata.insert("jdce.physical_size_y".into(), MetadataValue::Float(v));
                 }
                 let meta = ImageMetadata {
                     size_x: series_size_x,
@@ -1568,13 +1738,21 @@ impl FormatReader for JdceReader {
                     is_little_endian: little_endian,
                     resolution_count: 1,
                     thumbnail: false,
-                    series_metadata: HashMap::new(),
+                    series_metadata,
                     lookup_table: None,
                     modulo_z: None,
                     modulo_c: None,
                     modulo_t: None,
                 };
-                self.series_list.push(JdceSeries { meta, files });
+                self.series_list.push(JdceSeries {
+                    meta,
+                    files,
+                    well_row: well.row,
+                    well_col: well.col,
+                    well_index,
+                    field_index: field,
+                    plane_metadata,
+                });
             }
         }
 
@@ -1587,6 +1765,10 @@ impl FormatReader for JdceReader {
     fn close(&mut self) -> Result<()> {
         self.series_list.clear();
         self.series = 0;
+        self.plate_name = None;
+        self.plate_rows = 0;
+        self.plate_columns = 0;
+        self.channels.clear();
         Ok(())
     }
 
@@ -1612,6 +1794,99 @@ impl FormatReader for JdceReader {
             .get(self.series)
             .map(|s| &s.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if self.series_list.is_empty() {
+            return None;
+        }
+
+        let mut ome = OmeMetadata::default();
+        for (image_index, series) in self.series_list.iter().enumerate() {
+            let mut image = OmeMetadata::from_image_metadata(&series.meta)
+                .images
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            image.name = Some(format!(
+                "{}, Field #{}",
+                Self::well_name(series.well_row, series.well_col),
+                series.field_index + 1
+            ));
+            image.physical_size_x = match series.meta.series_metadata.get("jdce.physical_size_x") {
+                Some(MetadataValue::Float(v)) => Some(*v),
+                _ => None,
+            };
+            image.physical_size_y = match series.meta.series_metadata.get("jdce.physical_size_y") {
+                Some(MetadataValue::Float(v)) => Some(*v),
+                _ => None,
+            };
+            for (c, channel) in image.channels.iter_mut().enumerate() {
+                if let Some(jdce_channel) = self.channels.get(c) {
+                    channel.name = jdce_channel.name.clone();
+                    channel.emission_wavelength = jdce_channel.emission_wavelength;
+                    channel.excitation_wavelength = jdce_channel.excitation_wavelength;
+                }
+            }
+            image.planes.clear();
+            for plane in 0..series.meta.image_count {
+                let the_z = (plane / series.meta.size_c.max(1)) % series.meta.size_z.max(1);
+                let the_c = plane % series.meta.size_c.max(1);
+                let the_t = plane / (series.meta.size_c.max(1) * series.meta.size_z.max(1));
+                let p = series
+                    .plane_metadata
+                    .get(plane as usize)
+                    .and_then(|p| p.as_ref());
+                image.planes.push(OmePlane {
+                    the_z,
+                    the_c,
+                    the_t,
+                    delta_t: p.and_then(|p| p.timestamp),
+                    exposure_time: p.and_then(|p| p.exposure_time_ms),
+                    position_x: p.and_then(|p| p.position_x),
+                    position_y: p.and_then(|p| p.position_y),
+                    position_z: p.and_then(|p| p.position_z),
+                });
+            }
+            ome.images.push(image);
+
+            if ome.plates.is_empty() && self.plate_rows > 0 && self.plate_columns > 0 {
+                ome.plates.push(OmePlate {
+                    id: Some(create_lsid("Plate", &[0])),
+                    name: self.plate_name.clone(),
+                    rows: self.plate_rows,
+                    columns: self.plate_columns,
+                    wells: Vec::new(),
+                });
+            }
+            if let Some(plate) = ome.plates.get_mut(0) {
+                while plate.wells.len() <= series.well_index {
+                    let next = plate.wells.len();
+                    plate.wells.push(OmeWell {
+                        id: Some(create_lsid("Well", &[0, next])),
+                        row: 0,
+                        column: 0,
+                        well_samples: Vec::new(),
+                    });
+                }
+                let well = &mut plate.wells[series.well_index];
+                well.row = series.well_row.max(0) as u32;
+                well.column = series.well_col.max(0) as u32;
+                let sample_index = well.well_samples.len();
+                let first_plane = series.plane_metadata.iter().find_map(|p| p.as_ref());
+                well.well_samples.push(OmeWellSample {
+                    id: Some(create_lsid(
+                        "WellSample",
+                        &[0, series.well_index, sample_index],
+                    )),
+                    index: image_index as u32,
+                    image_ref: Some(image_index),
+                    position_x: first_plane.and_then(|p| p.position_x),
+                    position_y: first_plane.and_then(|p| p.position_y),
+                });
+            }
+        }
+        Some(ome)
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1666,6 +1941,117 @@ impl FormatReader for JdceReader {
         let tx = (series.meta.size_x - tw) / 2;
         let ty = (series.meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod jdce_tests {
+    use super::*;
+
+    fn jdce_test_meta(image_count: u32) -> ImageMetadata {
+        ImageMetadata {
+            size_x: 64,
+            size_y: 32,
+            size_z: 1,
+            size_c: 2,
+            size_t: image_count / 2,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count,
+            dimension_order: DimensionOrder::XYCZT,
+            is_little_endian: true,
+            ..ImageMetadata::default()
+        }
+    }
+
+    #[test]
+    fn jdce_ome_metadata_projects_java_plate_channel_and_plane_fields() {
+        let mut meta = jdce_test_meta(4);
+        meta.series_metadata
+            .insert("jdce.physical_size_x".into(), MetadataValue::Float(0.65));
+        meta.series_metadata
+            .insert("jdce.physical_size_y".into(), MetadataValue::Float(0.66));
+
+        let reader = JdceReader {
+            series_list: vec![JdceSeries {
+                meta,
+                files: vec![None; 4],
+                well_row: 0,
+                well_col: 1,
+                well_index: 0,
+                field_index: 0,
+                plane_metadata: vec![
+                    Some(JdcePlaneMetadata {
+                        timestamp: Some(0.0),
+                        exposure_time_ms: Some(25.0),
+                        position_x: Some(10.0),
+                        position_y: Some(20.0),
+                        position_z: Some(30.0),
+                    }),
+                    None,
+                    Some(JdcePlaneMetadata {
+                        timestamp: Some(5.0),
+                        exposure_time_ms: Some(30.0),
+                        position_x: Some(11.0),
+                        position_y: Some(21.0),
+                        position_z: Some(31.0),
+                    }),
+                    None,
+                ],
+            }],
+            series: 0,
+            plate_name: Some("Plate A".into()),
+            plate_rows: 8,
+            plate_columns: 12,
+            channels: vec![
+                JdceChannel {
+                    name: Some("DAPI".into()),
+                    emission_wavelength: Some(460.0),
+                    excitation_wavelength: Some(405.0),
+                },
+                JdceChannel {
+                    name: Some("FITC".into()),
+                    emission_wavelength: Some(525.0),
+                    excitation_wavelength: Some(488.0),
+                },
+            ],
+        };
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 1);
+        let image = &ome.images[0];
+        assert_eq!(image.name.as_deref(), Some("A02, Field #1"));
+        assert_eq!(image.physical_size_x, Some(0.65));
+        assert_eq!(image.physical_size_y, Some(0.66));
+        assert_eq!(image.channels.len(), 2);
+        assert_eq!(image.channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(image.channels[0].emission_wavelength, Some(460.0));
+        assert_eq!(image.channels[0].excitation_wavelength, Some(405.0));
+        assert_eq!(image.channels[1].name.as_deref(), Some("FITC"));
+        assert_eq!(image.channels[1].emission_wavelength, Some(525.0));
+        assert_eq!(image.channels[1].excitation_wavelength, Some(488.0));
+        assert_eq!(image.planes.len(), 4);
+        assert_eq!(image.planes[0].the_c, 0);
+        assert_eq!(image.planes[1].the_c, 1);
+        assert_eq!(image.planes[2].the_t, 1);
+        assert_eq!(image.planes[0].delta_t, Some(0.0));
+        assert_eq!(image.planes[0].exposure_time, Some(25.0));
+        assert_eq!(image.planes[0].position_x, Some(10.0));
+        assert_eq!(image.planes[2].delta_t, Some(5.0));
+        assert_eq!(image.planes[2].exposure_time, Some(30.0));
+
+        assert_eq!(ome.plates.len(), 1);
+        let plate = &ome.plates[0];
+        assert_eq!(plate.name.as_deref(), Some("Plate A"));
+        assert_eq!(plate.rows, 8);
+        assert_eq!(plate.columns, 12);
+        assert_eq!(plate.wells.len(), 1);
+        assert_eq!(plate.wells[0].row, 0);
+        assert_eq!(plate.wells[0].column, 1);
+        assert_eq!(plate.wells[0].well_samples.len(), 1);
+        assert_eq!(plate.wells[0].well_samples[0].image_ref, Some(0));
+        assert_eq!(plate.wells[0].well_samples[0].position_x, Some(10.0));
+        assert_eq!(plate.wells[0].well_samples[0].position_y, Some(20.0));
     }
 }
 
@@ -5546,6 +5932,9 @@ struct ObfOmePixels {
     size_c: u32,
     size_t: u32,
     dimension_order: DimensionOrder,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
 }
 
 /// True if `label` is a FLIM (SPCM-prefixed) dimension label.
@@ -5628,13 +6017,6 @@ fn obf_apply_description_metadata(
     }
 }
 
-fn obf_xml_attr(tag: &str, attr: &str) -> Option<String> {
-    let search = format!("{attr}=\"");
-    let start = tag.find(&search)? + search.len();
-    let end = tag[start..].find('"')? + start;
-    Some(tag[start..end].to_string())
-}
-
 fn obf_dimension_order(value: &str) -> Option<DimensionOrder> {
     match value {
         "XYCTZ" => Some(DimensionOrder::XYCTZ),
@@ -5647,29 +6029,57 @@ fn obf_dimension_order(value: &str) -> Option<DimensionOrder> {
     }
 }
 
-fn obf_parse_ome_pixels(ome_xml: &str) -> Vec<ObfOmePixels> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while let Some(rel) = ome_xml[pos..].find("<Pixels") {
-        let start = pos + rel;
-        let Some(end_rel) = ome_xml[start..].find('>') else {
-            break;
-        };
-        let tag = &ome_xml[start..start + end_rel + 1];
-        let parsed = || -> Option<ObfOmePixels> {
-            Some(ObfOmePixels {
-                size_x: obf_xml_attr(tag, "SizeX")?.parse().ok()?,
-                size_y: obf_xml_attr(tag, "SizeY")?.parse().ok()?,
-                size_z: obf_xml_attr(tag, "SizeZ")?.parse().ok()?,
-                size_c: obf_xml_attr(tag, "SizeC")?.parse().ok()?,
-                size_t: obf_xml_attr(tag, "SizeT")?.parse().ok()?,
-                dimension_order: obf_dimension_order(&obf_xml_attr(tag, "DimensionOrder")?)?,
-            })
-        };
-        if let Some(pixels) = parsed() {
-            out.push(pixels);
+fn obf_local_name(name: &[u8]) -> &[u8] {
+    match name.iter().position(|&b| b == b':') {
+        Some(pos) => &name[pos + 1..],
+        None => name,
+    }
+}
+
+fn obf_xml_event_attr(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+    e.attributes().flatten().find_map(|a| {
+        if obf_local_name(a.key.as_ref()).eq_ignore_ascii_case(name) {
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
+                .or_else(|| Some(String::from_utf8_lossy(&a.value).into_owned()))
+        } else {
+            None
         }
-        pos = start + end_rel + 1;
+    })
+}
+
+fn obf_pixels_from_xml_event(e: &quick_xml::events::BytesStart<'_>) -> Option<ObfOmePixels> {
+    Some(ObfOmePixels {
+        size_x: obf_xml_event_attr(e, b"SizeX")?.parse().ok()?,
+        size_y: obf_xml_event_attr(e, b"SizeY")?.parse().ok()?,
+        size_z: obf_xml_event_attr(e, b"SizeZ")?.parse().ok()?,
+        size_c: obf_xml_event_attr(e, b"SizeC")?.parse().ok()?,
+        size_t: obf_xml_event_attr(e, b"SizeT")?.parse().ok()?,
+        dimension_order: obf_dimension_order(&obf_xml_event_attr(e, b"DimensionOrder")?)?,
+        physical_size_x: obf_xml_event_attr(e, b"PhysicalSizeX").and_then(|v| v.parse().ok()),
+        physical_size_y: obf_xml_event_attr(e, b"PhysicalSizeY").and_then(|v| v.parse().ok()),
+        physical_size_z: obf_xml_event_attr(e, b"PhysicalSizeZ").and_then(|v| v.parse().ok()),
+    })
+}
+
+fn obf_parse_ome_pixels(ome_xml: &str) -> Vec<ObfOmePixels> {
+    let mut reader = quick_xml::Reader::from_str(ome_xml);
+    reader.config_mut().trim_text(true);
+    let mut out = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if obf_local_name(e.name().as_ref()).eq_ignore_ascii_case(b"Pixels") {
+                    if let Some(pixels) = obf_pixels_from_xml_event(&e) {
+                        out.push(pixels);
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
     }
     out
 }
@@ -6088,6 +6498,7 @@ pub struct ObfReader {
     metas: Vec<ImageMetadata>,
     stacks: Vec<ObfStack>,
     ome_pixels: Vec<ObfOmePixels>,
+    embedded_ome: Option<OmeMetadata>,
     series: usize,
 }
 
@@ -6098,6 +6509,7 @@ impl ObfReader {
             metas: Vec::new(),
             stacks: Vec::new(),
             ome_pixels: Vec::new(),
+            embedded_ome: None,
             series: 0,
         }
     }
@@ -6152,6 +6564,13 @@ impl ObfReader {
             let value = Self::read_obf_string(input)?;
             if key == "ome_xml" {
                 self.ome_pixels = obf_parse_ome_pixels(&value);
+                let mut embedded = OmeMetadata::from_ome_xml(&value);
+                for (image, pixels) in embedded.images.iter_mut().zip(self.ome_pixels.iter()) {
+                    image.physical_size_x = pixels.physical_size_x;
+                    image.physical_size_y = pixels.physical_size_y;
+                    image.physical_size_z = pixels.physical_size_z;
+                }
+                self.embedded_ome = Some(embedded);
                 break;
             }
         }
@@ -6575,6 +6994,7 @@ impl FormatReader for ObfReader {
         self.metas.clear();
         self.stacks.clear();
         self.ome_pixels.clear();
+        self.embedded_ome = None;
         self.series = 0;
 
         let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
@@ -6628,6 +7048,7 @@ impl FormatReader for ObfReader {
         self.metas.clear();
         self.stacks.clear();
         self.ome_pixels.clear();
+        self.embedded_ome = None;
         self.series = 0;
         Ok(())
     }
@@ -6685,6 +7106,32 @@ impl FormatReader for ObfReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if let Some(ome) = &self.embedded_ome {
+            return Some(ome.clone());
+        }
+        if self.metas.is_empty() {
+            return None;
+        }
+        let mut ome = OmeMetadata::default();
+        for meta in &self.metas {
+            let one = OmeMetadata::from_image_metadata(meta);
+            if let Some(mut image) = one.images.into_iter().next() {
+                if image.name.is_none() {
+                    image.name = meta
+                        .series_metadata
+                        .get("Name")
+                        .and_then(|value| match value {
+                            MetadataValue::String(name) => Some(name.trim().to_string()),
+                            _ => None,
+                        });
+                }
+                ome.images.push(image);
+            }
+        }
+        Some(ome)
     }
 }
 
@@ -6897,6 +7344,41 @@ mod pds_tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn obf_real_fixture_uses_embedded_ome_for_all_series() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/obf/test-v6-short-write.obf");
+        if !path.exists() {
+            return;
+        }
+
+        let mut reader = ObfReader::new();
+        reader.set_id(&path).expect("OBF set_id");
+        assert_eq!(reader.series_count(), 7);
+        for series in 0..reader.series_count() {
+            reader.set_series(series).unwrap();
+            let meta = reader.metadata();
+            assert_eq!(meta.size_c, 1, "series {series}");
+            assert_eq!(meta.size_t, 18, "series {series}");
+            assert_eq!(
+                meta.dimension_order,
+                DimensionOrder::XYZTC,
+                "series {series}"
+            );
+        }
+
+        let ome = reader.ome_metadata().expect("OBF embedded OME metadata");
+        assert_eq!(ome.images.len(), 7);
+        assert_eq!(
+            ome.images[0].name.as_deref(),
+            Some("Abberior STAR RED.Confocal")
+        );
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].physical_size_x, Some(2.001747353e-7));
+        assert_eq!(ome.images[0].physical_size_y, Some(2.000149434e-7));
+        assert_eq!(ome.images[0].physical_size_z, Some(5e-7));
     }
 
     #[test]

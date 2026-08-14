@@ -213,6 +213,19 @@ public class BfParityOracle {
         }
         sb.append("],\"summary\":");
         sb.append(omeSummaryJson(ome));
+        sb.append(",\"instruments\":[");
+        int instrumentCount = intValRaw(() -> ome.getInstrumentCount());
+        for (int i = 0; i < instrumentCount; i++) {
+            final int ii = i;
+            if (i > 0) sb.append(",");
+            sb.append("{\"objectiveCount\":").append(intValRaw(() -> ome.getObjectiveCount(ii)));
+            sb.append(",\"detectorCount\":").append(intValRaw(() -> ome.getDetectorCount(ii)));
+            sb.append(",\"lightSourceCount\":").append(intValRaw(() -> ome.getLightSourceCount(ii)));
+            sb.append(",\"filterCount\":").append(intValRaw(() -> ome.getFilterCount(ii)));
+            sb.append(",\"dichroicCount\":").append(intValRaw(() -> ome.getDichroicCount(ii)));
+            sb.append("}");
+        }
+        sb.append("]");
         sb.append("}");
         return sb.toString();
     }

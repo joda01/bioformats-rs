@@ -3268,6 +3268,20 @@ impl NikonReader {
             .map(|(ifd, _)| Some(ifd))
     }
 
+    fn physical_size_from_ifd(ifd: &crate::tiff::ifd::Ifd, tag: u16) -> Option<f64> {
+        use crate::tiff::ifd::tag as tiff_tag;
+
+        let scale = match ifd.get_u16(tiff_tag::RESOLUTION_UNIT).unwrap_or(2) {
+            2 => 25_400.0,
+            3 => 10_000.0,
+            _ => return None,
+        };
+        ifd.get(tag)
+            .and_then(|value| value.as_vec_f64().first().copied())
+            .filter(|value| *value > 0.0)
+            .map(|value| scale / value)
+    }
+
     /// Port of `adjustForWhiteBalance`: scale a sample by the per-channel
     /// white-balance coefficient when three coefficients are available.
     fn adjust_for_white_balance(&self, val: i16, index: usize) -> i16 {
@@ -3483,6 +3497,22 @@ impl FormatReader for NikonReader {
         if first.samples_per_pixel() == 1 {
             meta.is_interleaved = true;
         }
+        if let Some(value) =
+            Self::physical_size_from_ifd(first, crate::tiff::ifd::tag::X_RESOLUTION)
+        {
+            meta.series_metadata
+                .insert("PhysicalSizeX".into(), MetadataValue::Float(value));
+        } else {
+            meta.series_metadata.remove("PhysicalSizeX");
+        }
+        if let Some(value) =
+            Self::physical_size_from_ifd(first, crate::tiff::ifd::tag::Y_RESOLUTION)
+        {
+            meta.series_metadata
+                .insert("PhysicalSizeY".into(), MetadataValue::Float(value));
+        } else {
+            meta.series_metadata.remove("PhysicalSizeY");
+        }
         meta.series_metadata
             .insert("format".into(), MetadataValue::String("Nikon NEF".into()));
 
@@ -3580,6 +3610,20 @@ impl FormatReader for NikonReader {
             )));
         }
         Ok(())
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeX") {
+                image.physical_size_x = Some(*value);
+            }
+            if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeY") {
+                image.physical_size_y = Some(*value);
+            }
+        }
+        Some(ome)
     }
 }
 
@@ -4454,6 +4498,7 @@ mod tests {
         pixels: &[u8],
         make_nikon: bool,
         eps: bool,
+        physical_um: Option<f64>,
     ) -> Vec<u8> {
         use crate::tiff::ifd::tag;
         // Layout: header(8) | IFD | "Nikon\0" make string | strip data.
@@ -4462,15 +4507,20 @@ mod tests {
         data.extend_from_slice(b"II");
         push_u16_le(&mut data, 42);
 
-        let make_str: &[u8] = b"Nikon\0"; // 6 bytes
-                                          // 8 fixed entries + optional Make + optional EPS-standard.
-        let entry_count: u16 = 8 + make_nikon as u16 + eps as u16;
+        let make_str: &[u8] = b"Nikon\0";
+        // 8 fixed entries + optional Make/EPS + optional X/Y resolution/unit.
+        let entry_count: u16 =
+            8 + make_nikon as u16 + eps as u16 + physical_um.is_some() as u16 * 3;
         let ifd_offset = 8u32;
         let ifd_bytes = 2 + entry_count as u32 * 12 + 4;
         let make_offset = ifd_offset + ifd_bytes;
         // The Make string only occupies file space when present.
         let make_bytes = if make_nikon { make_str.len() as u32 } else { 0 };
-        let strip_offset = make_offset + make_bytes;
+        let x_resolution_offset = make_offset + make_bytes;
+        let y_resolution_offset = x_resolution_offset + 8;
+        let resolution_bytes = if physical_um.is_some() { 16 } else { 0 };
+        let strip_offset = make_offset + make_bytes + resolution_bytes;
+        let resolution = physical_um.map(|size| (25_400.0 / size).round() as u32);
 
         entries.push((tag::IMAGE_WIDTH, 4, 1, width));
         entries.push((tag::IMAGE_LENGTH, 4, 1, height));
@@ -4480,6 +4530,11 @@ mod tests {
         entries.push((tag::STRIP_OFFSETS, 4, 1, strip_offset));
         entries.push((tag::SAMPLES_PER_PIXEL, 3, 1, 3));
         entries.push((tag::STRIP_BYTE_COUNTS, 4, 1, pixels.len() as u32));
+        if physical_um.is_some() {
+            entries.push((tag::X_RESOLUTION, 5, 1, x_resolution_offset));
+            entries.push((tag::Y_RESOLUTION, 5, 1, y_resolution_offset));
+            entries.push((tag::RESOLUTION_UNIT, 3, 1, 2));
+        }
         if make_nikon {
             entries.push((NikonReader::MAKE, 2, make_str.len() as u32, make_offset));
         }
@@ -4498,6 +4553,12 @@ mod tests {
         if make_nikon {
             data.extend_from_slice(make_str);
         }
+        if let Some(resolution) = resolution {
+            data.extend_from_slice(&resolution.to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&resolution.to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes());
+        }
         data.extend_from_slice(pixels);
         data
     }
@@ -4509,14 +4570,14 @@ mod tests {
         assert!(reader.is_this_type_by_name(Path::new("photo.nef")));
         assert!(!reader.is_this_type_by_name(Path::new("photo.tif")));
 
-        let eps_tiff = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], false, true);
+        let eps_tiff = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], false, true, None);
         assert!(reader.is_this_type_by_bytes(&eps_tiff));
 
-        let make_tiff = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], true, false);
+        let make_tiff = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], true, false, None);
         assert!(reader.is_this_type_by_bytes(&make_tiff));
 
         // Plain TIFF with neither marker is rejected.
-        let plain = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], false, false);
+        let plain = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], false, false, None);
         assert!(!reader.is_this_type_by_bytes(&plain));
     }
 
@@ -4527,7 +4588,7 @@ mod tests {
         let h = 2u32;
         // 2x2 interleaved RGB, distinct values per channel/pixel.
         let pixels: Vec<u8> = (0..(w * h * 3) as u8).collect();
-        let nef = synthetic_nef(w, h, &pixels, true, false);
+        let nef = synthetic_nef(w, h, &pixels, true, false, None);
         let path = root.join("frame.nef");
         fs::write(&path, &nef).unwrap();
 
@@ -4551,6 +4612,32 @@ mod tests {
         // TIFF strip decode. Bio-Formats exposes chunky RGB as channel-planar.
         let plane = reader.open_bytes(0).unwrap();
         assert_eq!(plane, vec![0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nikon_projects_resolution_tags_to_ome_physical_size() {
+        let root = temp_dir("nikon_physical_size");
+        let pixels = vec![0, 1, 2];
+        let nef = synthetic_nef(1, 1, &pixels, true, false, Some(84.66666666666667));
+        let path = root.join("frame.nef");
+        fs::write(&path, &nef).unwrap();
+
+        let mut reader = NikonReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+
+        assert!(
+            (ome.images[0].physical_size_x.unwrap() - 84.66666666666667).abs() < 1e-9,
+            "unexpected PhysicalSizeX: {:?}",
+            ome.images[0].physical_size_x
+        );
+        assert!(
+            (ome.images[0].physical_size_y.unwrap() - 84.66666666666667).abs() < 1e-9,
+            "unexpected PhysicalSizeY: {:?}",
+            ome.images[0].physical_size_y
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

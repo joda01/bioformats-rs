@@ -820,6 +820,15 @@ impl FormatReader for FileStitcher {
         let meta = self.metas.get(self.current_series)?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let image = ome.images.get_mut(0)?;
+        if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeX") {
+            image.physical_size_x = Some(*value);
+        }
+        if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeY") {
+            image.physical_size_y = Some(*value);
+        }
+        if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeZ") {
+            image.physical_size_z = Some(*value);
+        }
         for (idx, channel) in image.channels.iter_mut().enumerate() {
             if let Some(MetadataValue::String(name)) =
                 meta.series_metadata.get(&format!("Channel {idx} Name"))
@@ -3307,6 +3316,10 @@ mod tests {
             "Channel 1 Name".into(),
             MetadataValue::String("FITC".into()),
         );
+        meta.series_metadata
+            .insert("PhysicalSizeX".into(), MetadataValue::Float(0.25));
+        meta.series_metadata
+            .insert("PhysicalSizeY".into(), MetadataValue::Float(0.5));
         let stitcher = FileStitcher {
             files: Vec::new(),
             metas: vec![meta],
@@ -3321,6 +3334,8 @@ mod tests {
         let ome = stitcher.ome_metadata().unwrap();
         assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
         assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
+        assert_eq!(ome.images[0].physical_size_x, Some(0.25));
+        assert_eq!(ome.images[0].physical_size_y, Some(0.5));
     }
 
     #[test]

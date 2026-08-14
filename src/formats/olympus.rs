@@ -160,6 +160,32 @@ fn sanitize_value(value: &str) -> String {
     f
 }
 
+fn parse_fv1000_double(value: &str) -> Option<f64> {
+    let value = sanitize_value(value);
+    let trimmed = value.trim();
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return Some(v);
+    }
+    if let Some((whole, rest)) = trimmed.split_once(',') {
+        if whole == "0" && rest.ends_with(".0") && rest.len() > 2 {
+            let decimal = format!("0.{}", &rest[..rest.len() - 2]);
+            if let Ok(v) = decimal.parse::<f64>() {
+                return Some(v);
+            }
+        }
+    }
+    if trimmed.contains(',') {
+        if let Ok(v) = trimmed.replace(',', "").parse::<f64>() {
+            return Some(v);
+        }
+        let decimal = trimmed.replace(',', ".");
+        if decimal.matches('.').count() == 1 {
+            return decimal.parse::<f64>().ok();
+        }
+    }
+    None
+}
+
 /// Java removeGST.
 fn remove_gst(s: &str) -> String {
     if let Some(gst) = s.find("GST") {
@@ -337,6 +363,8 @@ pub struct Fv1000Reader {
     /// Physical pixel sizes (µm) from WidthConvertValue / HeightConvertValue.
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
+    time_increment: Option<f64>,
     /// Active channels in acquisition order.
     channels: Vec<OifChannel>,
     /// Java FV1000Reader.lutNames: per-channel LUT logical paths.
@@ -355,6 +383,8 @@ impl Fv1000Reader {
             planes: Vec::new(),
             physical_size_x: None,
             physical_size_y: None,
+            physical_size_z: None,
+            time_increment: None,
             channels: Vec::new(),
             lut_names: Vec::new(),
             luts: Vec::new(),
@@ -485,6 +515,7 @@ impl Fv1000Reader {
         // ---- Axis N Parameters Common: AxisCode / MaxSize ----
         let mut code = vec![String::new(); NUM_DIMENSIONS];
         let mut size = vec![1u32; NUM_DIMENSIONS];
+        let mut pixel_size = vec![None; NUM_DIMENSIONS];
         for i in 0..NUM_DIMENSIONS {
             if let Some(common) = f.table(&format!("Axis {i} Parameters Common")) {
                 code[i] = common.get("AxisCode").cloned().unwrap_or_default();
@@ -492,6 +523,16 @@ impl Fv1000Reader {
                     .get("MaxSize")
                     .and_then(|s| s.trim().parse::<u32>().ok())
                     .unwrap_or(1);
+                let end = common
+                    .get("EndPosition")
+                    .and_then(|s| parse_fv1000_double(s));
+                let start = common
+                    .get("StartPosition")
+                    .and_then(|s| parse_fv1000_double(s));
+                pixel_size[i] = match (start, end) {
+                    (Some(start), Some(end)) => Some(end - start),
+                    _ => None,
+                };
             }
         }
 
@@ -510,11 +551,11 @@ impl Fv1000Reader {
             }
             self.physical_size_x = rip
                 .get("WidthConvertValue")
-                .and_then(|s| sanitize_value(s).trim().parse::<f64>().ok())
+                .and_then(|s| parse_fv1000_double(s))
                 .filter(|v| *v > 0.0);
             self.physical_size_y = rip
                 .get("HeightConvertValue")
-                .and_then(|s| sanitize_value(s).trim().parse::<f64>().ok())
+                .and_then(|s| parse_fv1000_double(s))
                 .filter(|v| *v > 0.0);
         }
 
@@ -659,7 +700,7 @@ impl Fv1000Reader {
                         }
                         plane.position_z = axis
                             .get("AbsPositionValue")
-                            .and_then(|s| s.trim().parse::<f64>().ok());
+                            .and_then(|s| parse_fv1000_double(s));
                     }
                     4 => {
                         if add_axis && !dimension_order.contains('T') {
@@ -667,7 +708,7 @@ impl Fv1000Reader {
                         }
                         plane.delta_t = axis
                             .get("AbsPositionValue")
-                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .and_then(|s| parse_fv1000_double(s))
                             .map(|v| v / 1000.0);
                     }
                     _ => {}
@@ -715,6 +756,14 @@ impl Fv1000Reader {
                         size_y = ss;
                     } else {
                         size_z = ss;
+                        if ss > 1 {
+                            if let Some(span) = pixel_size[i] {
+                                let z = ((span / (ss - 1) as f64) / 1000.0).abs();
+                                if z.is_finite() && z > 0.0 {
+                                    self.physical_size_z = Some(z);
+                                }
+                            }
+                        }
                     }
                 }
                 "T" => {
@@ -722,6 +771,14 @@ impl Fv1000Reader {
                         size_y = ss;
                     } else {
                         size_t = ss;
+                        if ss > 1 {
+                            if let Some(span) = pixel_size[i] {
+                                let t = ((span / (ss - 1) as f64) / 1000.0).abs();
+                                if t.is_finite() && t > 0.0 {
+                                    self.time_increment = Some(t);
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -1292,6 +1349,8 @@ impl FormatReader for Fv1000Reader {
         self.planes.clear();
         self.physical_size_x = None;
         self.physical_size_y = None;
+        self.physical_size_z = None;
+        self.time_increment = None;
         self.channels.clear();
         self.lut_names.clear();
         self.luts.clear();
@@ -1381,13 +1440,15 @@ impl FormatReader for Fv1000Reader {
         if let Some(y) = self.physical_size_y {
             img.physical_size_y = Some(y);
         }
-        // Z size defaults to 1.0 µm (FV1000Reader ~1022-1036).
-        img.physical_size_z = Some(1.0);
+        // Z/T sizes default to 1.0 when absent, infinite, or singleton
+        // (FV1000Reader ~1022-1036).
+        img.physical_size_z = Some(self.physical_size_z.unwrap_or(1.0));
         // Java FV1000Reader defaults the time increment to 1 second when the
         // acquisition metadata is absent or sizeT == 1.
-        img.time_increment = Some(1.0);
+        let time_increment = self.time_increment.unwrap_or(1.0);
+        img.time_increment = Some(time_increment);
         if img.planes.is_empty() {
-            img.planes = fv1000_default_ome_planes(meta, 1.0);
+            img.planes = fv1000_default_ome_planes(meta, time_increment);
         }
         img.instrument_ref = Some(0);
         img.objective_ref = Some(0);
@@ -2312,6 +2373,12 @@ mod tests {
     #[test]
     fn sanitize_value_strips_quotes_and_normalises_separators() {
         assert_eq!(sanitize_value("\"a\\b/c\""), "a/b/c");
+    }
+
+    #[test]
+    fn parse_fv1000_double_accepts_java_legacy_decimal_text() {
+        assert_eq!(parse_fv1000_double("0,207.0"), Some(0.207));
+        assert_eq!(parse_fv1000_double("211,761.0"), Some(211761.0));
     }
 
     #[test]

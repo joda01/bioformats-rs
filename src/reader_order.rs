@@ -215,6 +215,7 @@ fn java_reader_for_class(class: &str) -> Option<Box<dyn FormatReader>> {
             Box::new(crate::formats::hcs2::CellVoyagerReader::new())
         }
         "loci.formats.in.ColumbusReader" => Box::new(crate::formats::hcs2::ColumbusReader::new()),
+        "loci.formats.in.CV7000Reader" => Box::new(crate::formats::extended::YokogawaReader::new()),
         "loci.formats.in.BioRadReader" => Box::new(crate::formats::biorad::BioRadReader::new()),
         "loci.formats.in.FV1000Reader" => Box::new(crate::formats::olympus::Fv1000Reader::new()),
         "loci.formats.in.ZeissZVIReader" => {

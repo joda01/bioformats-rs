@@ -154,6 +154,33 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         return Ok(r);
     }
 
+    // CV7000 `.wpi` files are XML entry points with no useful magic bytes.
+    // Java accepts them by suffix via CV7000Reader before later XML/HCS readers.
+    if has_wpi_extension(path) {
+        let mut r = boxed_reader(crate::formats::extended::YokogawaReader::new());
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
+    // Java LeicaReader accepts `.raw` companions by suffix when a sibling `.lei`
+    // can resolve the dataset. Route that before generic raw readers so direct
+    // companion entry points behave like opening the LEI file.
+    if has_raw_extension(path) && has_lei_sibling(path) {
+        let mut r = boxed_reader(crate::formats::leica::LeicaReader::new());
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
+    // Java OperettaReader accepts Index.idx.xml, Index.ref.xml, and Index.xml
+    // by filename before broad XML readers such as Leica TCS. Dispatch those
+    // entry points directly so a valid Operetta index is not claimed by the
+    // generic XML suffix fallback first.
+    if has_operetta_index_name(path) {
+        let mut r = boxed_reader(crate::formats::hcs2::OperettaReader::new());
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
     let header = peek_header(path, DETECTION_HEADER_BYTES)?;
     let mut best_error = None;
 
@@ -389,6 +416,25 @@ fn has_zvi_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn has_wpi_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("wpi"))
+        .unwrap_or(false)
+}
+
+fn has_operetta_index_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "index.idx.xml" | "index.ref.xml" | "index.xml"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn terminal_magic_allows_fake_fallback(err: &BioFormatsError) -> bool {
     matches!(
         err,
@@ -481,6 +527,10 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
         return Ok(boxed_reader(
             crate::formats::zeiss_zvi::ZeissZviReader::new(),
         ));
+    }
+
+    if has_wpi_extension(path) {
+        return Ok(boxed_reader(crate::formats::extended::YokogawaReader::new()));
     }
 
     if path
@@ -966,6 +1016,13 @@ fn has_lei_sibling(path: &Path) -> bool {
             None => return false,
         }
     }
+}
+
+fn has_raw_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("raw"))
+        .unwrap_or(false)
 }
 
 fn tiff_image_description(path: &Path) -> Option<String> {
@@ -2157,6 +2214,27 @@ mod tests {
     }
 
     #[test]
+    fn wpi_dispatches_to_cv7000_reader() {
+        let path = temp_path("minimal.wpi");
+        std::fs::write(
+            &path,
+            r#"<bts:WellPlate bts:Name="Plate" bts:Rows="1" bts:Columns="1"/>"#,
+        )
+        .unwrap();
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("incomplete CV7000 WPI unexpectedly opened"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("missing MeasurementData.mlf")),
+            "unexpected error: {err:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn generic_tif_hcs_wrapper_dispatch_uses_metadata_signature() {
         let path = temp_path("simplepci_metadata.tif");
         write_minimal_tiff_with_description(&path, "Created by Hamamatsu Inc.\n");
@@ -2308,6 +2386,24 @@ mod tests {
             Some(MetadataValue::String(value)) if value == "Leica LEI"
         ));
         assert_eq!(reader.open_bytes(0).unwrap(), vec![41, 42]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leica_lei_raw_companion_dispatches_before_generic_raw_like_java() {
+        let dir = temp_dir("leica_lei_raw_companion");
+        let raw = dir.join("sample_001.raw");
+        let lei = dir.join("sample.lei");
+        std::fs::write(&raw, [11u8, 12, 13, 14]).unwrap();
+        std::fs::write(&lei, minimal_lei("sample_001.raw", 2, 2)).unwrap();
+
+        let mut reader = ImageReader::open(&raw).expect("LEI raw companion dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("format"),
+            Some(MetadataValue::String(value)) if value == "Leica LEI"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11, 12, 13, 14]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

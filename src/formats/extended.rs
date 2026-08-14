@@ -2833,6 +2833,40 @@ fn imspector_msr_scan_blocks(
     Ok(())
 }
 
+fn imspector_msr_java_integer_metadata_equals(
+    bytes: &[u8],
+    start: usize,
+    key: &[u8],
+    expected: i32,
+) -> bool {
+    let mut offset = start;
+    while bytes.len().saturating_sub(offset) >= key.len() + 8 {
+        let Some(rel) = bytes[offset..]
+            .windows(key.len())
+            .position(|window| window == key)
+        else {
+            return false;
+        };
+        offset += rel + key.len();
+        if bytes.len().saturating_sub(offset) < 8 {
+            return false;
+        }
+        let value_type = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        let value_len = u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]);
+        let value = i32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]);
+        if matches!(value_type, 0 | 1 | 4 | 5 | 6 | 8 | 9) && value_len == 8 {
+            return value == expected;
+        }
+        offset += 1;
+    }
+    false
+}
+
 fn imspector_msr_tile_count(metadata: &str) -> u32 {
     let mut tile_x = 1u32;
     let mut tile_y = 1u32;
@@ -2979,8 +3013,21 @@ fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<Vec<ImspectorStack>>
         &mut blocks,
     )?;
 
+    let z_resolution_is_one = imspector_msr_java_integer_metadata_equals(
+        bytes,
+        payload_end.saturating_add(2).min(bytes.len()),
+        b"xyz-Table Z Resolution",
+        1,
+    );
+
     let mut logical_size_z = size_z;
     let mut logical_size_t = size_t;
+    if z_resolution_is_one && logical_size_z > 1 {
+        logical_size_t = logical_size_t
+            .checked_mul(logical_size_z)
+            .ok_or_else(|| BioFormatsError::Format("Imspector MSR size T overflows".into()))?;
+        logical_size_z = 1;
+    }
     let mut logical_size_c = if unique_pmts.len() <= blocks.len() {
         unique_pmts.len().max(1) as u32
     } else {
@@ -4016,9 +4063,24 @@ impl FormatReader for ImspectorReader {
             Ok(header) => Some(header),
             Err(obf_error) => {
                 if let Some(stacks) = parse_imspector_msr_stack(&bytes)? {
+                    let image_name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.to_string());
                     self.path = Some(path.to_path_buf());
                     self.bytes = bytes;
-                    self.stacks = stacks;
+                    self.stacks = stacks
+                        .into_iter()
+                        .map(|mut stack| {
+                            if let Some(image_name) = &image_name {
+                                stack.meta.series_metadata.insert(
+                                    "image_name".into(),
+                                    MetadataValue::String(image_name.clone()),
+                                );
+                            }
+                            stack
+                        })
+                        .collect();
                     return Ok(());
                 }
                 return Err(obf_error);
@@ -4433,6 +4495,18 @@ mod imspector_tests {
         }
         bytes.extend_from_slice(pixels);
         bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+
+    fn append_java_msr_integer_metadata(bytes: &mut Vec<u8>, tag: &str, key: &str, value: i32) {
+        bytes.extend_from_slice(&0x8003u16.to_le_bytes());
+        bytes.push(tag.len() as u8);
+        bytes.extend_from_slice(tag.as_bytes());
+        bytes.extend_from_slice(&2i32.to_le_bytes());
+        bytes.push(key.len() as u8);
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&5u16.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn native_v1_stack_with_step_tables() -> Vec<u8> {
@@ -5000,6 +5074,11 @@ mod imspector_tests {
             Some(MetadataValue::String(value)) => assert_eq!(value, "PMT1"),
             other => panic!("unexpected PMT metadata: {other:?}"),
         }
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images[0].name.as_deref(),
+            Some("bioformats_imspector_java_msr_first_stack.msr")
+        );
 
         assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0, 2, 0, 3, 0, 4, 0]);
         assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 0, 6, 0, 7, 0, 8, 0]);
@@ -5007,6 +5086,32 @@ mod imspector_tests {
             reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(),
             vec![6, 0, 8, 0]
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_java_msr_xyz_table_z_resolution_collapses_z_into_t_like_java() {
+        let path = temp_path("java_msr_z_resolution.msr");
+        let mut bytes = java_msr_stack(
+            2,
+            2,
+            2,
+            1,
+            &[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0],
+        );
+        append_java_msr_integer_metadata(&mut bytes, "xyz-Table ZRes", "xyz-Table Z Resolution", 1);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_t, 2);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0, 2, 0, 3, 0, 4, 0]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 0, 6, 0, 7, 0, 8, 0]);
 
         let _ = std::fs::remove_file(path);
     }
@@ -7220,7 +7325,6 @@ impl FormatReader for HamamatsuVmsReader {
                 ome.instruments.extend(image_ome.instruments);
             }
             ome.images.extend(image_ome.images);
-            let _ = ome.add_original_metadata_annotations(meta, image_index);
         }
 
         Some(ome)
@@ -10648,9 +10752,16 @@ impl FormatReader for CellomicsReader {
     }
 
     fn ome_metadata(&self) -> Option<OmeMetadata> {
-        let meta = self.metas.get(self.current_series)?;
-        let mut ome = OmeMetadata::from_image_metadata(meta);
-        if let Some(image) = ome.images.get_mut(0) {
+        if self.metas.is_empty() {
+            return None;
+        }
+
+        let mut ome = OmeMetadata::default();
+        for (series_index, meta) in self.metas.iter().enumerate() {
+            let one = OmeMetadata::from_image_metadata(meta);
+            let Some(mut image) = one.images.into_iter().next() else {
+                continue;
+            };
             // Java initFile names every image "Well %s, Field #%02d" using
             // FormatTools.getWellName(row, col) (zero-padded column) and the
             // field index. We fall back to the plate/well metadata only when the
@@ -10707,46 +10818,106 @@ impl FormatReader for CellomicsReader {
                 )
                 .and_then(cellomics_ome_color);
             }
-        }
-
-        // Port of the OME Plate/Well/WellSample population from Java initFile.
-        // The plate is global in Java; here each series exposes the plate frame
-        // (id, name, snapped rows/columns) plus the single well/well-sample that
-        // this series populates, with the well sample referencing image 0.
-        if let (Some(real_rows), Some(real_cols)) = (
-            cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.real_rows"),
-            cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.real_columns"),
-        ) {
-            let mut plate = OmePlate {
-                id: Some(create_lsid("Plate", &[0])),
-                name: cellomics_metadata_string(&meta.series_metadata, "cellomics.plate.name"),
-                rows: real_rows.max(0) as u32,
-                columns: real_cols.max(0) as u32,
-                wells: Vec::new(),
-            };
-            if let (Some(well_index), Some(well_sample_index)) = (
-                cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.well_index"),
-                cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.well_sample_index"),
-            ) {
-                let cols = plate.columns.max(1);
-                let well = well_index.max(0) as u32;
-                plate.wells.push(OmeWell {
-                    id: Some(create_lsid("Well", &[0, well as usize])),
-                    row: well / cols,
-                    column: well % cols,
-                    well_samples: vec![OmeWellSample {
-                        id: Some(create_lsid("WellSample", &[0, well as usize, 0])),
-                        index: well_sample_index.max(0) as u32,
-                        image_ref: Some(0),
-                        position_x: None,
-                        position_y: None,
-                    }],
+            for plane_index in 0..meta.image_count {
+                let (the_z, the_c, the_t) = match meta.dimension_order {
+                    DimensionOrder::XYZCT => (
+                        plane_index % meta.size_z.max(1),
+                        (plane_index / meta.size_z.max(1)) % meta.size_c.max(1),
+                        plane_index / (meta.size_z.max(1) * meta.size_c.max(1)),
+                    ),
+                    DimensionOrder::XYZTC => (
+                        plane_index % meta.size_z.max(1),
+                        plane_index / (meta.size_z.max(1) * meta.size_t.max(1)),
+                        (plane_index / meta.size_z.max(1)) % meta.size_t.max(1),
+                    ),
+                    DimensionOrder::XYCZT => (
+                        (plane_index / meta.size_c.max(1)) % meta.size_z.max(1),
+                        plane_index % meta.size_c.max(1),
+                        plane_index / (meta.size_c.max(1) * meta.size_z.max(1)),
+                    ),
+                    DimensionOrder::XYCTZ => (
+                        plane_index / (meta.size_c.max(1) * meta.size_t.max(1)),
+                        plane_index % meta.size_c.max(1),
+                        (plane_index / meta.size_c.max(1)) % meta.size_t.max(1),
+                    ),
+                    DimensionOrder::XYTZC => (
+                        (plane_index / meta.size_t.max(1)) % meta.size_z.max(1),
+                        plane_index / (meta.size_t.max(1) * meta.size_z.max(1)),
+                        plane_index % meta.size_t.max(1),
+                    ),
+                    DimensionOrder::XYTCZ => (
+                        plane_index / (meta.size_t.max(1) * meta.size_c.max(1)),
+                        (plane_index / meta.size_t.max(1)) % meta.size_c.max(1),
+                        plane_index % meta.size_t.max(1),
+                    ),
+                };
+                image.planes.push(OmePlane {
+                    the_z,
+                    the_c,
+                    the_t,
+                    delta_t: None,
+                    exposure_time: None,
+                    position_x: None,
+                    position_y: None,
+                    position_z: None,
                 });
             }
-            ome.plates.push(plate);
-        }
+            ome.images.push(image);
 
-        let _ = ome.add_original_metadata_annotations(meta, 0);
+            if series_index == 0 {
+                if let (Some(real_rows), Some(real_cols)) = (
+                    cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.real_rows"),
+                    cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.real_columns"),
+                ) {
+                    let rows = real_rows.max(0) as u32;
+                    let cols = real_cols.max(0) as u32;
+                    let mut wells = Vec::with_capacity((rows as usize) * (cols as usize));
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            let well_index = (row * cols + col) as usize;
+                            wells.push(OmeWell {
+                                id: Some(create_lsid("Well", &[0, well_index])),
+                                row,
+                                column: col,
+                                well_samples: Vec::new(),
+                            });
+                        }
+                    }
+                    ome.plates.push(OmePlate {
+                        id: Some(create_lsid("Plate", &[0])),
+                        name: cellomics_metadata_string(
+                            &meta.series_metadata,
+                            "cellomics.plate.name",
+                        ),
+                        rows,
+                        columns: cols,
+                        wells,
+                    });
+                }
+            }
+
+            if let Some(plate) = ome.plates.get_mut(0) {
+                if let (Some(well_index), Some(well_sample_index)) = (
+                    cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.well_index"),
+                    cellomics_metadata_i64(
+                        &meta.series_metadata,
+                        "cellomics.plate.well_sample_index",
+                    ),
+                ) {
+                    let well = well_index.max(0) as usize;
+                    if let Some(ome_well) = plate.wells.get_mut(well) {
+                        let sample_index = ome_well.well_samples.len();
+                        ome_well.well_samples.push(OmeWellSample {
+                            id: Some(create_lsid("WellSample", &[0, well, sample_index])),
+                            index: well_sample_index.max(0) as u32,
+                            image_ref: Some(series_index),
+                            position_x: None,
+                            position_y: None,
+                        });
+                    }
+                }
+            }
+        }
         Some(ome)
     }
 

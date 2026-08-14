@@ -228,6 +228,16 @@ pub struct OmeROI {
 /// A single shape within an ROI.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum OmeShape {
+    Label {
+        x: f64,
+        y: f64,
+        text: Option<String>,
+        font_size: Option<f64>,
+        stroke_width: Option<f64>,
+        the_z: Option<u32>,
+        the_t: Option<u32>,
+        the_c: Option<u32>,
+    },
     Rectangle {
         x: f64,
         y: f64,
@@ -964,6 +974,29 @@ fn write_ome_shape_xml(xml: &mut String, shape: &OmeShape) {
     use std::fmt::Write;
 
     match shape {
+        OmeShape::Label {
+            x,
+            y,
+            text,
+            font_size,
+            stroke_width,
+            the_z,
+            the_t,
+            the_c,
+        } => {
+            let _ = write!(xml, r#"<Label X="{x}" Y="{y}""#);
+            if let Some(text) = text {
+                let _ = write!(xml, r#" Text="{}""#, xml_escape(text));
+            }
+            if let Some(font_size) = font_size {
+                let _ = write!(xml, r#" FontSize="{font_size}""#);
+            }
+            if let Some(stroke_width) = stroke_width {
+                let _ = write!(xml, r#" StrokeWidth="{stroke_width}""#);
+            }
+            write_shape_indices(xml, *the_z, *the_t, *the_c);
+            xml.push_str("/>");
+        }
         OmeShape::Rectangle {
             x,
             y,
@@ -1968,6 +2001,29 @@ fn parse_rois(xml: &str) -> Vec<OmeROI> {
             };
 
             let mut shapes = Vec::new();
+
+            // Label
+            for sp in all_tag_positions(union_xml, "Label") {
+                let t = start_tag_at(union_xml, sp);
+                let x = xml_attr(t, "X").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let y = xml_attr(t, "Y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let text = xml_attr(t, "Text");
+                let font_size = xml_attr(t, "FontSize").and_then(|s| s.parse().ok());
+                let stroke_width = xml_attr(t, "StrokeWidth").and_then(|s| s.parse().ok());
+                let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+                let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+                let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+                shapes.push(OmeShape::Label {
+                    x,
+                    y,
+                    text,
+                    font_size,
+                    stroke_width,
+                    the_z,
+                    the_t,
+                    the_c,
+                });
+            }
 
             // Rectangle
             for sp in all_tag_positions(union_xml, "Rectangle") {

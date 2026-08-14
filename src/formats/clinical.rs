@@ -834,6 +834,14 @@ impl FormatReader for Ecat7Reader {
         let meta = self.meta.as_ref()?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
         let image = &mut ome.images[0];
+        if image.name.is_none() {
+            image.name = self
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
+        }
         image.physical_size_x = self.physical_size_x;
         image.physical_size_y = self.physical_size_y;
         image.physical_size_z = self.physical_size_z;

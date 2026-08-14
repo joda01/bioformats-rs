@@ -237,6 +237,7 @@ impl CellWorxReader {
                             field_count,
                             channels,
                             info.n_timepoints,
+                            info.z_steps,
                             info.do_channels,
                         ),
                     };
@@ -471,7 +472,8 @@ fn htd_bool(value: &str) -> bool {
 /// is delimited from the value by the literal `",` sequence (matching the Java
 /// `line.indexOf("\",")` logic).
 fn parse_htd(path: &Path) -> Result<HtdInfo> {
-    let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let content = String::from_utf8_lossy(&bytes);
 
     let mut x_wells = 0usize;
     let mut y_wells = 0usize;
@@ -645,30 +647,33 @@ fn build_well_files(
     field_count: usize,
     channels: usize,
     n_timepoints: u32,
+    z_steps: u32,
     do_channels: bool,
 ) -> Vec<PathBuf> {
     let base = format!("{}{}", plate, well_name(row, col));
     let mut files: Vec<PathBuf> =
-        Vec::with_capacity(field_count * channels * n_timepoints as usize);
+        Vec::with_capacity(field_count * channels * n_timepoints as usize * z_steps as usize);
     for field in 0..field_count {
         for channel in 0..channels {
             for _t in 0..n_timepoints {
-                let mut name = base.clone();
-                if field_count > 1 {
-                    name.push_str(&format!("_s{}", field + 1));
-                }
-                if do_channels || channels > 1 {
-                    name.push_str(&format!("_w{}", channel + 1));
-                }
-                if n_timepoints > 1 {
-                    // Matches the upstream quirk: the timepoint *count* is used.
-                    name.push_str(&format!("_t{}", n_timepoints));
-                }
-                let lower = PathBuf::from(format!("{}.tif", name));
-                if lower.exists() {
-                    files.push(lower);
-                } else {
-                    files.push(PathBuf::from(format!("{}.TIF", name)));
+                for _z in 0..z_steps {
+                    let mut name = base.clone();
+                    if field_count > 1 {
+                        name.push_str(&format!("_s{}", field + 1));
+                    }
+                    if do_channels || channels > 1 {
+                        name.push_str(&format!("_w{}", channel + 1));
+                    }
+                    if n_timepoints > 1 {
+                        // Matches the upstream quirk: the timepoint *count* is used.
+                        name.push_str(&format!("_t{}", n_timepoints));
+                    }
+                    let lower = PathBuf::from(format!("{}.tif", name));
+                    if lower.exists() {
+                        files.push(lower);
+                    } else {
+                        files.push(PathBuf::from(format!("{}.TIF", name)));
+                    }
                 }
             }
         }
@@ -1129,15 +1134,9 @@ fn add_cellworx_template_metadata(ome: &mut OmeMetadata, template: Option<&OmeMe
     let template_image = template.and_then(|template| template.images.first());
     for image in &mut ome.images {
         if let Some(template) = template_image {
-            if image.physical_size_x.is_none() {
-                image.physical_size_x = template.physical_size_x;
-            }
-            if image.physical_size_y.is_none() {
-                image.physical_size_y = template.physical_size_y;
-            }
-            if image.physical_size_z.is_none() {
-                image.physical_size_z = template.physical_size_z;
-            }
+            image.physical_size_x = template.physical_size_x;
+            image.physical_size_y = template.physical_size_y;
+            image.physical_size_z = template.physical_size_z;
             if image.time_increment.is_none() {
                 image.time_increment = template.time_increment;
             }

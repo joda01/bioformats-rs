@@ -96,6 +96,21 @@ fn json_float(json: &str, key: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
+fn json_bool(json: &str, key: &str) -> Option<bool> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(':').map(str::trim_start).unwrap_or(rest);
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn positive_u32_from_json(json: &str, key: &str) -> Result<u32> {
     let value = json_int(json, key)
         .ok_or_else(|| BioFormatsError::Format(format!("MicroManager: missing {key}")))?;
@@ -409,6 +424,7 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     // Dimension order from "SlicesFirst": false -> XYCZT, else XYZCT (Java default).
     let dimension_order = match json_str(&json, "SlicesFirst")
         .or_else(|| json_int(&json, "SlicesFirst").map(|v| v.to_string()))
+        .or_else(|| json_bool(&json, "SlicesFirst").map(|v| v.to_string()))
     {
         Some(ref v) if v.eq_ignore_ascii_case("false") || v == "0" => DimensionOrder::XYCZT,
         _ => DimensionOrder::XYZCT,

@@ -5790,6 +5790,7 @@ fn dcimg_v1_reads_header_beyond_initial_probe() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+
 #[test]
 fn dcimg_v1_ignores_bytes_per_row_field_like_java() {
     let dir = isolated_tmp_dir("dcimg_v1_ignored_row_stride");

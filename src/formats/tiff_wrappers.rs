@@ -9211,7 +9211,8 @@ fn metaxpress_htd_bool(value: &str) -> bool {
 /// is delimited from the value by the literal `",` sequence (matching Java's
 /// `CellWorxReader.parseHTD` / `line.indexOf("\",")`).
 fn metaxpress_parse_htd(path: &std::path::Path) -> Result<MetaxpressHtdInfo> {
-    let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let content = String::from_utf8_lossy(&bytes);
 
     let mut x_wells = 0usize;
     let mut y_wells = 0usize;

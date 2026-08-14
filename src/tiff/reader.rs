@@ -3191,10 +3191,22 @@ fn is_interleaved_rgb(info: &IfdInfo) -> bool {
 }
 
 fn tiff_physical_size(ifd: Option<&Ifd>, tag: u16) -> Option<f64> {
-    ifd.and_then(|ifd| ifd.get(tag))
+    let ifd = ifd?;
+    let resolution = ifd
+        .get(tag)
         .and_then(|value| value.as_vec_f64().first().copied())
-        .filter(|value| *value > 0.0)
-        .map(|value| 1.0 / value)
+        .filter(|value| *value > 0.0)?;
+    // Java IFD.getX/YResolution() converts TIFF ResolutionUnit to microns per
+    // pixel before BaseTiffReader passes it to FormatTools.getPhysicalSizeX/Y.
+    match ifd
+        .get(crate::tiff::ifd::tag::RESOLUTION_UNIT)
+        .and_then(|value| value.as_u16())
+        .unwrap_or(2)
+    {
+        2 => Some(25_400.0 / resolution),
+        3 => Some(10_000.0 / resolution),
+        _ => Some(resolution),
+    }
 }
 
 fn should_planarize_chunky_rgb(info: &IfdInfo, _path: Option<&Path>) -> bool {

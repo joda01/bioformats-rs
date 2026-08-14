@@ -140,11 +140,9 @@ fn xlef_lms_metadata_only_series_projects_safe_scalars_to_ome() {
     assert_float(&meta.series_metadata, "xlef.lms.physical_size_x", 2.0);
     assert_float(&meta.series_metadata, "xlef.lms.physical_size_y", 2.0);
     assert_float(&meta.series_metadata, "xlef.lms.physical_size_z", 3.0);
-    assert_float(
-        &meta.series_metadata,
-        "xlef.lms.channel.0.excitation_wavelength",
-        405.0,
-    );
+    assert!(!meta
+        .series_metadata
+        .contains_key("xlef.lms.channel.0.excitation_wavelength"));
     assert_float(
         &meta.series_metadata,
         "xlef.lms.channel.1.emission_wavelength",
@@ -227,11 +225,11 @@ fn xlef_lms_metadata_only_series_projects_safe_scalars_to_ome() {
     assert_eq!(image.physical_size_z, Some(3.0));
     assert_eq!(image.channels.len(), 2);
     assert_eq!(image.channels[0].name.as_deref(), Some("DAPI"));
-    assert_eq!(image.channels[0].excitation_wavelength, Some(405.0));
+    assert_eq!(image.channels[0].excitation_wavelength, None);
     assert_eq!(image.channels[0].emission_wavelength, Some(460.0));
     assert_eq!(image.channels[0].color, Some(862362111));
     assert_eq!(image.channels[1].name.as_deref(), Some("FITC"));
-    assert_eq!(image.channels[1].excitation_wavelength, Some(488.0));
+    assert_eq!(image.channels[1].excitation_wavelength, None);
     assert_eq!(image.channels[1].emission_wavelength, Some(525.0));
     assert_eq!(image.channels[1].color, Some(16909311));
     assert_eq!(image.instrument_ref, Some(0));
