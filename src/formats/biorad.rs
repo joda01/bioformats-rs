@@ -1168,7 +1168,7 @@ impl FormatReader for BioRadReader {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel: (bpp * 8) as u8,
+            bits_per_pixel: (bpp * 8) as u16,
             image_count,
             dimension_order: DimensionOrder::XYCTZ,
             is_rgb: false,

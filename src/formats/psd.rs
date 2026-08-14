@@ -1349,7 +1349,7 @@ fn finish_psd(
         size_c: output_channels as u32,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: depth as u8,
+        bits_per_pixel: (depth) as u16,
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,

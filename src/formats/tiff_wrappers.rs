@@ -663,7 +663,7 @@ impl NdpiReader {
             meta.size_y = ifd.image_length().unwrap_or(0);
             meta.size_c = if is_rgb { spp as u32 } else { 1 };
             meta.is_rgb = is_rgb;
-            meta.bits_per_pixel = bps as u8;
+            meta.bits_per_pixel = (bps) as u16;
             let sample_format = ifd
                 .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
                 .unwrap_or(1);
@@ -701,7 +701,7 @@ impl NdpiReader {
             meta.size_c = 1;
             meta.is_rgb = false;
             meta.pixel_type = crate::common::pixel_type::PixelType::Uint16;
-            meta.bits_per_pixel = bits as u8;
+            meta.bits_per_pixel = (bits) as u16;
             meta.image_count = meta.size_z.max(1) * meta.size_t.max(1);
         }
     }
@@ -1357,7 +1357,7 @@ impl LeicaScnReader {
                     img.size_c.max(1)
                 };
                 meta.is_rgb = is_rgb;
-                meta.bits_per_pixel = bps as u8;
+                meta.bits_per_pixel = (bps) as u16;
                 let sample_format = ifd
                     .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
                     .unwrap_or(1);
@@ -3793,7 +3793,7 @@ impl Default for Nd2Handler {
             core_size_c: 0,
             core_series_count: 1,
             image_metadata_lv_exists: false,
-            core_bits_per_pixel: None,
+            core_bits_per_pixel: (None).into(),
             // CoreMetadata's default dimensionOrder ("XYCZT" in Bio-Formats).
             core_dimension_order: "XYCZT".to_string(),
             ts: Vec::new(),
@@ -8859,7 +8859,7 @@ impl MolecularDevicesTiffReader {
                 size_c: channels as u32,
                 size_t: info.n_timepoints,
                 pixel_type,
-                bits_per_pixel: bits,
+                bits_per_pixel: (bits).into(),
                 image_count,
                 dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
                 is_rgb: false,

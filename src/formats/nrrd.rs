@@ -930,7 +930,7 @@ impl FormatReader for NrrdReader {
             size_c: axes.size_c,
             size_t: axes.size_t,
             pixel_type: hdr.pixel_type,
-            bits_per_pixel: bps,
+            bits_per_pixel: (bps).into(),
             image_count,
             // NRRDReader.java fixes dimensionOrder = "XYCZT" (initFile line 277).
             dimension_order: DimensionOrder::XYCZT,

@@ -790,9 +790,9 @@ impl Fv1000Reader {
             }
         };
         let mut bits = if valid_bits > 0 {
-            valid_bits as u8
+            valid_bits as u16
         } else {
-            (image_depth * 8).max(8) as u8
+            (image_depth * 8).max(8) as u16
         };
         let mut is_little_endian = true;
         let mut is_rgb = false;
@@ -857,7 +857,7 @@ impl Fv1000Reader {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel: bits,
+            bits_per_pixel: (bits).into(),
             image_count: image_count as u32,
             dimension_order,
             is_rgb,
@@ -1082,7 +1082,7 @@ fn find_oif_for_entry(path: &Path) -> Option<PathBuf> {
 }
 
 /// Probe a TIFF held in memory: returns (pixel_type, little_endian, rgb, bits).
-fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8)> {
+fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u16)> {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("bioformats_oib_probe_{}.tif", rand_suffix(bytes)));
     std::fs::write(&tmp, bytes).ok()?;
@@ -1101,7 +1101,7 @@ fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8)> {
 }
 
 /// Probe a TIFF for dimensions only: (pt, le, rgb, bits, width, height).
-fn probe_tiff_dims(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8, u32, u32)> {
+fn probe_tiff_dims(bytes: &[u8]) -> Option<(PixelType, bool, bool, u16, u32, u32)> {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("bioformats_oib_dims_{}.tif", rand_suffix(bytes)));
     std::fs::write(&tmp, bytes).ok()?;

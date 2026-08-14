@@ -420,7 +420,7 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<Option<String>>)> {
         size_c: 1,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: bits,
+        bits_per_pixel: (bits).into(),
         image_count,
         dimension_order: DimensionOrder::XYZTC,
         is_rgb: false,

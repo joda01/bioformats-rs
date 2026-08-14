@@ -1018,7 +1018,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: (bytes_per_sample * 8) as u8,
+        bits_per_pixel: (bytes_per_sample * 8) as u16,
         image_count: image_count0,
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: false,

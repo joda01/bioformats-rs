@@ -576,7 +576,7 @@ impl FlexReader {
                 let mut meta = s.metadata.clone();
                 if let Some(pt) = self.scaled_pixel_type {
                     meta.pixel_type = pt;
-                    meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
+                    meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u16;
                 }
                 meta
             })
@@ -1306,7 +1306,7 @@ fn apply_flex_core_overrides(
     base_meta.is_interleaved = false;
     if let Some(pt) = scaled_pixel_type {
         base_meta.pixel_type = pt;
-        base_meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
+        base_meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u16;
     }
     base_meta
 }

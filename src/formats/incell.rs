@@ -920,7 +920,7 @@ impl InCellReader {
         let mut size_x = m.image_width;
         let mut size_y = m.image_height;
         let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
+        let mut bits = 16u16;
         let mut little_endian = true;
         let mut is_tiff_first = false;
 
@@ -1042,7 +1042,7 @@ impl InCellReader {
                 size_c: series_size_c,
                 size_t: series_size_t,
                 pixel_type,
-                bits_per_pixel: bits,
+                bits_per_pixel: (bits).into(),
                 image_count: size_z * series_size_c * series_size_t,
                 dimension_order: DimensionOrder::XYZCT,
                 is_rgb: false,

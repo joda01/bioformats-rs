@@ -570,7 +570,7 @@ impl FormatReader for MrcReader {
             size_c: spp,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
             image_count: nz,
             dimension_order: if is_rgb {
                 DimensionOrder::XYCZT

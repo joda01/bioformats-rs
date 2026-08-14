@@ -2150,7 +2150,7 @@ impl FormatReader for ZeissCziReader {
             size_c: parsed.c_count,
             size_t: parsed.t_count,
             pixel_type: parsed.pixel_type,
-            bits_per_pixel: bps,
+            bits_per_pixel: (bps).into(),
             image_count,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb,

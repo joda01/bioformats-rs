@@ -1440,7 +1440,7 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel: (bpp_bytes * 8) as u8,
+            bits_per_pixel: (bpp_bytes * 8) as u16,
             image_count,
             dimension_order,
             is_rgb,

@@ -227,7 +227,7 @@ impl FormatReader for ImagicReader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count: num_images as u32,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,

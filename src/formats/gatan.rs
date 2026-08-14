@@ -1430,7 +1430,7 @@ impl FormatReader for GatanReader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: (bytes_per_pixel * 8) as u8,
+            bits_per_pixel: (bytes_per_pixel * 8) as u16,
             image_count,
             // GatanReader hard-codes dimensionOrder = "XYZTC" (GatanReader.java:253).
             dimension_order: DimensionOrder::XYZTC,
@@ -2182,7 +2182,7 @@ impl FormatReader for GatanDm2Reader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: (bps * 8) as u8,
+            bits_per_pixel: (bps * 8) as u16,
             image_count: 1,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,

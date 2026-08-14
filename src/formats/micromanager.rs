@@ -396,10 +396,13 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     let pixel_type_str = json_str(summary, "PixelType").unwrap_or_else(|| "GRAY16".into());
     let mut pixel_type = pixel_type_from_str(&pixel_type_str)?;
     let mut bits = match json_int(summary, "BitDepth") {
-        Some(value) => u8::try_from(value).ok().filter(|&v| v > 0).ok_or_else(|| {
-            BioFormatsError::Format(format!("MicroManager: invalid BitDepth {value}"))
-        })?,
-        None => pixel_type.bytes_per_sample() as u8 * 8,
+        Some(value) => u16::try_from(value)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("MicroManager: invalid BitDepth {value}"))
+            })?,
+        None => pixel_type.bytes_per_sample() as u16 * 8,
     };
     let is_rgb_summary = pixel_type_str.starts_with("RGB");
 
@@ -566,7 +569,7 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         size_c: channels,
         size_t: frames,
         pixel_type,
-        bits_per_pixel: bits,
+        bits_per_pixel: (bits).into(),
         image_count,
         dimension_order,
         is_rgb: is_rgb_summary,

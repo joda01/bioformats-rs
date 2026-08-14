@@ -1531,7 +1531,7 @@ fn ics_writer_byte_order_header_matches_java_little_endian_rules() {
         meta.size_y = 1;
         meta.size_c = 1;
         meta.pixel_type = pixel_type;
-        meta.bits_per_pixel = bits;
+        meta.bits_per_pixel = bits as u16;
         meta.image_count = 1;
         meta.is_little_endian = true;
 

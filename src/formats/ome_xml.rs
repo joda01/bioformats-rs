@@ -907,7 +907,7 @@ fn parse_ome_xml_series_with_base(
                 size_c: exposed_c,
                 size_t,
                 pixel_type,
-                bits_per_pixel: bpp,
+                bits_per_pixel: (bpp).into(),
                 image_count,
                 dimension_order: dim_order,
                 is_rgb,

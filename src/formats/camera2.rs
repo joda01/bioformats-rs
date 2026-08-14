@@ -1024,7 +1024,7 @@ impl FormatReader for BioRadGelReader {
             size_x,
             size_y,
             pixel_type,
-            bits_per_pixel: bits,
+            bits_per_pixel: (bits).into(),
             dimension_order: DimensionOrder::XYCZT,
             is_little_endian: little_endian,
             series_metadata,
@@ -2478,7 +2478,7 @@ impl FormatReader for IpwReader {
             size_c,
             size_t,
             pixel_type: first_meta.pixel_type,
-            bits_per_pixel: first_meta.bits_per_pixel,
+            bits_per_pixel: (first_meta.bits_per_pixel).into(),
             image_count,
             dimension_order: if first_meta.is_rgb {
                 DimensionOrder::XYCZT
@@ -3472,7 +3472,7 @@ impl FormatReader for NikonReader {
         } else {
             PixelType::Uint16
         };
-        meta.bits_per_pixel = bits_per_sample as u8;
+        meta.bits_per_pixel = (bits_per_sample) as u16;
         meta.size_z = 1;
         meta.size_c = if is_rgb { samples as u32 } else { 1 };
         meta.is_rgb = is_rgb;

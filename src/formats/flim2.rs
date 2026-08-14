@@ -433,7 +433,7 @@ fn build_flowsight_metadata(
         } else {
             PixelType::Uint16
         },
-        bits_per_pixel: bits as u8,
+        bits_per_pixel: (bits) as u16,
         is_little_endian: little_endian,
         ..ImageMetadata::default()
     };
@@ -1059,7 +1059,7 @@ fn parse_synthetic_raw(path: &Path, spec: SyntheticRawSpec) -> Result<SyntheticR
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel,
+        bits_per_pixel: bits_per_pixel.into(),
         image_count,
         is_little_endian: true,
         ..ImageMetadata::default()
@@ -4872,7 +4872,7 @@ impl SlideBook7Reader {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel,
+            bits_per_pixel: bits_per_pixel.into(),
             image_count,
             // Java sets ms.littleEndian = true unconditionally in initFile.
             is_little_endian: true,
@@ -6522,7 +6522,7 @@ fn parse_ivision_native(path: &Path, metadata_level: MetadataLevel) -> Result<Iv
         size_c,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
         image_count,
         is_little_endian: false,
         ..ImageMetadata::default()
@@ -7591,7 +7591,7 @@ impl FormatReader for AfiReader {
                 if i > 0 {
                     if let Some(pixel_type) = pyramid_pixel_type {
                         m.pixel_type = pixel_type;
-                        m.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
+                        m.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u16;
                     }
                 }
             }
@@ -8661,7 +8661,7 @@ impl XlefReader {
         meta.size_t = lms.size_t.max(1);
         meta.dimension_order = lms.dimension_order;
         meta.pixel_type = lms.pixel_type;
-        meta.bits_per_pixel = lms.bits_per_pixel;
+        meta.bits_per_pixel = (lms.bits_per_pixel).into();
         meta.is_rgb = lms.is_rgb;
         meta.is_interleaved = lms.is_interleaved;
         meta.is_indexed = lms.is_indexed;
@@ -9772,9 +9772,9 @@ fn xlef_maybe_convert_jpeg_mono(
     let logical_bytes = logical_meta.pixel_type.bytes_per_sample();
     if logical_bytes > 1 {
         let target_bits = xlef_lms_metadata_int(logical_meta, "xlef.lms.channel.0.resolution")
-            .and_then(|bits| u8::try_from(bits).ok())
+            .and_then(|bits| u16::try_from(bits).ok())
             .unwrap_or(logical_meta.bits_per_pixel)
-            .clamp(8, 16);
+            .clamp(8, 16) as u8;
         let mut out = vec![0u8; plane * 2];
         xlef_transform_bytes_8_to_16(red, &mut out, target_bits)?;
         Ok(out)
@@ -9891,7 +9891,7 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
             }
             xlef_lms_insert_channel_metadata(&mut meta, channel_index, attrs);
             if let Some(bits) = attrs.get("Resolution").and_then(|v| v.parse::<u8>().ok()) {
-                meta.bits_per_pixel = bits;
+                meta.bits_per_pixel = (bits).into();
                 meta.pixel_type = if bits <= 8 {
                     PixelType::Uint8
                 } else if bits <= 16 {
@@ -10164,7 +10164,7 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
         };
         if let Some(pixel_type) = xlef_lms_pixel_type_from_sample_bytes(sample_bytes) {
             meta.pixel_type = pixel_type;
-            meta.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
+            meta.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u16;
         }
     }
     if meta.size_x == 0 || meta.size_y == 0 {
@@ -12243,7 +12243,7 @@ fn oir_apply_xml(xml_blocks: &[String], meta: &mut ImageMetadata, channel_ids: &
                 let (pt, bits) = oir_pixel_type_from_bytes(depth);
                 meta.pixel_type = pt;
                 if meta.bits_per_pixel == 0 || meta.bits_per_pixel == 8 {
-                    meta.bits_per_pixel = bits;
+                    meta.bits_per_pixel = (bits).into();
                 }
             }
             if let Some(mut bits) =
@@ -12252,7 +12252,7 @@ fn oir_apply_xml(xml_blocks: &[String], meta: &mut ImageMetadata, channel_ids: &
                 if rgb {
                     bits /= 3;
                 }
-                meta.bits_per_pixel = bits as u8;
+                meta.bits_per_pixel = (bits) as u16;
             }
         }
 
@@ -14041,7 +14041,7 @@ impl EtsVolume {
             size_c: level.size_c.max(1),
             size_t: level.size_t.max(1),
             pixel_type: pt,
-            bits_per_pixel: (pt.bytes_per_sample() * 8) as u8,
+            bits_per_pixel: (pt.bytes_per_sample() * 8) as u16,
             image_count: image_count.max(1),
             dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
             is_rgb: channels > 1,
@@ -16482,7 +16482,7 @@ impl FormatReader for VolocityClippingReader {
             size_t: 1,
             image_count: size_z,
             pixel_type,
-            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
             dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
             is_little_endian: little_endian,
             ..ImageMetadata::default()

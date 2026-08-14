@@ -485,7 +485,7 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: sig,
+        bits_per_pixel: (sig).into(),
         image_count,
         dimension_order,
         is_rgb,

@@ -1322,7 +1322,7 @@ impl FormatReader for SpeReader {
             size_c: 1,
             size_t: numframes,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count: numframes,
             dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,

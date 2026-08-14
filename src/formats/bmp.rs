@@ -433,7 +433,7 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         size_c,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: bpp.max(8) as u8,
+        bits_per_pixel: (bpp.max(8)) as u16,
         image_count: 1,
         dimension_order: DimensionOrder::XYCTZ,
         is_rgb,

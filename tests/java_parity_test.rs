@@ -26,17 +26,27 @@
 //! By default the test FAILS on CORE and OME metadata divergence. Pixel-CRC
 //! parity is printed as a scored report. Set `BIOFORMATS_RS_JAVA_PARITY_STRICT=1`
 //! to also fail on pixel divergence.
+//!
+//! For slow real-data iteration, set `BIOFORMATS_RS_JAVA_PARITY_CACHE_DIR` to a
+//! writable directory. Java oracle JSON is reused when the file fingerprint,
+//! oracle arguments, Bio-Formats jar, and oracle source are unchanged. Set
+//! `BIOFORMATS_RS_JAVA_PARITY_REFRESH_CACHE=1` to force a refresh.
+//! Set `BIOFORMATS_RS_JAVA_PARITY_MAX_PLANES=N` to reduce pixel depth for quick
+//! iteration; the default is 64 planes per series.
 
 use bioformats::common::metadata::{DimensionOrder, MetadataValue};
 use bioformats::common::ome_metadata::OmeAnnotation;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::ImageReader;
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::UNIX_EPOCH;
 
 /// Files to compare (relative to ./testdata). Mirrors real_data_test coverage.
 const FILES: &[&str] = &[
@@ -105,6 +115,14 @@ const FILES: &[&str] = &[
 /// series has fewer planes than this, all of them are compared.
 const MAX_PLANES: u32 = 64;
 const REGION: u32 = 256;
+
+fn max_planes() -> u32 {
+    env::var("BIOFORMATS_RS_JAVA_PARITY_MAX_PLANES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MAX_PLANES)
+}
 
 fn testdata(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -237,6 +255,50 @@ fn oracle_classpath() -> Option<&'static str> {
     .as_deref()
 }
 
+fn file_fingerprint(path: &Path) -> String {
+    let Ok(meta) = fs::metadata(path) else {
+        return "missing".to_string();
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos()))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{}:{modified}", meta.len())
+}
+
+fn oracle_source_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("parity/BfParityOracle.java")
+}
+
+fn oracle_cache_path(path: &Path, max_planes: u32, full_plane: bool) -> Option<PathBuf> {
+    let cache_dir = env::var_os("BIOFORMATS_RS_JAVA_PARITY_CACHE_DIR").map(PathBuf::from)?;
+    let mut key = String::new();
+    key.push_str("bf-java-parity-v2\n");
+    key.push_str(&format!("path={}\n", path.display()));
+    key.push_str(&format!("file={}\n", file_fingerprint(path)));
+    key.push_str(&format!("max_planes={max_planes}\n"));
+    key.push_str(&format!("region={REGION}\n"));
+    key.push_str(&format!("full_plane={full_plane}\n"));
+    let jar = jar_path();
+    key.push_str(&format!(
+        "jar={}:{}\n",
+        jar.display(),
+        file_fingerprint(&jar)
+    ));
+    let oracle = oracle_source_path();
+    key.push_str(&format!(
+        "oracle={}:{}\n",
+        oracle.display(),
+        file_fingerprint(&oracle)
+    ));
+
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    Some(cache_dir.join(format!("{:016x}.json", hasher.finish())))
+}
+
 fn run_oracle(cp: &str, path: &Path, max_planes: u32, full_plane: bool) -> Option<Value> {
     let out = Command::new("java")
         .arg("-cp")
@@ -251,6 +313,46 @@ fn run_oracle(cp: &str, path: &Path, max_planes: u32, full_plane: bool) -> Optio
     let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout.lines().find(|l| l.trim_start().starts_with('{'))?;
     serde_json::from_str(line).ok()
+}
+
+fn run_oracle_cached(cp: &str, path: &Path, max_planes: u32, full_plane: bool) -> Option<Value> {
+    let Some(cache_path) = oracle_cache_path(path, max_planes, full_plane) else {
+        return run_oracle(cp, path, max_planes, full_plane);
+    };
+    let refresh = env::var("BIOFORMATS_RS_JAVA_PARITY_REFRESH_CACHE").as_deref() == Ok("1");
+    if !refresh {
+        if let Ok(text) = fs::read_to_string(&cache_path) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                eprintln!("parity oracle cache hit: {}", cache_path.display());
+                return Some(value);
+            }
+        }
+    }
+
+    let value = run_oracle(cp, path, max_planes, full_plane)?;
+    if let Some(parent) = cache_path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!(
+                "parity oracle cache disabled for {}: mkdir failed: {err}",
+                cache_path.display()
+            );
+            return Some(value);
+        }
+    }
+    match serde_json::to_string(&value) {
+        Ok(json) => {
+            if let Err(err) = fs::write(&cache_path, json) {
+                eprintln!(
+                    "parity oracle cache write failed for {}: {err}",
+                    cache_path.display()
+                );
+            } else {
+                eprintln!("parity oracle cache write: {}", cache_path.display());
+            }
+        }
+        Err(err) => eprintln!("parity oracle cache serialization failed: {err}"),
+    }
+    Some(value)
 }
 
 /// Files where the oracle must NOT do whole-plane `openBytes` reads: those reads
@@ -270,14 +372,14 @@ fn oracle_no_full_plane(rel: &str) -> bool {
 /// chunk decode per region, so deep coverage takes ~an hour for one file; a tiny
 /// cap still exercises core+OME parity and the ⚠ Java-bug planes (s31/s32) while
 /// keeping runtime sane. Everything else uses the full MAX_PLANES depth.
-fn oracle_max_planes(rel: &str) -> u32 {
+fn oracle_max_planes(rel: &str, configured_max_planes: u32) -> u32 {
     let lower = rel.to_ascii_lowercase();
     if lower.contains("bdv/") {
-        2
+        configured_max_planes.min(2)
     } else if lower.contains("cv7000/") {
-        2
+        configured_max_planes.min(2)
     } else {
-        MAX_PLANES
+        configured_max_planes
     }
 }
 
@@ -469,6 +571,7 @@ fn java_parity() {
     }
     let strict = env::var("BIOFORMATS_RS_JAVA_PARITY_STRICT").as_deref() == Ok("1");
     let no_pixels = env::var("BIOFORMATS_RS_JAVA_PARITY_NO_PIXELS").as_deref() == Ok("1");
+    let configured_max_planes = max_planes();
     // Optional comma-separated substring filter, so a worker can verify just its
     // own files quickly: BIOFORMATS_RS_JAVA_PARITY_FILES="lsm/,nd2/"
     let filter = env::var("BIOFORMATS_RS_JAVA_PARITY_FILES").unwrap_or_default();
@@ -514,12 +617,13 @@ fn java_parity() {
             eprintln!("skip (absent): {rel}");
             continue;
         }
-        let Some(j) = run_oracle(
-            cp,
-            &path,
-            oracle_max_planes(rel),
-            !oracle_no_full_plane(rel),
-        ) else {
+        let oracle_planes = if no_pixels {
+            0
+        } else {
+            oracle_max_planes(rel, configured_max_planes)
+        };
+        let oracle_full_plane = !no_pixels && !oracle_no_full_plane(rel);
+        let Some(j) = run_oracle_cached(cp, &path, oracle_planes, oracle_full_plane) else {
             eprintln!("skip (oracle no output): {rel}");
             continue;
         };

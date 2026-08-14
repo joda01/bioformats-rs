@@ -109,7 +109,7 @@ pub struct ImageMetadata {
     pub size_c: u32,
     pub size_t: u32,
     pub pixel_type: PixelType,
-    pub bits_per_pixel: u8,
+    pub bits_per_pixel: u16,
     pub image_count: u32,
     pub dimension_order: DimensionOrder,
     pub is_rgb: bool,

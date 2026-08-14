@@ -618,7 +618,7 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
             size_c,
             size_t: this_size_t,
             pixel_type,
-            bits_per_pixel: bits as u8,
+            bits_per_pixel: (bits) as u16,
             image_count,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb: false,

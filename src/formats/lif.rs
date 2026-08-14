@@ -2346,7 +2346,7 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
     m.size_z = size_z;
     m.size_t = size_t;
     m.pixel_type = pixel_type;
-    m.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
+    m.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u16;
     m.is_rgb = is_rgb;
     m.is_interleaved = is_rgb
         && !is_decodable_planar_rgb(

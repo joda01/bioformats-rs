@@ -161,6 +161,22 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         return Err(err);
     }
 
+    // Old Nikon ND2 files are JP2-backed and begin with normal JPEG2000 magic,
+    // but Java ND2Reader has an explicit old-JP2 branch for `.nd2` paths. Give
+    // ND2Reader the suffix-dispatched first chance before the generic
+    // JPEG2000Reader magic probe can claim the file as a plain JP2 pyramid.
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nd2"))
+    {
+        let mut r = boxed_reader(crate::formats::nd2::Nd2Reader::new());
+        match r.set_id(path) {
+            Ok(()) => return Ok(r),
+            Err(err) => remember_set_id_error(&mut best_error, err),
+        }
+    }
+
     // `.ims` is shared by two unrelated formats: the HDF5-based Imaris
     // (`imaris::ImarisHdfReader`) and the older Bitplane Imaris 3 TIFF variant
     // (`flim2::ImarisTiffReader`). The TIFF wrapper accepts `.ims` purely by

@@ -941,7 +941,7 @@ impl BdvReader {
                     size_c,
                     size_t,
                     pixel_type,
-                    bits_per_pixel: (bytes_per_sample * 8) as u8,
+                    bits_per_pixel: (bytes_per_sample * 8) as u16,
                     image_count,
                     dimension_order: DimensionOrder::XYZTC,
                     is_rgb: false,

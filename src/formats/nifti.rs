@@ -318,7 +318,7 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: hdr.bitpix.max(0) as u8,
+        bits_per_pixel: (hdr.bitpix.max(0)) as u16,
         image_count,
         // Java NiftiReader uses dimensionOrder "XYCZT".
         dimension_order: DimensionOrder::XYCZT,

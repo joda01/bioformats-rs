@@ -132,7 +132,7 @@ impl OmeZarrReader {
             size_c: level.size_c,
             size_t: level.size_t,
             pixel_type: level.pixel_type,
-            bits_per_pixel: bps * 8,
+            bits_per_pixel: (bps * 8).into(),
             image_count: level.size_z * level.size_c * level.size_t,
             dimension_order: level.dimension_order,
             is_rgb: false,

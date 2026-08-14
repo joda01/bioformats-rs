@@ -1194,7 +1194,7 @@ impl FormatReader for DeltavisionReader {
             size_c: channels,
             size_t,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count,
             dimension_order: dv_dimension_order(image_sequence),
             is_rgb,

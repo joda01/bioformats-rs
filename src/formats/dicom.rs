@@ -1738,7 +1738,7 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
         size_c,
         size_t: 1,
         pixel_type,
-        bits_per_pixel,
+        bits_per_pixel: bits_per_pixel.into(),
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,

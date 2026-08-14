@@ -493,7 +493,7 @@ impl FormatReader for VisitechReader {
                 size_c,
                 size_t: vmeta.size_t,
                 pixel_type: vmeta.pixel_type,
-                bits_per_pixel: (vmeta.pixel_type.bytes_per_sample() * 8) as u8,
+                bits_per_pixel: (vmeta.pixel_type.bytes_per_sample() * 8) as u16,
                 image_count,
                 // Java sets dimensionOrder = "XYZTC".
                 dimension_order: DimensionOrder::XYZTC,

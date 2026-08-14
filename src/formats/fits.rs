@@ -179,7 +179,7 @@ fn fits_series_from_hdu(hdu: FitsHdu) -> Result<FitsSeries> {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
             image_count: size_z,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,

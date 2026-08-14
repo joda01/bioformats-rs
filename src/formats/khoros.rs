@@ -177,7 +177,7 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         size_c: final_size_c,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: (bps * 8) as u8,
+        bits_per_pixel: (bps * 8) as u16,
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,

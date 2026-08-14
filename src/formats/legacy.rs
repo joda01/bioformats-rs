@@ -567,7 +567,7 @@ fn parse_fuji(inf_file: &Path) -> Result<(ImageMetadata, FujiHeader)> {
         size_c: 1,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: bits as u8,
+        bits_per_pixel: (bits) as u16,
         image_count: 1,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb: false,

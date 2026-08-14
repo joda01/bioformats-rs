@@ -456,7 +456,7 @@ impl FormatReader for MetaImageReader {
             size_c: hdr.channels,
             size_t: 1,
             pixel_type: hdr.pixel_type,
-            bits_per_pixel: bps,
+            bits_per_pixel: (bps).into(),
             image_count: size_z,
             dimension_order: DimensionOrder::XYZTC,
             is_rgb: hdr.channels > 1,

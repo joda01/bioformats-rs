@@ -895,7 +895,7 @@ impl VectraReader {
                 meta.size_c
             };
             meta.pixel_type = qptiff_pixel_type(ifd);
-            meta.bits_per_pixel = first_bits;
+            meta.bits_per_pixel = (first_bits).into();
             meta.is_rgb = is_rgb;
             meta.is_interleaved = false;
             meta.is_little_endian = true;
@@ -3644,7 +3644,7 @@ fn parse_imspector_native_stack(
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel,
+        bits_per_pixel: bits_per_pixel.into(),
         image_count,
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: false,
@@ -3936,7 +3936,7 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel,
+        bits_per_pixel: bits_per_pixel.into(),
         image_count,
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: false,
@@ -10533,7 +10533,7 @@ impl FormatReader for CellomicsReader {
                     size_c: image_count.max(1),
                     size_t: 1,
                     pixel_type: header.pixel_type,
-                    bits_per_pixel: header.bits_per_pixel,
+                    bits_per_pixel: (header.bits_per_pixel).into(),
                     image_count: image_count.max(1),
                     dimension_order: DimensionOrder::XYCZT,
                     is_rgb: false,
@@ -10582,7 +10582,7 @@ impl FormatReader for CellomicsReader {
                 size_c,
                 size_t: 1,
                 pixel_type: header.pixel_type,
-                bits_per_pixel: header.bits_per_pixel,
+                bits_per_pixel: (header.bits_per_pixel).into(),
                 image_count,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb: false,
@@ -11105,7 +11105,7 @@ impl FormatReader for MrwReader {
             size_c: 3,
             size_t: 1,
             pixel_type: PixelType::Uint16,
-            bits_per_pixel: if data_size > 0 { data_size } else { 16 },
+            bits_per_pixel: if data_size > 0 { data_size.into() } else { 16 },
             image_count: 1,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb: true,
@@ -12770,7 +12770,7 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
@@ -13660,7 +13660,7 @@ impl ApngReader {
             size_c,
             size_t: image_count,
             pixel_type,
-            bits_per_pixel,
+            bits_per_pixel: bits_per_pixel.into(),
             image_count,
             // APNGReader.java: dimensionOrder "XYCTZ".
             dimension_order: DimensionOrder::XYCTZ,
@@ -14946,7 +14946,7 @@ impl FormatReader for NafReader {
                 size_c: size_c as u32,
                 size_t: size_t as u32,
                 pixel_type,
-                bits_per_pixel,
+                bits_per_pixel: bits_per_pixel.into(),
                 image_count,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb: false,

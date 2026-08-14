@@ -2462,7 +2462,7 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
         size_c: core.size_c,
         size_t: core.size_t,
         pixel_type: core.pixel_type,
-        bits_per_pixel: (core.pixel_type.bytes_per_sample() as u8) * 8,
+        bits_per_pixel: (core.pixel_type.bytes_per_sample() as u16) * 8,
         image_count: core.image_count.max(1),
         dimension_order: parse_dimension_order(&core.dimension_order),
         is_rgb: core.rgb,

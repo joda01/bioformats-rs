@@ -969,7 +969,7 @@ fn build_metadata(mut p: FakeParams) -> Result<Vec<ImageMetadata>> {
             size_c: p.size_c,
             size_t: p.size_t,
             pixel_type: p.pixel_type,
-            bits_per_pixel,
+            bits_per_pixel: bits_per_pixel.into(),
             image_count: p.size_z * eff_size_c * p.size_t,
             dimension_order: dim_order,
             is_rgb: p.rgb > 1,

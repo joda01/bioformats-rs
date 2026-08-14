@@ -4169,7 +4169,7 @@ impl MngReader {
                 size_c: bands,
                 size_t: count,
                 pixel_type: pt,
-                bits_per_pixel: (pt.bytes_per_sample() * 8) as u8,
+                bits_per_pixel: (pt.bytes_per_sample() * 8) as u16,
                 image_count: count,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb: bands > 1,
@@ -5334,7 +5334,7 @@ impl MincReader {
             size_c: 1,
             size_t,
             pixel_type,
-            bits_per_pixel: bits,
+            bits_per_pixel: (bits).into(),
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -5559,7 +5559,7 @@ impl FormatReader for MincReader {
             size_c: 1,
             size_t,
             pixel_type,
-            bits_per_pixel: bits,
+            bits_per_pixel: (bits).into(),
             image_count,
             // Java MINCReader: dimensionOrder = "XYZCT".
             dimension_order: DimensionOrder::XYZCT,
@@ -6128,7 +6128,7 @@ impl OpenlabReader {
                 meta.pixel_type = PixelType::Uint16;
             }
             meta.bits_per_pixel = if meta.pixel_type == PixelType::Uint16 {
-                bits.max(9)
+                bits.max(9).into()
             } else {
                 8
             };
@@ -6823,7 +6823,7 @@ impl FormatReader for Jpeg2000Reader {
             size_c: n_components,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count: 1,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb,

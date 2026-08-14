@@ -694,7 +694,7 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel: (bytes_per_sample * 8) as u8,
+            bits_per_pixel: (bytes_per_sample * 8) as u16,
             image_count: size_z
                 .checked_mul(size_c)
                 .and_then(|v| v.checked_mul(size_t))

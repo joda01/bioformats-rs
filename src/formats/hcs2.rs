@@ -538,7 +538,7 @@ impl SimplePciTiffReader {
                 m.image_count = m.image_count.saturating_mul(m.size_c);
             }
             if let Some(bpp) = bits_per_pixel {
-                m.bits_per_pixel = bpp;
+                m.bits_per_pixel = (bpp).into();
             }
             // OME-store equivalents, surfaced as series metadata.
             if let Some(d) = &date {
@@ -4370,7 +4370,7 @@ fn make_series_meta(
     size_c: u32,
     size_t: u32,
     pixel_type: PixelType,
-    bits: u8,
+    bits: u16,
     little_endian: bool,
     order: DimensionOrder,
     format: &str,
@@ -4387,7 +4387,7 @@ fn make_series_meta(
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: bits,
+        bits_per_pixel: (bits).into(),
         image_count: size_z * size_c * size_t,
         dimension_order: order,
         is_rgb: false,
@@ -4406,7 +4406,7 @@ fn make_series_meta(
 
 /// Probe a TIFF for (size_x, size_y, pixel_type, bits, little_endian).
 /// Returns `None` if the file cannot be opened.
-fn probe_tiff(path: &Path) -> Option<(u32, u32, PixelType, u8, bool)> {
+fn probe_tiff(path: &Path) -> Option<(u32, u32, PixelType, u16, bool)> {
     let mut tr = crate::tiff::TiffReader::new();
     if tr.set_id(path).is_ok() {
         let m = tr.metadata();
@@ -5681,7 +5681,7 @@ mod operetta {
         let mut size_x = planes[0].x.max(1);
         let mut size_y = planes[0].y.max(1);
         let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
+        let mut bits = 16u16;
         let mut little_endian = true;
         'find: for sp in &series_planes {
             for p in sp.iter().flatten() {
@@ -6584,7 +6584,7 @@ mod columbus {
         let mut size_x = 1u32;
         let mut size_y = 1u32;
         let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
+        let mut bits = 16u16;
         let mut little_endian = true;
         for p in &planes {
             if let Some(f) = &p.file {
@@ -7986,7 +7986,7 @@ mod bd {
         let mut full_x = 0u32;
         let mut full_y = 0u32;
         let mut pixel_type = PixelType::Uint16;
-        let mut bits_pp = bits;
+        let mut bits_pp = bits as u16;
         let mut little_endian = true;
         for (_, tiffs) in &well_tiffs {
             if let Some(p) = tiffs.first() {
@@ -8358,7 +8358,7 @@ mod cellvoyager {
 
         // Probe pixel type from any existing field-0 tile.
         let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
+        let mut bits = 16u16;
         let mut little_endian = true;
         'probe: for (wi, well) in wells.iter().enumerate() {
             for area in &well.areas {

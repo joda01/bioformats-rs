@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use bioformats::ImageReader;
+use bioformats::{ImageReader, MetadataValue};
 
 fn parse_arg<T: std::str::FromStr>(args: &[String], index: usize, name: &str) -> T {
     args.get(index)
@@ -55,11 +55,41 @@ fn main() {
         let y = (size_y - h) / 2;
         let planes = image_count.min(planes_per_series);
         println!(
-            "series={series} size={}x{} planes={planes} set_series_ns={}",
+            "series={series} size={}x{} planes={planes} metadata_keys={} set_series_ns={}",
             size_x,
             size_y,
+            meta.series_metadata.len(),
             t_series.elapsed().as_nanos()
         );
+        for (key, value) in meta
+            .series_metadata
+            .iter()
+            .filter(|(key, _)| key.starts_with("nd2_"))
+        {
+            if matches!(
+                key.as_str(),
+                "nd2_is_lossless"
+                    | "nd2_split_channels"
+                    | "nd2_image_data_first_encoding"
+                    | "nd2_image_data_payload_offsets"
+                    | "nd2_loop_series_handling"
+                    | "nd2_series_index"
+                    | "nd2_chunks"
+                    | "nd2_image_data_chunks"
+                    | "nd2_image_metadata_seq_chunks"
+                    | "nd2_image_metadata_seq_matches_images"
+            ) {
+                match value {
+                    MetadataValue::String(value) => println!("series={series} {key}={value}"),
+                    MetadataValue::Int(value) => println!("series={series} {key}={value}"),
+                    MetadataValue::Float(value) => println!("series={series} {key}={value}"),
+                    MetadataValue::Bool(value) => println!("series={series} {key}={value}"),
+                    MetadataValue::Bytes(value) => {
+                        println!("series={series} {key}=<{} bytes>", value.len())
+                    }
+                }
+            }
+        }
         for plane in 0..planes {
             let t_read = Instant::now();
             match reader.open_bytes_region(plane, x, y, w, h) {

@@ -24,14 +24,16 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::{crop_full_plane, validate_region};
 
 /// ND2 file magic bytes.
 pub const ND2_MAGIC: [u8; 4] = [0xDA, 0xCE, 0xBE, 0x0A];
+const ND2_EAGER_PLANE_METADATA_LIMIT: usize = 128;
 
 #[derive(Debug, Clone)]
 struct Nd2Chunk {
     name: String,
+    block_offset: u64,
     data_offset: u64,
     data_length: u64,
 }
@@ -95,12 +97,96 @@ fn scan_chunks(f: &mut BufReader<File>) -> std::io::Result<Vec<Nd2Chunk>> {
 
         chunks.push(Nd2Chunk {
             name,
+            block_offset: chunk_start,
             data_offset,
             data_length: data_len,
         });
 
         // Advance past data
         f.seek(SeekFrom::Start(data_end))?;
+    }
+    Ok(chunks)
+}
+
+fn scan_chunks_before(f: &mut BufReader<File>, stop: u64) -> std::io::Result<Vec<Nd2Chunk>> {
+    let mut chunks = Vec::new();
+    let file_len = f.get_ref().metadata()?.len();
+    let stop = stop.min(file_len);
+    let mut search_pos = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+
+    while search_pos + 16 <= stop {
+        f.seek(SeekFrom::Start(search_pos))?;
+        let to_read = ((stop - search_pos).min(buf.len() as u64)) as usize;
+        if to_read < ND2_MAGIC.len() {
+            break;
+        }
+        let n = f.read(&mut buf[..to_read])?;
+        if n < ND2_MAGIC.len() {
+            break;
+        }
+
+        let Some(found) = buf[..n]
+            .windows(ND2_MAGIC.len())
+            .position(|window| window == ND2_MAGIC)
+        else {
+            search_pos += (n - (ND2_MAGIC.len() - 1)) as u64;
+            continue;
+        };
+
+        let chunk_start = search_pos + found as u64;
+        if chunk_start + 16 > stop {
+            break;
+        }
+        f.seek(SeekFrom::Start(chunk_start))?;
+
+        let mut magic = [0u8; 4];
+        if f.read_exact(&mut magic).is_err() {
+            break;
+        }
+        if magic != ND2_MAGIC {
+            search_pos = chunk_start + 1;
+            continue;
+        }
+
+        let mut name_len_bytes = [0u8; 4];
+        f.read_exact(&mut name_len_bytes)?;
+        let name_len = u32::from_le_bytes(name_len_bytes) as usize;
+        if name_len == 0 || name_len > 4096 {
+            search_pos = chunk_start + 1;
+            continue;
+        }
+
+        let mut data_len_bytes = [0u8; 8];
+        f.read_exact(&mut data_len_bytes)?;
+        let data_len = u64::from_le_bytes(data_len_bytes);
+        let data_offset = chunk_start + 16 + name_len as u64;
+        let Some(data_end) = data_offset.checked_add(data_len) else {
+            search_pos = chunk_start + 1;
+            continue;
+        };
+        if data_end > file_len || data_offset > stop {
+            break;
+        }
+
+        let mut name_bytes = vec![0u8; name_len];
+        f.read_exact(&mut name_bytes)?;
+        let name = String::from_utf8_lossy(&name_bytes)
+            .trim_end_matches('\0')
+            .to_string();
+        if !name.ends_with('!') {
+            search_pos = chunk_start + 1;
+            continue;
+        }
+
+        chunks.push(Nd2Chunk {
+            name,
+            block_offset: chunk_start,
+            data_offset,
+            data_length: data_len,
+        });
+
+        search_pos = data_end;
     }
     Ok(chunks)
 }
@@ -189,39 +275,62 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
         f.read_exact(&mut position_bytes)?;
         f.read_exact(&mut length_bytes)?;
         let position = u64::from_le_bytes(position_bytes);
-        let _length = u64::from_le_bytes(length_bytes);
+        let length = u64::from_le_bytes(length_bytes);
         let map_entry_offset = f.stream_position()?;
-
-        if position + 16 > file_len {
+        if position + length > file_len || position + 16 > file_len {
             return Ok(None);
         }
 
-        f.seek(SeekFrom::Start(position))?;
-        let mut chunk_magic = [0u8; 4];
-        f.read_exact(&mut chunk_magic)?;
-        if chunk_magic != ND2_MAGIC {
-            return Ok(None);
-        }
-        let mut actual_name_len_bytes = [0u8; 4];
-        let mut actual_data_len_bytes = [0u8; 8];
-        f.read_exact(&mut actual_name_len_bytes)?;
-        f.read_exact(&mut actual_data_len_bytes)?;
-        let actual_name_len = u32::from_le_bytes(actual_name_len_bytes) as u64;
-        let actual_data_len = u64::from_le_bytes(actual_data_len_bytes);
-        let data_offset = position + 16 + actual_name_len;
-        if data_offset > file_len || data_offset + actual_data_len > file_len {
-            return Ok(None);
-        }
-        f.seek(SeekFrom::Start(map_entry_offset))?;
+        let image_index = image_data_index(&name);
+        let (data_offset, data_length) = if image_index.is_some() {
+            f.seek(SeekFrom::Start(position))?;
+            let mut chunk_magic = [0u8; 4];
+            f.read_exact(&mut chunk_magic)?;
+            if chunk_magic != ND2_MAGIC {
+                return Ok(None);
+            }
+            let mut actual_name_len_bytes = [0u8; 4];
+            let mut actual_data_len_bytes = [0u8; 8];
+            f.read_exact(&mut actual_name_len_bytes)?;
+            f.read_exact(&mut actual_data_len_bytes)?;
+            let actual_name_len = u32::from_le_bytes(actual_name_len_bytes) as u64;
+            let actual_data_len = u64::from_le_bytes(actual_data_len_bytes);
+            let data_offset = position + 16 + actual_name_len;
+            if data_offset > file_len || data_offset + actual_data_len > file_len {
+                return Ok(None);
+            }
+            f.seek(SeekFrom::Start(map_entry_offset))?;
+            (data_offset, actual_data_len)
+        } else {
+            f.seek(SeekFrom::Start(position))?;
+            let mut chunk_magic = [0u8; 4];
+            f.read_exact(&mut chunk_magic)?;
+            if chunk_magic != ND2_MAGIC {
+                return Ok(None);
+            }
+            let mut actual_name_len_bytes = [0u8; 4];
+            let mut actual_data_len_bytes = [0u8; 8];
+            f.read_exact(&mut actual_name_len_bytes)?;
+            f.read_exact(&mut actual_data_len_bytes)?;
+            let actual_name_len = u32::from_le_bytes(actual_name_len_bytes) as u64;
+            let actual_data_len = u64::from_le_bytes(actual_data_len_bytes);
+            let data_offset = position + 16 + actual_name_len;
+            if data_offset > file_len || data_offset + actual_data_len > file_len {
+                return Ok(None);
+            }
+            f.seek(SeekFrom::Start(map_entry_offset))?;
+            (data_offset, actual_data_len)
+        };
 
-        if let Some(index) = image_data_index(&name) {
+        if let Some(index) = image_index {
             image_count += 1;
             max_image_index = Some(max_image_index.map_or(index, |m| m.max(index)));
         }
         chunks.push(Nd2Chunk {
             name: format!("{name}!"),
+            block_offset: position,
             data_offset,
-            data_length: actual_data_len,
+            data_length,
         });
     }
 
@@ -231,18 +340,41 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
         }
     }
 
-    for chunk in chunks.iter().filter(|c| c.name.starts_with("ImageDataSeq")) {
-        let block_offset = chunk
-            .data_offset
-            .saturating_sub(16 + chunk.name.len() as u64);
-        if block_offset + 4 > file_len {
-            return Ok(None);
+    if let Some(first_image_offset) = chunks
+        .iter()
+        .filter(|c| c.name.starts_with("ImageDataSeq"))
+        .map(|c| c.block_offset)
+        .min()
+    {
+        let prefix_scan_stop = first_image_offset.min(4 * 1024 * 1024);
+        for prefix_chunk in scan_chunks_before(f, prefix_scan_stop)? {
+            if !prefix_chunk.name.starts_with("ImageDataSeq")
+                && !chunks
+                    .iter()
+                    .any(|chunk| chunk.block_offset == prefix_chunk.block_offset)
+            {
+                chunks.push(prefix_chunk);
+            }
         }
-        f.seek(SeekFrom::Start(block_offset))?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        if magic != ND2_MAGIC {
-            return Ok(None);
+    }
+
+    let check_every = file_len / 10;
+    let mut next_check = 0;
+    if check_every > 0 {
+        for chunk in chunks.iter().filter(|c| c.name.starts_with("ImageDataSeq")) {
+            if chunk.block_offset <= next_check {
+                continue;
+            }
+            if chunk.block_offset + 4 > file_len {
+                return Ok(None);
+            }
+            f.seek(SeekFrom::Start(chunk.block_offset))?;
+            let mut magic = [0u8; 4];
+            f.read_exact(&mut magic)?;
+            if magic != ND2_MAGIC {
+                return Ok(None);
+            }
+            next_check = chunk.block_offset + check_every;
         }
     }
 
@@ -409,14 +541,37 @@ struct Nd2LvValues {
     attr_size_x: Option<u32>,
     attr_size_y: Option<u32>,
     attr_size_c: Option<u32>,
-    attr_bpc_in_memory: Option<u8>,
-    attr_bpc_significant: Option<u8>,
+    attr_bpc_in_memory: Option<u16>,
+    attr_bpc_significant: Option<u16>,
+    /// ImageAttributesLV fields when the attributes are stored as a normal
+    /// Nikon LV tree rather than the flat scan Java also supports.
+    lv_size_x: Option<u32>,
+    lv_size_y: Option<u32>,
+    lv_size_c: Option<u32>,
+    lv_bpc_in_memory: Option<u16>,
+    lv_bpc_significant: Option<u16>,
+    /// dZHigh/dZLow, combined with dZStep to infer sizeZ like Java iterateIn.
+    z_high: Option<f64>,
+    z_low: Option<f64>,
+    /// Dimensions recovered from line-based TextInfo metadata
+    /// (`Dimensions`, `Time Loop`, `Z Stack Loop` in ND2Handler.parseKeyAndValue).
+    text_size_z: Option<u32>,
+    text_size_t: Option<u32>,
+    text_series_count: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 struct Nd2LoopDescriptor {
     kind: &'static str,
     count: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct Nd2XmlChannelMetadata {
+    name: String,
+    emission_wavelength: Option<f64>,
+    excitation_wavelength: Option<f64>,
+    color: Option<i32>,
 }
 
 /// Parse the Nikon LV binary metadata tree starting at the root of a chunk.
@@ -426,6 +581,8 @@ struct Nd2LoopDescriptor {
 /// where children live until `absOffset` (relative to the chunk start) and a
 /// trailing `count × 8` byte index table is skipped afterwards.
 fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
+    let initial_text_channel_name_count = out.text_channel_names.len();
+
     fn read_u16(d: &[u8], p: usize) -> Option<u16> {
         d.get(p..p + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
     }
@@ -440,11 +597,75 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
     fn read_f64(d: &[u8], p: usize) -> Option<f64> {
         read_i64(d, p).map(|v| f64::from_bits(v as u64))
     }
+    fn nd2_lv_direct_child_u32(data: &[u8], mut p: usize, end: usize, wanted: &str) -> Option<u32> {
+        while p + 2 <= end {
+            let entry_start = p;
+            let ty = data[p];
+            let name_len = data[p + 1] as usize;
+            let name_start = p + 2;
+            let name_end = name_start + name_len * 2;
+            if name_end > end {
+                break;
+            }
+            let name_units: Vec<u16> = (0..name_len)
+                .filter_map(|i| read_u16(data, name_start + i * 2))
+                .collect();
+            let name = String::from_utf16_lossy(&name_units)
+                .trim_end_matches('\0')
+                .to_string();
+            p = name_end;
+            match ty {
+                1 => p += 1,
+                2 | 3 => {
+                    if name == wanted {
+                        return read_i32(data, p)
+                            .filter(|&value| value > 0)
+                            .map(|value| value as u32);
+                    }
+                    p += 4;
+                }
+                4 | 5 | 6 | 7 => p += 8,
+                8 => {
+                    while p + 2 <= end {
+                        let u = read_u16(data, p).unwrap_or(0);
+                        p += 2;
+                        if u == 0 {
+                            break;
+                        }
+                    }
+                }
+                9 => {
+                    let len = read_i64(data, p)?.max(0) as usize;
+                    p = (p + 8 + len).min(end);
+                }
+                11 => {
+                    let count = read_i32(data, p)?;
+                    let off = read_i64(data, p + 4)?;
+                    let child_end = entry_start
+                        .saturating_add(off.max(0) as usize)
+                        .clamp(p + 12, data.len());
+                    p = child_end
+                        .saturating_add((count.max(0) as usize) * 8)
+                        .min(end);
+                }
+                _ => break,
+            }
+        }
+        None
+    }
 
     // Recursive walk. `end` is an exclusive byte bound for the current level.
     // `current_color` carries the most recent uiColor within this level, so the
     // next sDescription can be paired with it (ND2Reader.iterateIn).
-    fn walk(data: &[u8], mut p: usize, end: usize, depth: u32, out: &mut Nd2LvValues) -> usize {
+    fn walk(
+        data: &[u8],
+        mut p: usize,
+        end: usize,
+        depth: u32,
+        out: &mut Nd2LvValues,
+        channel_count_context: Option<u32>,
+        level_name: Option<&str>,
+    ) -> usize {
         if depth > 64 {
             return end;
         }
@@ -471,8 +692,28 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                 2 | 3 => {
                     // int32 / uint32. uiColor sets the pending channel color
                     // (Java: currentColor = (Integer) value).
-                    if name == "uiColor" {
+                    if name == "uiColor" || name == "Color" {
                         current_color = read_i32(data, p);
+                    } else if let Some(value) = read_i32(data, p).filter(|&v| v > 0) {
+                        match name.as_str() {
+                            "uiWidth" => {
+                                out.lv_size_x = Some(value as u32);
+                            }
+                            "uiHeight" => {
+                                out.lv_size_y = Some(value as u32);
+                            }
+                            "uiComp" | "uiVirtualComponents" if out.lv_size_c.is_none() => {
+                                out.lv_size_c = Some(value as u32);
+                            }
+                            "uiBpcInMemory" if out.lv_bpc_in_memory.is_none() => {
+                                out.lv_bpc_in_memory = Some(value as u16);
+                            }
+                            "uiBpcSignificant" if out.lv_bpc_significant.is_none() => {
+                                out.lv_bpc_significant = Some(value as u16);
+                            }
+                            "ChannelCount" => {}
+                            _ => {}
+                        }
                     }
                     p += 4;
                 }
@@ -491,7 +732,21 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                                     out.z_step = Some(v);
                                 }
                             }
-                            "EmWavelength" => out.emission_wavelengths.push(v),
+                            "dZHigh" => {
+                                if v.is_finite() && out.z_high.is_none() {
+                                    out.z_high = Some(v);
+                                }
+                            }
+                            "dZLow" => {
+                                if v.is_finite() && out.z_low.is_none() {
+                                    out.z_low = Some(v);
+                                }
+                            }
+                            "EmWavelength" => {
+                                if !out.emission_wavelengths.contains(&v) {
+                                    out.emission_wavelengths.push(v);
+                                }
+                            }
                             // dExposureTime is milliseconds; Java stores /1000 s
                             // and only when value > 0 (ND2Reader.iterateIn:2206).
                             "dExposureTime" => {
@@ -538,7 +793,6 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                     }
                     let s = String::from_utf16_lossy(&units);
                     if name == "sDescription" && !s.is_empty() {
-                        out.channel_names.push(s.clone());
                         // Pair the channel name with the pending uiColor, mirroring
                         // ND2Reader.iterateIn:2197-2202 (only when a color was seen).
                         if let Some(color) = current_color {
@@ -548,7 +802,11 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                     } else if name == "sObjective" && !s.is_empty() && out.objective_model.is_none()
                     {
                         out.objective_model = Some(s);
-                    } else if name.starts_with("TextInfoItem") && !s.is_empty() {
+                    } else if (name.starts_with("TextInfo")
+                        || s.contains("<variant")
+                        || s.contains("<NDControl"))
+                        && !s.is_empty()
+                    {
                         // Collect text-annotation blobs for the backup handler
                         // (ND2Reader.iterateIn:2130-2133 → textInfos).
                         out.text_infos.push(s);
@@ -562,7 +820,15 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                     let len = len.max(0) as usize;
                     if len > 2 {
                         let child_end = (p + len).min(end);
-                        walk(data, p, child_end, depth + 1, out);
+                        walk(
+                            data,
+                            p,
+                            child_end,
+                            depth + 1,
+                            out,
+                            channel_count_context,
+                            level_name,
+                        );
                     }
                     p = (p + len).min(end);
                 }
@@ -581,7 +847,19 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                         .saturating_add(off.max(0) as usize)
                         .clamp(p, data.len());
                     if child_end > p {
-                        walk(data, p, child_end.min(end), depth + 1, out);
+                        let child_channel_count =
+                            nd2_lv_direct_child_u32(data, p, child_end, "ChannelCount")
+                                .filter(|&count| count > 0)
+                                .or(channel_count_context);
+                        walk(
+                            data,
+                            p,
+                            child_end.min(end),
+                            depth + 1,
+                            out,
+                            child_channel_count,
+                            Some(&name),
+                        );
                     }
                     // Skip children plus the trailing count*8 index table.
                     let after = child_end.saturating_add((count.max(0) as usize) * 8);
@@ -593,7 +871,55 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
         p
     }
 
-    walk(data, 0, data.len(), 0, out);
+    walk(data, 0, data.len(), 0, out, None, None);
+
+    // Some ND2 LV blocks carry channel descriptors in deeply nested list
+    // variants whose offsets are not always represented by the simple recursive
+    // walk above. Java's iterateIn still sees the scalar entry stream and pairs
+    // the most recent uiColor with the following sDescription. Recover that
+    // exact pair from the raw LV entry layout as a fallback.
+    let mut current_color: Option<i32> = None;
+    let mut p = 0usize;
+    while p + 2 <= data.len() {
+        let ty = data[p];
+        let name_len = data[p + 1] as usize;
+        let name_start = p + 2;
+        let name_end = name_start + name_len * 2;
+        if name_end > data.len() {
+            p += 1;
+            continue;
+        }
+        let name_units: Vec<u16> = (0..name_len)
+            .filter_map(|i| read_u16(data, name_start + i * 2))
+            .collect();
+        let name = String::from_utf16_lossy(&name_units)
+            .trim_end_matches('\0')
+            .to_string();
+        if (ty == 2 || ty == 3) && (name == "uiColor" || name == "Color") {
+            current_color = read_i32(data, name_end).filter(|&value| value != 0);
+        } else if ty == 8 && name == "sDescription" {
+            if let Some(color) = current_color {
+                let mut units = Vec::new();
+                let mut q = name_end;
+                while q + 2 <= data.len() {
+                    let u = read_u16(data, q).unwrap_or(0);
+                    q += 2;
+                    if u == 0 {
+                        break;
+                    }
+                    units.push(u);
+                }
+                let value = String::from_utf16_lossy(&units);
+                if !value.is_empty()
+                    && !out.text_channel_names[initial_text_channel_name_count..].contains(&value)
+                {
+                    out.text_channel_names.push(value.clone());
+                    out.channel_colors.entry(value).or_insert(color);
+                }
+            }
+        }
+        p += 1;
+    }
 }
 
 /// Parse the flat binary `ImageAttributes*` attribute list handled directly in
@@ -650,8 +976,8 @@ fn parse_nd2_binary_image_attributes(data: &[u8], out: &mut Nd2LvValues) {
             "uiWidth" if value > 0 => out.attr_size_x = Some(value as u32),
             "uiHeight" if value > 0 => out.attr_size_y = Some(value as u32),
             "uiComp" if value > 0 => out.attr_size_c = Some(value as u32),
-            "uiBpcInMemory" if value > 0 => out.attr_bpc_in_memory = Some(value as u8),
-            "uiBpcSignificant" if value > 0 => out.attr_bpc_significant = Some(value as u8),
+            "uiBpcInMemory" if value > 0 => out.attr_bpc_in_memory = Some(value as u16),
+            "uiBpcSignificant" if value > 0 => out.attr_bpc_significant = Some(value as u16),
             // Java binary ImageAttributes path: isLossless = valueOrLength >= 0.
             "dCompressionParam" => {
                 saw_lossless_param = true;
@@ -1051,8 +1377,10 @@ fn xml_attr(tag_text: &str, attr: &str) -> Option<String> {
         };
         let eq = cursor + eq_rel;
         let name_start = tag_text[..eq]
-            .rfind(|c: char| c.is_whitespace() || c == '<')
-            .map_or(0, |pos| pos + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| c.is_whitespace() || c == '<')
+            .map_or(0, |(pos, c)| pos + c.len_utf8());
         let name = tag_text[name_start..eq].trim();
         let rest = tag_text[eq + 1..].trim_start();
         let mut chars = rest.chars();
@@ -1091,6 +1419,27 @@ fn xml_values(xml: &str, tag: &str) -> Vec<String> {
     }
 
     values
+}
+
+fn xml_element_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let mut blocks = Vec::new();
+    let close = format!("</{tag}>");
+    let mut cursor = 0;
+
+    while let Some((pos, gt)) = xml_find_start_tag(xml, tag, cursor) {
+        let after_open = &xml[pos..];
+        let end = if after_open[..gt].trim_end().ends_with('/') {
+            pos + gt + 1
+        } else if let Some(end_rel) = xml[pos + gt + 1..].find(&close) {
+            pos + gt + 1 + end_rel + close.len()
+        } else {
+            break;
+        };
+        blocks.push(&xml[pos..end]);
+        cursor = end;
+    }
+
+    blocks
 }
 
 /// Collect the `<item_N>` numeric children of the first `<tag>…</tag>` element,
@@ -1147,19 +1496,261 @@ fn nd2_xml_f64_value(xml: &str, tag: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+fn nd2_xml_signed_f64_value(xml: &str, tag: &str) -> Option<f64> {
+    xml_value(xml, tag)?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
+fn nd2_z_count_from_range(
+    z_high: Option<f64>,
+    z_low: Option<f64>,
+    z_step: Option<f64>,
+) -> Option<u32> {
+    let high = z_high?;
+    let low = z_low?;
+    let step = z_step.filter(|v| *v > 0.0)?;
+    let count = ((high - low).abs() / step).ceil() as u32 + 1;
+    (count > 1).then_some(count)
+}
+
+fn nd2_xml_metadata_channels(xml: &str) -> Vec<Nd2XmlChannelMetadata> {
+    let mut channels = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(relative_pos) = xml[cursor..].find("<Channel_") {
+        let pos = cursor + relative_pos;
+        let after_open = &xml[pos..];
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
+        let tag_text = &after_open[..gt];
+        let tag_name = tag_text
+            .trim_start_matches('<')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        if tag_name.is_empty() {
+            cursor = pos + gt + 1;
+            continue;
+        }
+        let close = format!("</{tag_name}>");
+        let end = if tag_text.trim_end().ends_with('/') {
+            pos + gt + 1
+        } else if let Some(end_rel) = xml[pos + gt + 1..].find(&close) {
+            pos + gt + 1 + end_rel + close.len()
+        } else {
+            break;
+        };
+        let block = &xml[pos..end];
+        if let Some(name) = xml_value(block, "Name").filter(|name| !name.is_empty()) {
+            channels.push(Nd2XmlChannelMetadata {
+                name,
+                emission_wavelength: xml_value(block, "EmWavelength")
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && *value > 0.0),
+                excitation_wavelength: None,
+                color: xml_value(block, "Color")
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .filter(|&value| value != 0),
+            });
+        }
+        cursor = end;
+    }
+
+    channels
+}
+
+fn nd2_xml_old_jp2_valid_position_names(xml: &str) -> Vec<String> {
+    let mut best: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    while let Some((pos_name_pos, pos_name_gt)) = xml_find_start_tag(xml, "pPosName", cursor) {
+        let Some(pos_name_end_rel) = xml[pos_name_pos + pos_name_gt + 1..].find("</pPosName>")
+        else {
+            break;
+        };
+        let pos_name_end = pos_name_pos + pos_name_gt + 1 + pos_name_end_rel;
+        let names_block = &xml[pos_name_pos + pos_name_gt + 1..pos_name_end];
+
+        let mut names = Vec::new();
+        let mut item_cursor = 0;
+        while let Some(relative_pos) = names_block[item_cursor..].find("<item_") {
+            let pos = item_cursor + relative_pos;
+            let after_open = &names_block[pos..];
+            let Some(gt) = after_open.find('>') else {
+                break;
+            };
+            if let Some(value) = xml_attr(&after_open[..gt], "value") {
+                names.push(value);
+            }
+            item_cursor = pos + gt + 1;
+        }
+
+        let mut valid = Vec::new();
+        if let Some((valid_pos, valid_gt)) = xml_find_start_tag(xml, "pItemValid", pos_name_end) {
+            let search_end = (pos_name_end + 32768).min(xml.len());
+            if valid_pos < search_end {
+                if let Some(valid_end_rel) = xml[valid_pos + valid_gt + 1..].find("</pItemValid>") {
+                    let valid_end = valid_pos + valid_gt + 1 + valid_end_rel;
+                    let valid_block = &xml[valid_pos + valid_gt + 1..valid_end];
+                    let mut valid_cursor = 0;
+                    while let Some(relative_pos) = valid_block[valid_cursor..].find("<_") {
+                        let pos = valid_cursor + relative_pos;
+                        let after_open = &valid_block[pos..];
+                        let Some(gt) = after_open.find('>') else {
+                            break;
+                        };
+                        let tag = &after_open[..gt];
+                        if let Some(value) = xml_attr(tag, "value") {
+                            valid.push(value == "true");
+                        }
+                        valid_cursor = pos + gt + 1;
+                    }
+                }
+            }
+        }
+
+        if !valid.is_empty() {
+            names = names
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, name)| {
+                    valid.get(index).copied().unwrap_or(true).then_some(name)
+                })
+                .collect();
+        }
+
+        if best.is_empty()
+            || (!best.iter().any(|name| !name.is_empty())
+                && names.iter().any(|name| !name.is_empty()))
+        {
+            best = names;
+        }
+        if best.iter().any(|name| !name.is_empty()) {
+            break;
+        }
+        cursor = pos_name_end + "</pPosName>".len();
+    }
+    best
+}
+
+fn nd2_xml_xy_position_count_with_valid_flags(xml: &str) -> Option<u32> {
+    let xy_count = nd2_xml_first_loop_count_near_runtype(xml, "XYPosLoop")?;
+    let xy_pos = xml.find("XYPosLoop")?;
+    let search_end = (xy_pos + 32768).min(xml.len());
+    if let Some((valid_pos, valid_gt)) = xml_find_start_tag(xml, "pItemValid", xy_pos) {
+        if valid_pos < search_end {
+            if let Some(valid_end_rel) = xml[valid_pos + valid_gt + 1..].find("</pItemValid>") {
+                let valid_end = valid_pos + valid_gt + 1 + valid_end_rel;
+                let valid_block = &xml[valid_pos + valid_gt + 1..valid_end];
+                let true_count = valid_block.matches("value=\"true\"").count() as u32;
+                let false_count = valid_block.matches("value=\"false\"").count() as u32;
+                if true_count + false_count > 0 {
+                    return Some(true_count.max(1));
+                }
+            }
+        }
+    }
+    Some(xy_count)
+}
+
+fn nd2_replace_position_names_if_more_informative(
+    current: &mut Vec<String>,
+    candidate: Vec<String>,
+) {
+    if candidate.is_empty() {
+        return;
+    }
+    let current_has_names = current.iter().any(|name| !name.is_empty());
+    let candidate_has_names = candidate.iter().any(|name| !name.is_empty());
+    if current.is_empty() || (!current_has_names && candidate_has_names) {
+        *current = candidate;
+    }
+}
+
+fn nd2_xml_first_loop_count_near_runtype(xml: &str, runtype_suffix: &str) -> Option<u32> {
+    let mut cursor = 0;
+    while let Some(relative_pos) = xml[cursor..].find(runtype_suffix) {
+        let pos = cursor + relative_pos;
+        let tag_start = xml[..pos].rfind('<').unwrap_or(pos);
+        let tag_end = xml[pos..].find('>').map(|gt| pos + gt)?;
+        let tag = &xml[tag_start..tag_end];
+        if xml_attr(tag, "runtype")
+            .as_deref()
+            .is_some_and(|runtype| runtype.ends_with(runtype_suffix))
+        {
+            if let Some((count_pos, count_gt)) = xml_find_start_tag(xml, "uiCount", tag_end + 1) {
+                if count_pos <= tag_end + 8192 {
+                    let count_tag = &xml[count_pos..count_pos + count_gt];
+                    if let Some(count) = xml_attr(count_tag, "value")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|&count| count > 0)
+                    {
+                        return Some(count);
+                    }
+                }
+            }
+        }
+        cursor = pos + runtype_suffix.len();
+    }
+    None
+}
+
+fn nd2_xml_metadata_channel_groups(xml: &str) -> Vec<Vec<Nd2XmlChannelMetadata>> {
+    let mut groups = Vec::new();
+    for metadata_block in xml_element_blocks(xml, "Metadata") {
+        let channels = nd2_xml_metadata_channels(metadata_block);
+        if !channels.is_empty() {
+            groups.push(channels);
+        }
+    }
+    groups
+}
+
+fn nd2_apply_metadata_channels(xml: &str, out: &mut Nd2LvValues) {
+    let channels = nd2_xml_metadata_channels(xml);
+    if channels.is_empty() {
+        return;
+    }
+
+    if out.channel_names.len() < channels.len() {
+        out.channel_names = channels
+            .iter()
+            .map(|channel| channel.name.clone())
+            .collect();
+    }
+    for channel in channels {
+        if let Some(color) = channel.color {
+            out.channel_colors.entry(channel.name).or_insert(color);
+        }
+        if let Some(value) = channel.emission_wavelength {
+            out.emission_wavelengths.push(value);
+        }
+        if let Some(value) = channel.excitation_wavelength {
+            out.excitation_wavelengths.push(value);
+        }
+    }
+}
+
 fn parse_nd2_xml_metadata(xml: &str, out: &mut Nd2LvValues) {
+    parse_nd2_text_info_elements(xml, out);
+    nd2_apply_metadata_channels(xml, out);
+
     if out.calibration.is_none() {
         out.calibration = nd2_xml_f64_value(xml, "dCalibration");
     }
     if out.z_step.is_none() {
         out.z_step = nd2_xml_f64_value(xml, "dZStep");
     }
-
-    for name in xml_values(xml, "sDescription") {
-        if !name.is_empty() && !out.channel_names.contains(&name) {
-            out.channel_names.push(name);
-        }
+    if out.z_high.is_none() {
+        out.z_high = nd2_xml_signed_f64_value(xml, "dZHigh");
     }
+    if out.z_low.is_none() {
+        out.z_low = nd2_xml_signed_f64_value(xml, "dZLow");
+    }
+
     for wavelength in xml_values(xml, "EmWavelength")
         .into_iter()
         .filter_map(|value| value.parse::<f64>().ok())
@@ -1234,26 +1825,58 @@ fn parse_nd2_xml_metadata(xml: &str, out: &mut Nd2LvValues) {
 /// key handling for the line-based case (ND2Handler.parseKeyAndValue:830-894).
 /// The resulting `out` is the equivalent of Java's `backupHandler`.
 fn parse_text(text: &str, out: &mut Nd2LvValues) {
-    let trimmed = text.trim();
-    // XML case: reuse the same parser ND2Handler uses for metadata XML.
-    if trimmed.contains('<') && trimmed.contains('>') {
-        parse_nd2_xml_metadata(trimmed, out);
+    fn positive_digits(value: &str) -> Option<u32> {
+        let digits = value
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>();
+        digits.parse::<u32>().ok().filter(|&v| v > 0)
     }
 
-    // Line-based fallback (ND2Handler.parseKeyAndValue). This runs regardless,
-    // matching how the text key/value pairs supply channel names and emission /
-    // excitation wavelengths that the XML form may not carry.
-    for line in text.split('\n') {
-        let Some(sep) = line.find(':') else { continue };
-        let key = line[..sep].trim();
-        let value = line[sep + 1..].trim();
+    fn apply_text_dimension_token(token: &str, out: &mut Nd2LvValues) {
+        let token = token.trim();
+        let Some(value) = positive_digits(token).map(|v| v.max(1)) else {
+            return;
+        };
+        if token.starts_with("XY") {
+            if value > 1 {
+                out.text_series_count = Some(value);
+            }
+        } else if token.starts_with('T') {
+            if out
+                .text_size_t
+                .is_none_or(|current| current <= 1 || value < current)
+            {
+                out.text_size_t = Some(value);
+            }
+        } else if token.starts_with('Z') {
+            if out.text_size_z.is_none_or(|current| current <= 1) {
+                out.text_size_z = Some(value);
+            }
+        }
+    }
+
+    fn apply_text_key_value(key: &str, value: &str, out: &mut Nd2LvValues) {
         if value.is_empty() {
-            continue;
+            return;
         }
         if key == "Name" {
             // ND2Handler:830-831 / 908-909 — channel name.
             if !out.channel_names.contains(&value.to_string()) {
                 out.channel_names.push(value.to_string());
+            }
+        } else if key.starts_with("Dimensions") || key.starts_with("Abmessungen") {
+            for dim in value.split(" x ") {
+                apply_text_dimension_token(dim, out);
+            }
+        } else if key == "Line" {
+            // ND2Handler.parseKeyAndValue:878-886 recursively parses semicolon
+            // sub-fields like `Excitation wavelength:488`.
+            for item in value.split(';') {
+                let Some(sep) = item.find(':') else {
+                    continue;
+                };
+                apply_text_key_value(item[..sep].trim(), item[sep + 1..].trim(), out);
             }
         } else if key.eq_ignore_ascii_case("Emission wavelength") {
             // ND2Handler:888-890 — first whitespace-delimited token as f64.
@@ -1273,7 +1896,79 @@ fn parse_text(text: &str, out: &mut Nd2LvValues) {
             {
                 out.excitation_wavelengths.push(v);
             }
+        } else if key == "Z Stack Loop" {
+            if let Some(v) = value.parse::<u32>().ok().filter(|&v| v > 0) {
+                out.text_size_z = Some(v);
+            }
+        } else if key == "Time Loop" {
+            if let Some(v) = value.parse::<u32>().ok().filter(|&v| v > 0) {
+                if out.text_size_t.is_none() {
+                    out.text_size_t = Some(v);
+                }
+            }
         }
+    }
+
+    let trimmed = nd2_text_xml_fragment(text).unwrap_or_else(|| text.trim().to_string());
+    // XML case: reuse the same parser ND2Handler uses for metadata XML.
+    if trimmed.contains('<') && trimmed.contains('>') {
+        parse_nd2_xml_metadata(&trimmed, out);
+    }
+
+    // Line-based fallback (ND2Handler.parseKeyAndValue). This runs regardless,
+    // matching how the text key/value pairs supply channel names and emission /
+    // excitation wavelengths that the XML form may not carry.
+    for line in text.split('\n') {
+        let Some(sep) = line.find(':') else { continue };
+        let key = line[..sep].trim();
+        let value = line[sep + 1..].trim();
+        apply_text_key_value(key, value, out);
+    }
+}
+
+fn nd2_text_xml_fragment(text: &str) -> Option<String> {
+    let start = text.find('<')?;
+    let end = text.rfind('>')?;
+    (end >= start).then(|| text[start..=end].to_string())
+}
+
+fn nd2_unescape_text_attr(text: &str) -> String {
+    text.replace("&#x000d;", "\r")
+        .replace("&#x000D;", "\r")
+        .replace("&#x000a;", "\n")
+        .replace("&#x000A;", "\n")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn parse_old_nd2_text_info_items(xml: &str, out: &mut Nd2LvValues) {
+    let mut cursor = 0;
+    while let Some((pos, gt)) = xml_find_start_tag(xml, "TextInfoItem", cursor) {
+        let after_open = &xml[pos..];
+        if let Some(text) = xml_attr(&after_open[..gt], "Text") {
+            parse_text(&nd2_unescape_text_attr(&text), out);
+        }
+        cursor = pos + gt + 1;
+    }
+}
+
+fn parse_nd2_text_info_elements(xml: &str, out: &mut Nd2LvValues) {
+    let mut cursor = 0;
+    while let Some(relative_pos) = xml[cursor..].find("<TextInfo") {
+        let pos = cursor + relative_pos;
+        let after_open = &xml[pos..];
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
+        let tag_text = &after_open[..gt];
+        let value = xml_attr(tag_text, "Text").or_else(|| xml_attr(tag_text, "value"));
+        if let Some(text) = value {
+            parse_text(&nd2_unescape_text_attr(&text), out);
+        }
+        cursor = pos + gt + 1;
     }
 }
 
@@ -1309,15 +2004,31 @@ fn nd2_xml_plane_z_position(xml: &str) -> Option<f64> {
 
 fn nd2_xml_ui_count_for_runtype(xml: &str, runtype_suffix: &str) -> Option<u32> {
     let mut cursor = 0;
-    while let Some((pos, gt)) = xml_find_start_tag(xml, "uiCount", cursor) {
+    let mut prev_runtype: Option<String> = None;
+
+    while let Some(relative_pos) = xml[cursor..].find('<') {
+        let pos = cursor + relative_pos;
         let after_open = &xml[pos..];
-        let attrs = &after_open[..gt];
-        if xml_attr(attrs, "runtype")
-            .as_deref()
-            .is_some_and(|runtype| runtype.ends_with(runtype_suffix))
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
+        let tag_text = &after_open[..gt];
+        let tag_name = tag_text
+            .trim_start_matches('<')
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        if tag_name == "uiCount"
+            && prev_runtype
+                .clone()
+                .or_else(|| xml_attr(tag_text, "runtype"))
+                .as_deref()
+                .is_some_and(|runtype| runtype.ends_with(runtype_suffix))
         {
-            let value = xml_attr(attrs, "value").or_else(|| {
-                if attrs.trim_end().ends_with('/') {
+            let value = xml_attr(tag_text, "value").or_else(|| {
+                if tag_text.trim_end().ends_with('/') {
                     None
                 } else {
                     let content_start = pos + gt + 1;
@@ -1333,7 +2044,130 @@ fn nd2_xml_ui_count_for_runtype(xml: &str, runtype_suffix: &str) -> Option<u32> 
                 return Some(count);
             }
         }
+        prev_runtype = xml_attr(tag_text, "runtype");
         cursor = pos + gt + 1;
+    }
+    None
+}
+
+fn nd2_xml_child_ui_count(xml: &str, start: usize, end: usize) -> Option<u32> {
+    let (pos, gt) = xml_find_start_tag(&xml[start..end], "uiCount", 0)?;
+    let pos = start + pos;
+    let after_open = &xml[pos..];
+    let attrs = &after_open[..gt];
+    let value = xml_attr(attrs, "value").or_else(|| {
+        if attrs.trim_end().ends_with('/') {
+            None
+        } else {
+            let content_start = pos + gt + 1;
+            xml[content_start..end].find("</uiCount>").map(|end_rel| {
+                xml[content_start..content_start + end_rel]
+                    .trim()
+                    .to_string()
+            })
+        }
+    })?;
+    value.parse::<u32>().ok().filter(|&count| count > 0)
+}
+
+fn nd2_xml_loop_container_counts(xml: &str, runtype_suffix: &str) -> Vec<u32> {
+    let mut counts = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(relative_pos) = xml[cursor..].find('<') {
+        let pos = cursor + relative_pos;
+        let after_open = &xml[pos..];
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
+        let tag_text = &after_open[..gt];
+        if xml_attr(tag_text, "runtype")
+            .as_deref()
+            .is_some_and(|runtype| runtype.ends_with(runtype_suffix))
+        {
+            let local_end = (pos + gt + 1 + 8192).min(xml.len());
+            if let Some(count) = nd2_xml_child_ui_count(xml, pos + gt + 1, local_end) {
+                counts.push(count);
+            }
+        }
+        cursor = pos + gt + 1;
+    }
+
+    counts
+}
+
+fn nd2_xml_nearby_ui_count_after_runtype(xml: &str, runtype_suffix: &str) -> Option<u32> {
+    let mut cursor = 0;
+    while let Some(rel) = xml[cursor..].find(runtype_suffix) {
+        let pos = cursor + rel;
+        let start = xml[..pos].rfind('<').unwrap_or(pos);
+        let tag_end = xml[pos..].find('>').map(|gt| pos + gt).unwrap_or(pos);
+        let tag = &xml[start..=tag_end.min(xml.len().saturating_sub(1))];
+        if xml_attr(tag, "runtype")
+            .as_deref()
+            .is_some_and(|runtype| runtype.ends_with(runtype_suffix))
+        {
+            let search_end = (tag_end + 2048).min(xml.len());
+            if let Some((count_pos, count_gt)) = xml_find_start_tag(xml, "uiCount", tag_end) {
+                if count_pos < search_end {
+                    let attrs = &xml[count_pos..count_pos + count_gt];
+                    if let Some(count) = xml_attr(attrs, "value")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|&count| count > 0)
+                    {
+                        return Some(count);
+                    }
+                }
+            }
+        }
+        cursor = pos + runtype_suffix.len();
+    }
+    None
+}
+
+fn nd2_xml_first_two_no_name_values(xml: &str) -> (Option<u32>, Option<u32>) {
+    let mut first = None;
+    let mut second = None;
+    let mut cursor = 0;
+
+    while let Some((pos, gt)) = xml_find_start_tag(xml, "no_name", cursor) {
+        let after_open = &xml[pos..];
+        let attrs = &after_open[..gt];
+        if let Some(value) = xml_attr(attrs, "value").and_then(|value| value.parse::<u32>().ok()) {
+            if value == 0 {
+                cursor = pos + gt + 1;
+                continue;
+            }
+            if first.is_none() {
+                first = Some(value);
+            } else {
+                second = Some(value);
+                break;
+            }
+        }
+        cursor = pos + gt + 1;
+    }
+
+    (first, second)
+}
+
+fn nd2_xml_ndcontrol_loop_dimensions(xml: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let mut cursor = 0;
+    while let Some((pos, gt)) = xml_find_start_tag(xml, "LoopSize", cursor) {
+        let after_open = &xml[pos..];
+        let end = if after_open[..gt].trim_end().ends_with('/') {
+            pos + gt + 1
+        } else if let Some(end_rel) = xml[pos + gt + 1..].find("</LoopSize>") {
+            pos + gt + 1 + end_rel + "</LoopSize>".len()
+        } else {
+            break;
+        };
+        let (size_t, size_z) = nd2_xml_first_two_no_name_values(&xml[pos..end]);
+        let size_z = size_z.filter(|&value| value > 1);
+        if size_t.is_some() || size_z.is_some() {
+            return Some((size_z, size_t));
+        }
+        cursor = end;
     }
     None
 }
@@ -1395,14 +2229,42 @@ fn nd2_update_loop_counts_from_xml(
     loop_size_t: &mut Option<u32>,
     loop_series_count: &mut Option<u32>,
 ) {
+    if let Some((z, t)) = nd2_xml_ndcontrol_loop_dimensions(xml) {
+        if z.is_some() && loop_size_z.is_none_or(|current| current <= 1) {
+            *loop_size_z = z;
+        }
+        if t.is_some() && loop_size_t.is_none_or(|current| current <= 1) {
+            *loop_size_t = t;
+        }
+    }
     if loop_size_z.is_none() {
-        *loop_size_z = nd2_xml_ui_count_for_runtype(xml, "ZStackLoop");
+        *loop_size_z = nd2_xml_ui_count_for_runtype(xml, "ZStackLoop")
+            .or_else(|| {
+                nd2_xml_loop_container_counts(xml, "ZStackLoop")
+                    .into_iter()
+                    .next()
+            })
+            .or_else(|| nd2_xml_nearby_ui_count_after_runtype(xml, "ZStackLoop"));
     }
     if loop_size_t.is_none() {
-        *loop_size_t = nd2_xml_ui_count_for_runtype(xml, "TimeLoop");
+        *loop_size_t = nd2_xml_ui_count_for_runtype(xml, "TimeLoop")
+            .or_else(|| {
+                nd2_xml_loop_container_counts(xml, "TimeLoop")
+                    .into_iter()
+                    .next()
+            })
+            .or_else(|| nd2_xml_nearby_ui_count_after_runtype(xml, "TimeLoop"));
     }
-    if loop_series_count.is_none() {
-        *loop_series_count = nd2_xml_ui_count_for_runtype(xml, "XYPosLoop");
+    if loop_series_count.is_none_or(|count| count <= 1) {
+        *loop_series_count = nd2_xml_loop_container_counts(xml, "XYPosLoop")
+            .into_iter()
+            .find(|&count| count > 1)
+            .or_else(|| nd2_xml_nearby_ui_count_after_runtype(xml, "XYPosLoop"))
+            .or_else(|| {
+                let count = nd2_xml_item_list_f64(xml, "dPosX").len() as u32;
+                (count > 1).then_some(count)
+            })
+            .or_else(|| nd2_xml_ui_count_for_runtype(xml, "XYPosLoop"));
     }
 }
 
@@ -1411,11 +2273,16 @@ fn nd2_u32_value(xml: &str, tag: &str) -> Option<u32> {
     (value != u32::MAX).then_some(value)
 }
 
-fn nd2_bpp_value(xml: &str) -> Option<u8> {
+fn nd2_bpp_value(xml: &str) -> Option<u16> {
+    xml_value(xml, "uiBpcSignificant")
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|&b| b > 0)
+}
+
+fn nd2_storage_bpp_value(xml: &str) -> Option<u16> {
     xml_value(xml, "uiBpcInMemory")
         .or_else(|| xml_value(xml, "uiBpc"))
-        .or_else(|| xml_value(xml, "uiBpcSignificant"))
-        .and_then(|s| s.parse::<u8>().ok())
+        .and_then(|s| s.parse::<u16>().ok())
         .filter(|&b| b > 0)
 }
 
@@ -1438,7 +2305,7 @@ fn rect_sensor_extent(xml: &str) -> Option<(u32, u32)> {
     }
 }
 
-fn parse_nd2_attributes(xml: &str) -> (u32, u32, u32, u32, u8) {
+fn parse_nd2_attributes(xml: &str) -> (u32, u32, u32, u32, u16) {
     let (rect_w, rect_h) = rect_sensor_extent(xml).unwrap_or((0, 0));
     let w = if rect_w > 0 {
         rect_w
@@ -1455,7 +2322,7 @@ fn parse_nd2_attributes(xml: &str) -> (u32, u32, u32, u32, u8) {
             .unwrap_or(0)
     };
     let c = nd2_u32_value(xml, "uiComp").unwrap_or(1u32);
-    let bpp = nd2_bpp_value(xml).unwrap_or(8u8);
+    let bpp = nd2_bpp_value(xml).unwrap_or(0u16);
     // Java ND2Handler treats uiSequenceCount as an image-count consistency
     // hint, not as a Z size. Z/T dimensions come from loop metadata or later
     // fallback normalization.
@@ -1552,8 +2419,110 @@ fn scan_old_jp2_boxes(
     Ok((planes, size_x, size_y, bands, pixel_type_code))
 }
 
-fn old_nd2_metadata_text(f: &mut BufReader<File>) -> std::io::Result<String> {
-    f.seek(SeekFrom::Start(0))?;
+fn old_nd2_metadata_text(
+    f: &mut BufReader<File>,
+    last_codestream_offset: u64,
+) -> std::io::Result<String> {
+    let file_len = f.get_ref().metadata()?.len();
+    f.seek(SeekFrom::Start(last_codestream_offset))?;
+
+    let mut found = false;
+    let mut metadata_offset = 0u64;
+    let mut buf = vec![0u8; 8192];
+    while !found && f.stream_position()? < file_len {
+        let read = if f.stream_position()? == last_codestream_offset {
+            f.read(&mut buf)?
+        } else {
+            let overlap_start = buf.len() - 10;
+            buf.copy_within(overlap_start.., 0);
+            10 + f.read(&mut buf[10..])?
+        };
+        if read == 0 {
+            break;
+        }
+        let scan_len = if read == buf.len() {
+            read.saturating_sub(10)
+        } else {
+            read
+        };
+        for i in 0..scan_len.saturating_add(9).min(buf.len().saturating_sub(1)) {
+            if buf[i] == 0xff && buf[i + 1] == 0xd9 {
+                found = true;
+                metadata_offset = f.stream_position()? - (scan_len as u64 + 10) + i as u64;
+                break;
+            }
+        }
+    }
+    if !found || metadata_offset == 0 || metadata_offset >= file_len.saturating_sub(5) {
+        return Ok(String::new());
+    }
+
+    f.seek(SeekFrom::Start(metadata_offset + 4))?;
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><NIKON>");
+    while f.stream_position()? < file_len {
+        let mut len_bytes = [0u8; 2];
+        if f.read_exact(&mut len_bytes).is_err() {
+            break;
+        }
+        let mut block_len = i16::from_be_bytes(len_bytes) as i64;
+        if block_len < 2 {
+            break;
+        }
+        block_len -= 2;
+        let remaining = file_len.saturating_sub(f.stream_position()?) as i64;
+        if block_len > remaining {
+            block_len = remaining;
+        }
+        if block_len <= 0 {
+            break;
+        }
+        let mut block = vec![0u8; block_len as usize];
+        f.read_exact(&mut block)?;
+        let mut s = String::from_utf8_lossy(&block).into_owned();
+        while let Some(start) = s.find("<!--") {
+            let Some(end) = s[start + 4..].find("-->") else {
+                break;
+            };
+            s.replace_range(start..start + 4 + end + 3, "");
+        }
+        let Some(open_bracket) = s.find('<') else {
+            continue;
+        };
+        let Some(closed_bracket) = s.rfind('>').map(|pos| pos + 1) else {
+            continue;
+        };
+        if closed_bracket < open_bracket {
+            continue;
+        }
+        let s = s[open_bracket..closed_bracket].trim();
+        if !s.contains("CalibrationSeq") && !s.contains("VCAL") && !s.contains("jp2cLUNK") {
+            out.push_str(s);
+        }
+    }
+    out.push_str("</NIKON>");
+
+    let mut chars: Vec<char> = out.chars().collect();
+    let mut offset = 0usize;
+    for (i, ch) in chars.iter_mut().enumerate() {
+        if offset == 0 && *ch == '!' {
+            offset = i + 1;
+        }
+        if ch.is_control() {
+            *ch = ' ';
+        }
+    }
+    if chars.len().saturating_sub(offset) < offset {
+        offset = 0;
+    }
+    Ok(chars[offset..].iter().collect())
+}
+
+fn old_nd2_metadata_tail_text(f: &mut BufReader<File>) -> std::io::Result<String> {
+    const OLD_ND2_METADATA_TAIL_LIMIT: u64 = 64 * 1024 * 1024;
+
+    let file_len = f.get_ref().metadata()?.len();
+    let start = file_len.saturating_sub(OLD_ND2_METADATA_TAIL_LIMIT);
+    f.seek(SeekFrom::Start(start))?;
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
     Ok(String::from_utf8_lossy(&data).into_owned())
@@ -1587,6 +2556,40 @@ fn old_nd2_component_count(text: &str, jp2_bands: u16) -> u32 {
         .max(1)
 }
 
+fn old_nd2_plane_metadata(
+    text: &str,
+    image_count: usize,
+    size_c: u32,
+) -> (Vec<Option<f64>>, Vec<Option<f64>>) {
+    let effective_c = size_c.max(1) as usize;
+    let frame_count = (image_count / effective_c).max(1);
+    let times = xml_values(text, "dTimeMSec")
+        .into_iter()
+        .filter_map(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .take(frame_count)
+        .collect::<Vec<_>>();
+    let z_positions = xml_values(text, "dZPos")
+        .into_iter()
+        .filter_map(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .take(frame_count)
+        .collect::<Vec<_>>();
+
+    let mut plane_delta_t = vec![None; image_count];
+    let mut plane_position_z = vec![None; image_count];
+    for plane in 0..image_count {
+        let frame = plane / effective_c;
+        if let Some(time_ms) = times.get(frame).copied() {
+            plane_delta_t[plane] = Some(time_ms / 1000.0);
+        }
+        if let Some(z) = z_positions.get(frame).copied() {
+            plane_position_z[plane] = Some(z);
+        }
+    }
+    (plane_delta_t, plane_position_z)
+}
+
 fn require_exact_frame(data: Vec<u8>, expected: usize, kind: &str) -> Result<Vec<u8>> {
     if data.len() == expected {
         Ok(data)
@@ -1608,7 +2611,7 @@ fn decompress_nd2_zlib(data: &[u8], expected: usize) -> Result<Vec<u8>> {
     use std::io::Read as _;
 
     let mut dec = ZlibDecoder::new(data);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(expected);
     dec.read_to_end(&mut out).map_err(BioFormatsError::Io)?;
     require_exact_frame(out, expected, "zlib")
 }
@@ -1618,7 +2621,7 @@ fn decompress_nd2_zlib_chunk(data: &[u8], remaining: usize) -> Result<Vec<u8>> {
     use std::io::Read as _;
 
     let mut dec = ZlibDecoder::new(data);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(remaining);
     dec.by_ref()
         .take(remaining.saturating_add(1) as u64)
         .read_to_end(&mut out)
@@ -1893,15 +2896,12 @@ fn nd2_chunk_table_payload_encoding(
     }
 }
 
-fn nd2_frame_payload_hint(data: &[u8], expected: usize) -> &'static str {
-    nd2_frame_payload_layout(data, data.len(), expected).0
-}
-
 fn nd2_frame_payload_layout(
     prefix: &[u8],
     total_len: usize,
     expected: usize,
 ) -> (&'static str, usize) {
+    const LEGACY_FRAME_PREFIX_LEN: usize = 7;
     const FRAME_PREFIX_LEN: usize = 8;
     const NIKON_PAYLOAD_OFFSET: usize = 4096;
     const MAX_RAW_TRAILER_LEN: usize = 4096;
@@ -1915,6 +2915,44 @@ fn nd2_frame_payload_layout(
             if !looks_like_zlib(payload) && !looks_like_jpeg2000(payload) {
                 return ("raw_with_8_byte_prefix", FRAME_PREFIX_LEN);
             }
+        }
+    }
+
+    for prefix_len in [
+        0usize,
+        LEGACY_FRAME_PREFIX_LEN,
+        FRAME_PREFIX_LEN,
+        NIKON_PAYLOAD_OFFSET,
+    ] {
+        let Some(payload) = prefix.get(prefix_len..) else {
+            continue;
+        };
+        let prefix = match prefix_len {
+            0 => "",
+            LEGACY_FRAME_PREFIX_LEN => "_after_7_byte_prefix",
+            FRAME_PREFIX_LEN => "_after_8_byte_prefix",
+            NIKON_PAYLOAD_OFFSET => "_after_4096_byte_prefix",
+            _ => "",
+        };
+
+        if looks_like_zlib(payload) {
+            return match prefix {
+                "" => ("zlib", prefix_len),
+                "_after_7_byte_prefix" => ("zlib_after_7_byte_prefix", prefix_len),
+                "_after_8_byte_prefix" => ("zlib_after_8_byte_prefix", prefix_len),
+                "_after_4096_byte_prefix" => ("zlib_after_4096_byte_prefix", prefix_len),
+                _ => ("zlib", prefix_len),
+            };
+        }
+
+        if looks_like_jpeg2000(payload) {
+            return match prefix {
+                "" => ("jpeg2000", prefix_len),
+                "_after_7_byte_prefix" => ("jpeg2000_after_7_byte_prefix", prefix_len),
+                "_after_8_byte_prefix" => ("jpeg2000_after_8_byte_prefix", prefix_len),
+                "_after_4096_byte_prefix" => ("jpeg2000_after_4096_byte_prefix", prefix_len),
+                _ => ("jpeg2000", prefix_len),
+            };
         }
     }
 
@@ -1956,36 +2994,6 @@ fn nd2_frame_payload_layout(
         }
     }
 
-    for prefix_len in [0usize, FRAME_PREFIX_LEN, NIKON_PAYLOAD_OFFSET] {
-        let Some(payload) = prefix.get(prefix_len..) else {
-            continue;
-        };
-        let prefix = match prefix_len {
-            0 => "",
-            FRAME_PREFIX_LEN => "_after_8_byte_prefix",
-            NIKON_PAYLOAD_OFFSET => "_after_4096_byte_prefix",
-            _ => "",
-        };
-
-        if looks_like_zlib(payload) {
-            return match prefix {
-                "" => ("zlib", prefix_len),
-                "_after_8_byte_prefix" => ("zlib_after_8_byte_prefix", prefix_len),
-                "_after_4096_byte_prefix" => ("zlib_after_4096_byte_prefix", prefix_len),
-                _ => ("zlib", prefix_len),
-            };
-        }
-
-        if looks_like_jpeg2000(payload) {
-            return match prefix {
-                "" => ("jpeg2000", prefix_len),
-                "_after_8_byte_prefix" => ("jpeg2000_after_8_byte_prefix", prefix_len),
-                "_after_4096_byte_prefix" => ("jpeg2000_after_4096_byte_prefix", prefix_len),
-                _ => ("jpeg2000", prefix_len),
-            };
-        }
-    }
-
     if let Some((encoding, _)) = nd2_chunk_table_payload_encoding(prefix, total_len, expected) {
         return (encoding, 0);
     }
@@ -2018,21 +3026,6 @@ fn nd2_prefix_timestamp_seconds(prefix: &[u8], payload_prefix_len: usize) -> Opt
     (value.is_finite() && (1.0e-9..1.0e12).contains(&value)).then_some(value)
 }
 
-fn stored_expected_for_nd2_frame(
-    size_x: u32,
-    size_y: u32,
-    size_c: u32,
-    pixel_type: PixelType,
-) -> usize {
-    let scanline_pad = if size_x % 2 != 0 && size_c % 2 != 0 {
-        1usize
-    } else {
-        0usize
-    };
-    ((size_x as usize * size_c as usize + scanline_pad) * pixel_type.bytes_per_sample())
-        * size_y as usize
-}
-
 fn nd2_split_interleaved_channel(
     pixels: &[u8],
     size_x: usize,
@@ -2058,17 +3051,35 @@ fn nd2_split_interleaved_channel(
         )));
     }
     let mut out = vec![0u8; size_x * size_y * bps];
+    let src_step = size_c * bps;
+    let channel_offset = channel * bps;
+    let mut dst = 0usize;
     for y in 0..size_y {
-        for x in 0..size_x {
-            let src = (y * size_x * size_c + x * size_c + channel) * bps;
-            let dst = (y * size_x + x) * bps;
-            out[dst..dst + bps].copy_from_slice(&pixels[src..src + bps]);
+        let mut src = y * row_pixels + channel_offset;
+        for _ in 0..size_x {
+            match bps {
+                1 => out[dst] = pixels[src],
+                2 => {
+                    out[dst] = pixels[src];
+                    out[dst + 1] = pixels[src + 1];
+                }
+                4 => {
+                    out[dst] = pixels[src];
+                    out[dst + 1] = pixels[src + 1];
+                    out[dst + 2] = pixels[src + 2];
+                    out[dst + 3] = pixels[src + 3];
+                }
+                _ => out[dst..dst + bps].copy_from_slice(&pixels[src..src + bps]),
+            }
+            dst += bps;
+            src += src_step;
         }
     }
     Ok(out)
 }
 
 fn decode_nd2_frame_payload(data: &[u8], expected: usize) -> Result<Vec<u8>> {
+    const LEGACY_FRAME_PREFIX_LEN: usize = 7;
     const FRAME_PREFIX_LEN: usize = 8;
     const NIKON_PAYLOAD_OFFSET: usize = 4096;
     const MAX_RAW_TRAILER_LEN: usize = 4096;
@@ -2089,6 +3100,30 @@ fn decode_nd2_frame_payload(data: &[u8], expected: usize) -> Result<Vec<u8>> {
         let payload = &data[FRAME_PREFIX_LEN..];
         if !looks_like_zlib(payload) && !looks_like_jpeg2000(payload) {
             return Ok(payload.to_vec());
+        }
+    }
+
+    for prefix_len in [
+        0usize,
+        LEGACY_FRAME_PREFIX_LEN,
+        FRAME_PREFIX_LEN,
+        NIKON_PAYLOAD_OFFSET,
+    ] {
+        let Some(payload) = data.get(prefix_len..) else {
+            continue;
+        };
+
+        if prefix_len > 0 && payload.len() == expected {
+            return Ok(payload.to_vec());
+        }
+
+        if looks_like_zlib(payload) {
+            return decompress_nd2_zlib(payload, expected);
+        }
+
+        if looks_like_jpeg2000(payload) {
+            let decoded = crate::common::codec::decompress_jpeg2000(payload)?;
+            return require_exact_frame(decoded, expected, "JPEG2000");
         }
     }
 
@@ -2119,25 +3154,6 @@ fn decode_nd2_frame_payload(data: &[u8], expected: usize) -> Result<Vec<u8>> {
         let payload = &data[NIKON_PAYLOAD_OFFSET..];
         if !looks_like_zlib(payload) && !looks_like_jpeg2000(payload) {
             return Ok(payload[..expected].to_vec());
-        }
-    }
-
-    for prefix_len in [0usize, FRAME_PREFIX_LEN, NIKON_PAYLOAD_OFFSET] {
-        let Some(payload) = data.get(prefix_len..) else {
-            continue;
-        };
-
-        if prefix_len > 0 && payload.len() == expected {
-            return Ok(payload.to_vec());
-        }
-
-        if looks_like_zlib(payload) {
-            return decompress_nd2_zlib(payload, expected);
-        }
-
-        if looks_like_jpeg2000(payload) {
-            let decoded = crate::common::codec::decompress_jpeg2000(payload)?;
-            return require_exact_frame(decoded, expected, "JPEG2000");
         }
     }
 
@@ -2401,6 +3417,8 @@ pub struct Nd2Reader {
     pos_x: Vec<f64>,
     pos_y: Vec<f64>,
     pos_z: Vec<f64>,
+    /// Position suffixes from pPosName (Java: handler.posNames).
+    position_names: Vec<String>,
     /// Number of acquired XY positions (Java: positionCount).
     position_count: u32,
     /// Number of X fields (Java: nXFields).
@@ -2445,6 +3463,7 @@ impl Nd2Reader {
             pos_x: Vec::new(),
             pos_y: Vec::new(),
             pos_z: Vec::new(),
+            position_names: Vec::new(),
             position_count: 0,
             n_x_fields: 0,
             lens_na: None,
@@ -2478,14 +3497,84 @@ impl Nd2Reader {
             ));
         }
 
-        let metadata_text = old_nd2_metadata_text(&mut reader).map_err(BioFormatsError::Io)?;
+        let last_codestream_offset = planes
+            .last()
+            .map(|plane| plane.data_offset)
+            .unwrap_or_default();
+        let mut metadata_text = old_nd2_metadata_text(&mut reader, last_codestream_offset)
+            .map_err(BioFormatsError::Io)?;
+        if old_nd2_component_count(&metadata_text, jp2_bands) <= jp2_bands as u32
+            && nd2_xml_ui_count_for_runtype(&metadata_text, "XYPosLoop").unwrap_or(1) <= 1
+            && planes.len() > 1
+        {
+            let tail_text = old_nd2_metadata_tail_text(&mut reader).map_err(BioFormatsError::Io)?;
+            if old_nd2_component_count(&tail_text, jp2_bands)
+                > old_nd2_component_count(&metadata_text, jp2_bands)
+                || nd2_xml_ui_count_for_runtype(&tail_text, "XYPosLoop").unwrap_or(1)
+                    > nd2_xml_ui_count_for_runtype(&metadata_text, "XYPosLoop").unwrap_or(1)
+            {
+                metadata_text = tail_text;
+            }
+        }
         let metadata_indexes = old_nd2_metadata_indexes(&metadata_text);
         let size_c = old_nd2_component_count(&metadata_text, jp2_bands);
+        let is_rgb = jp2_bands > 1;
+        let effective_size_c = if is_rgb { 1 } else { size_c.max(1) };
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_xml_metadata(&metadata_text, &mut lv);
+        let old_jp2_position_names = nd2_xml_old_jp2_valid_position_names(&metadata_text);
+        let old_jp2_channel_groups = nd2_xml_metadata_channel_groups(&metadata_text);
+        // Java's old-JP2 path feeds the trailing XML through ND2Handler only.
+        // ND2Handler does not promote sDescription or optical-filter spectrum
+        // XML elements to channel names/wavelengths there; those are populated
+        // only from text "Name"/"Emission wavelength"/"Excitation wavelength"
+        // keys or binary LV text-channel handling in the newer path.
+        lv.channel_names.clear();
+        lv.emission_wavelengths.clear();
+        lv.excitation_wavelengths.clear();
+        lv.channel_colors.clear();
+        lv.text_channel_names.clear();
+        parse_old_nd2_text_info_items(&metadata_text, &mut lv);
+        if !old_jp2_channel_groups.is_empty() {
+            let best_channels = old_jp2_channel_groups
+                .iter()
+                .max_by_key(|channels| channels.len())
+                .unwrap();
+            if lv.channel_names.len() < best_channels.len() {
+                lv.channel_names = best_channels
+                    .iter()
+                    .map(|channel| channel.name.clone())
+                    .collect();
+            }
+            if lv.emission_wavelengths.len() < best_channels.len() {
+                lv.emission_wavelengths.clear();
+                for channel in best_channels {
+                    if let Some(value) = channel.emission_wavelength {
+                        lv.emission_wavelengths.push(value);
+                    }
+                }
+            }
+            if lv.excitation_wavelengths.len() < best_channels.len() {
+                lv.excitation_wavelengths.clear();
+                for channel in best_channels {
+                    if let Some(value) = channel.excitation_wavelength {
+                        lv.excitation_wavelengths.push(value);
+                    }
+                }
+            }
+            for channel in best_channels {
+                if let Some(color) = channel.color {
+                    lv.channel_colors
+                        .entry(channel.name.clone())
+                        .or_insert(color);
+                }
+            }
+        }
         let mut usable_plane_count = planes.len();
-        if size_c > 1 && usable_plane_count % size_c as usize == 1 {
+        if !is_rgb && size_c > 1 && usable_plane_count % size_c as usize == 1 {
             usable_plane_count -= 1;
         }
-        usable_plane_count -= usable_plane_count % size_c as usize;
+        usable_plane_count -= usable_plane_count % effective_size_c as usize;
         if usable_plane_count == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "ND2: old JP2-backed file has no complete component planes".into(),
@@ -2493,14 +3582,89 @@ impl Nd2Reader {
         }
 
         let metadata_count = metadata_indexes.len();
-        let series_count =
-            if metadata_count > 1 && usable_plane_count == metadata_count * size_c as usize {
-                metadata_count
+        let xml_series = nd2_xml_ui_count_for_runtype(&metadata_text, "XYPosLoop").unwrap_or(1);
+        let xml_size_z = nd2_xml_ui_count_for_runtype(&metadata_text, "ZStackLoop").unwrap_or(1);
+        let xml_size_t = nd2_xml_ui_count_for_runtype(&metadata_text, "TimeLoop").unwrap_or(1);
+        let complete_frame_count = usable_plane_count / effective_size_c as usize;
+        let timestamp_frame_count = xml_values(&metadata_text, "dTimeMSec")
+            .into_iter()
+            .filter_map(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .take(complete_frame_count)
+            .count();
+
+        // Old JP2 mirrors ND2Handler's SAX loop counts first, then ND2Reader's
+        // final series cap. If those loop counts cannot consume the available
+        // planes, keep Java's parsed XY count and derive T from dTimeMSec entries.
+        let mut used_xml_loop_dimensions = false;
+        let (mut series_count, size_z, size_t) = {
+            let mut series_count = xml_series as usize;
+            let size_z = xml_size_z;
+            let size_t = xml_size_t;
+            let nplanes = (size_z as usize).saturating_mul(effective_size_c as usize);
+            let expected = series_count
+                .saturating_mul(nplanes)
+                .saturating_mul(size_t as usize);
+            if (xml_series > 1 || xml_size_z > 1 || xml_size_t > 1)
+                && !(xml_series <= 1 && expected != usable_plane_count)
+                && !(expected > usable_plane_count && size_t <= 1)
+            {
+                if expected <= usable_plane_count {
+                    used_xml_loop_dimensions = true;
+                } else if nplanes > 0 && size_t > 0 {
+                    let capped_series = usable_plane_count / (nplanes * size_t as usize);
+                    used_xml_loop_dimensions = capped_series > 0
+                        && capped_series
+                            .saturating_mul(nplanes)
+                            .saturating_mul(size_t as usize)
+                            == usable_plane_count;
+                }
+            }
+
+            if used_xml_loop_dimensions {
+                (series_count, size_z, size_t)
             } else {
-                1
-            };
-        let size_t = (usable_plane_count / series_count / size_c as usize).max(1) as u32;
-        let image_count = size_t * size_c;
+                series_count = (xml_series > 1)
+                    .then_some(xml_series as usize)
+                    .filter(|&count| {
+                        timestamp_frame_count > 0
+                            && timestamp_frame_count % count == 0
+                            && timestamp_frame_count / count > 0
+                    })
+                    .unwrap_or_else(|| {
+                        if metadata_count > 1
+                            && usable_plane_count == metadata_count * effective_size_c as usize
+                        {
+                            metadata_count
+                        } else {
+                            1
+                        }
+                    });
+                let size_t = if timestamp_frame_count > 0
+                    && timestamp_frame_count % series_count == 0
+                {
+                    (timestamp_frame_count / series_count).max(1) as u32
+                } else {
+                    (usable_plane_count / series_count / effective_size_c as usize).max(1) as u32
+                };
+                (series_count, 1, size_t)
+            }
+        };
+        let nplanes = size_z as usize * effective_size_c as usize;
+        if nplanes > 0 && size_t > 0 {
+            let java_used = series_count
+                .saturating_mul(nplanes)
+                .saturating_mul(size_t as usize);
+            if java_used > usable_plane_count {
+                series_count = usable_plane_count / (nplanes * size_t as usize);
+            }
+            usable_plane_count = series_count
+                .saturating_mul(nplanes)
+                .saturating_mul(size_t as usize);
+        }
+        let image_count = size_z * size_t * effective_size_c;
+        let (plane_delta_t, plane_position_z) =
+            old_nd2_plane_metadata(&metadata_text, usable_plane_count, effective_size_c);
         let bits_per_pixel = if pixel_type_code == 0x0f07_0100 || pixel_type_code == 0x0f07_0000 {
             16
         } else {
@@ -2518,12 +3682,14 @@ impl Nd2Reader {
         };
 
         let mut plane_series = vec![Vec::with_capacity(image_count as usize); series_count];
+        let mut source_series = vec![Vec::with_capacity(image_count as usize); series_count];
         for t in 0..size_t as usize {
             for series in 0..series_count {
-                for c in 0..size_c as usize {
-                    let source = (t * series_count + series) * size_c as usize + c;
+                for q in 0..nplanes {
+                    let source = (t * series_count + series) * nplanes + q;
                     if source < usable_plane_count {
                         plane_series[series].push(planes[source].clone());
+                        source_series[series].push(source);
                     }
                 }
             }
@@ -2545,18 +3711,24 @@ impl Nd2Reader {
                 "nd2_metadata_seq_count".into(),
                 MetadataValue::Int(metadata_count as i64),
             );
+            if is_rgb {
+                series_metadata.insert(
+                    "nd2_rgb_channel_count".into(),
+                    MetadataValue::Int(size_c as i64),
+                );
+            }
 
             metas.push(ImageMetadata {
                 size_x,
                 size_y,
-                size_z: 1,
+                size_z,
                 size_c,
                 size_t,
                 pixel_type,
                 bits_per_pixel,
                 image_count,
                 dimension_order,
-                is_rgb: false,
+                is_rgb,
                 is_interleaved: false,
                 is_indexed: false,
                 is_little_endian: false,
@@ -2572,30 +3744,53 @@ impl Nd2Reader {
 
         self.meta = metas;
         self.current_series = 0;
+        // Old JP2 XML can carry non-pixel-size dCalibration values; Java's
+        // old SAX path does not project the 50.0 value in but3_cont200-1.nd2
+        // into OME PhysicalSizeX/Y. Keep only microscope-scale XY pixel sizes
+        // on this legacy path; the modern binary trueSizeX/Y path is unchanged.
+        self.physical_size = lv
+            .calibration
+            .filter(|v| *v > 0.0 && (*v < 10.0 || (size_c == 1 && (*v - 100.0).abs() < 1.0e-9)));
+        self.physical_size_z = lv.z_step;
+        self.channel_names = lv.channel_names;
+        self.emission_wavelengths = lv.emission_wavelengths;
+        self.excitation_wavelengths = lv.excitation_wavelengths;
+        self.backup_channel_names.clear();
+        self.backup_emission_wavelengths.clear();
+        self.backup_excitation_wavelengths.clear();
+        self.exposure_time = lv.exposure_time;
+        self.channel_colors = lv.channel_colors;
+        self.text_channel_names = lv.text_channel_names;
+        self.colors = (0..size_c as usize)
+            .map(|c| {
+                self.channel_names
+                    .get(c)
+                    .and_then(|name| self.channel_colors.get(name))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect();
+        self.pos_x = lv.pos_x;
+        self.pos_y = lv.pos_y;
+        self.pos_z = lv.pos_z;
+        self.position_names = old_jp2_position_names;
+        self.position_count = lv.position_count;
+        self.lens_na = lv.lens_na;
+        self.objective_mag = lv.objective_mag;
+        self.objective_model = lv.objective_model;
+        self.refractive_index = lv.refractive_index;
+        self.is_lossless = lv.is_lossless;
+        self.n_x_fields = if lv.n_x_fields > 6 { 0 } else { lv.n_x_fields };
         self.old_jp2_planes = plane_series;
         self.split_channels = false;
         self.image_chunks.clear();
         self.series_image_chunks.clear();
         self.series_plane_offsets.clear();
-        self.series_source_planes.clear();
+        self.series_source_planes = source_series;
         self.chunks.clear();
-        self.plane_delta_t.clear();
-        self.plane_position_z.clear();
+        self.plane_delta_t = plane_delta_t;
+        self.plane_position_z = plane_position_z;
         self.ts_t.clear();
-        self.exposure_time.clear();
-        self.channel_colors.clear();
-        self.text_channel_names.clear();
-        self.colors.clear();
-        self.pos_x.clear();
-        self.pos_y.clear();
-        self.pos_z.clear();
-        self.position_count = 0;
-        self.n_x_fields = 0;
-        self.lens_na = None;
-        self.objective_mag = None;
-        self.objective_model = None;
-        self.refractive_index = None;
-        self.is_lossless = false;
         self.pfs_offset = 0;
         self.pfs_state_offset = 0;
         reader
@@ -2693,21 +3888,29 @@ impl FormatReader for Nd2Reader {
         reader
             .seek(SeekFrom::Start(0))
             .map_err(BioFormatsError::Io)?;
-        if read >= 8 && looks_like_jpeg2000(&header) {
+        let old_jp2_signature = read >= 4 && header[..4] == [0xff, 0x4f, 0xff, 0x51]
+            || read >= 8
+                && u32::from_be_bytes(header[..4].try_into().unwrap_or([0; 4])) == 12
+                && &header[4..8] == b"jP  ";
+        if old_jp2_signature {
             return self.set_old_jp2_id(reader, path);
         }
-
         let chunks = match read_chunk_map(&mut reader).map_err(BioFormatsError::Io)? {
             Some(chunks) => chunks,
             None => scan_chunks(&mut reader).map_err(BioFormatsError::Io)?,
         };
 
         let (mut size_x, mut size_y, mut size_c, mut size_z, mut bpp) =
-            (0u32, 0u32, 1u32, 1u32, 8u8);
+            (0u32, 0u32, 1u32, 1u32, 0u16);
+        let mut storage_bpp: Option<u16> = None;
         let mut loop_size_z: Option<u32> = None;
         let mut loop_size_t: Option<u32> = None;
         let mut loop_series_count: Option<u32> = None;
         let mut loop_descriptors = Vec::new();
+        let mut position_names = Vec::new();
+        let mut has_spectral_loop = false;
+        let mut has_declared_ndcontrol_loop_dimensions = false;
+        let mut has_ndcontrol_dimension_order = false;
 
         for ac in chunks
             .iter()
@@ -2719,6 +3922,9 @@ impl FormatReader for Nd2Reader {
             // inferred dimensions, so try both representations here.
             let xml = String::from_utf8_lossy(&data);
             let (w, h, c, z, b) = parse_nd2_attributes(&xml);
+            if b > 0 {
+                bpp = b;
+            }
             if w > 0 && h > 0 {
                 size_x = w;
                 size_y = h;
@@ -2728,39 +3934,62 @@ impl FormatReader for Nd2Reader {
                 if z > 0 {
                     size_z = z;
                 }
-                if b > 0 {
-                    bpp = b;
-                }
+                storage_bpp = nd2_storage_bpp_value(&xml);
                 nd2_update_loop_counts_from_xml(
                     &xml,
                     &mut loop_size_z,
                     &mut loop_size_t,
                     &mut loop_series_count,
                 );
+                if let Some(count) = nd2_xml_xy_position_count_with_valid_flags(&xml) {
+                    if count > 1 {
+                        loop_series_count = Some(count);
+                    }
+                }
+                let has_ndcontrol_loop = nd2_xml_ndcontrol_loop_dimensions(&xml).is_some();
+                has_declared_ndcontrol_loop_dimensions |= has_ndcontrol_loop;
+                has_ndcontrol_dimension_order |= has_ndcontrol_loop;
                 nd2_update_loop_descriptors_from_xml(&xml, &mut loop_descriptors);
+                nd2_replace_position_names_if_more_informative(
+                    &mut position_names,
+                    nd2_xml_old_jp2_valid_position_names(&xml),
+                );
+                has_spectral_loop |= !nd2_xml_loop_container_counts(&xml, "SpectLoop").is_empty();
                 break;
             }
             let mut attrs = Nd2LvValues::default();
+            parse_nd2_lv(&data, &mut attrs);
             parse_nd2_binary_image_attributes(&data, &mut attrs);
-            if let (Some(w), Some(h)) = (attrs.attr_size_x, attrs.attr_size_y) {
+            let attr_size_x = attrs.lv_size_x.or(attrs.attr_size_x);
+            let attr_size_y = attrs.lv_size_y.or(attrs.attr_size_y);
+            let attr_size_c = attrs.lv_size_c.or(attrs.attr_size_c);
+            let attr_storage_bpp = attrs.lv_bpc_in_memory.or(attrs.attr_bpc_in_memory);
+            let attr_bpp = attrs
+                .lv_bpc_significant
+                .or_else(|| {
+                    attrs
+                        .attr_bpc_significant
+                        .filter(|_| attr_storage_bpp.is_none())
+                })
+                .or(attr_storage_bpp);
+            if let (Some(w), Some(h)) = (attr_size_x, attr_size_y) {
                 size_x = w;
                 size_y = h;
-                if let Some(c) = attrs.attr_size_c.filter(|&c| c > 0) {
+                if let Some(c) = attr_size_c.filter(|&c| c > 0) {
                     size_c = c;
                 }
-                if let Some(b) = attrs
-                    .attr_bpc_significant
-                    .or(attrs.attr_bpc_in_memory)
-                    .filter(|&b| b > 0)
-                {
+                if let Some(b) = attr_bpp.filter(|&b| b > 0) {
                     bpp = b;
                 }
+                storage_bpp = attr_storage_bpp.filter(|&b| b > 0);
                 break;
             }
         }
 
         for mc in chunks.iter().filter(|c| {
-            c.name.starts_with("ImageMetadata") || c.name.contains("GrabberCameraSettings")
+            c.name.starts_with("ImageMetadata")
+                || c.name.contains("GrabberCameraSettings")
+                || c.name.starts_with("CustomDataVar|NDControl")
         }) {
             let data = read_chunk_data(&mut reader, mc).map_err(BioFormatsError::Io)?;
             let xml = String::from_utf8_lossy(&data);
@@ -2770,7 +3999,20 @@ impl FormatReader for Nd2Reader {
                 &mut loop_size_t,
                 &mut loop_series_count,
             );
+            if let Some(count) = nd2_xml_xy_position_count_with_valid_flags(&xml) {
+                if count > 1 {
+                    loop_series_count = Some(count);
+                }
+            }
+            let has_ndcontrol_loop = nd2_xml_ndcontrol_loop_dimensions(&xml).is_some();
+            has_declared_ndcontrol_loop_dimensions |= has_ndcontrol_loop;
+            has_ndcontrol_dimension_order |= has_ndcontrol_loop;
             nd2_update_loop_descriptors_from_xml(&xml, &mut loop_descriptors);
+            nd2_replace_position_names_if_more_informative(
+                &mut position_names,
+                nd2_xml_old_jp2_valid_position_names(&xml),
+            );
+            has_spectral_loop |= !nd2_xml_loop_container_counts(&xml, "SpectLoop").is_empty();
             if let Some((w, h)) = rect_sensor_extent(&xml) {
                 size_x = w;
                 size_y = h;
@@ -2781,7 +4023,23 @@ impl FormatReader for Nd2Reader {
                 if let Some(b) = nd2_bpp_value(&xml) {
                     bpp = b;
                 }
+                storage_bpp = nd2_storage_bpp_value(&xml);
                 break;
+            }
+            if size_x == 0 {
+                if let Some(w) = nd2_u32_value(&xml, "uiCamPxlCountX").filter(|&w| w > 0) {
+                    size_x = w;
+                }
+            }
+            if size_y == 0 {
+                if let Some(h) = nd2_u32_value(&xml, "uiCamPxlCountY").filter(|&h| h > 0) {
+                    size_y = h;
+                }
+            }
+            if size_c == 1 {
+                if let Some(c) = nd2_u32_value(&xml, "uiComp").filter(|&c| c > 0) {
+                    size_c = c;
+                }
             }
         }
 
@@ -2817,6 +4075,8 @@ impl FormatReader for Nd2Reader {
             .into_iter()
             .map(|(_, chunk_index)| chunk_index)
             .collect();
+        let has_image_metadata_lv_chunk =
+            chunks.iter().any(|c| c.name.starts_with("ImageMetadataLV"));
 
         // If we still don't know dimensions, try to infer from first image chunk size
         if size_x == 0 {
@@ -2835,21 +4095,40 @@ impl FormatReader for Nd2Reader {
             }
         }
 
-        let pixel_type = match bpp {
+        let storage_bits_for_pixel_type = storage_bpp
+            .filter(|&bits| bits == 8 || bits == 16 || bits == 32)
+            .or_else(|| (bpp == 8 || bpp == 16 || bpp == 32).then_some(bpp))
+            .unwrap_or(8);
+        let pixel_type = match storage_bits_for_pixel_type {
             8 => PixelType::Uint8,
             16 => PixelType::Uint16,
+            32 => PixelType::Float32,
             _ => PixelType::Uint16,
         };
+        if bpp == 0 {
+            bpp = (pixel_type.bytes_per_sample() * 8) as u16;
+        }
 
         // Parse the Nikon LV binary metadata tree (ImageMetadataSeqLV /
         // ImageCalibrationLV) for OME attributes: physical pixel size, channel
         // names, emission wavelengths. Matches ND2Reader.iterateIn in Java.
+        //
+        // Binary ImageMetadataLV eType/uiCount walk (ND2Reader.initFile
+        // java:967-1062). Builds imageMetadataLVOrder (M/T/Z) and the T/Z/M
+        // counts directly from the binary metadata. Java guards this with
+        // `!imageMetadataLVProcessed`, so only the FIRST block whose name starts
+        // with "ImageMetadat" is walked. Keep this in the same metadata pass so
+        // we do not read/scan the same metadata block again.
         let mut lv = Nd2LvValues::default();
+        let mut image_metadata_lv = ImageMetadataLv::default();
+        let mut image_metadata_z_count_candidate: Option<u32> = None;
+        let mut image_metadata_lv_found = false;
         for ac in chunks
             .iter()
             .filter(|c| c.name.starts_with("ImageAttributes"))
         {
             if let Ok(data) = read_chunk_data(&mut reader, ac) {
+                parse_nd2_lv(&data, &mut lv);
                 parse_nd2_binary_image_attributes(&data, &mut lv);
             }
         }
@@ -2857,10 +4136,60 @@ impl FormatReader for Nd2Reader {
             c.name.starts_with("ImageMetadataSeq")
                 || c.name.starts_with("ImageMetadata")
                 || c.name.starts_with("ImageCalibration")
+                || c.name.starts_with("ImageText")
+                || c.name.starts_with("CustomDataVar|NDControl")
+                || c.name.contains("GrabberCameraSettings")
         }) {
             if let Ok(data) = read_chunk_data(&mut reader, mc) {
                 parse_nd2_lv(&data, &mut lv);
                 let xml = String::from_utf8_lossy(&data);
+                parse_nd2_xml_metadata(&xml, &mut lv);
+                if mc.name.starts_with("ImageMetadat") {
+                    let scan_data = image_metadata_lv_scan_bytes(&mc.name, &data);
+                    if let Some(result) = parse_image_metadata_lv(&scan_data) {
+                        if !scan_data.starts_with(b"<?xml")
+                            && (result.processed
+                                || result.current_count_set
+                                || !result.order.is_empty())
+                        {
+                            image_metadata_lv_found = true;
+                        }
+                        if result.current_count_set && result.z_count > 1 {
+                            image_metadata_z_count_candidate = Some(
+                                image_metadata_z_count_candidate
+                                    .unwrap_or(1)
+                                    .max(result.z_count as u32),
+                            );
+                        }
+                        if result.processed && !image_metadata_lv.processed {
+                            image_metadata_lv = result;
+                        }
+                    }
+                }
+                nd2_update_loop_counts_from_xml(
+                    &xml,
+                    &mut loop_size_z,
+                    &mut loop_size_t,
+                    &mut loop_series_count,
+                );
+                if let Some(count) = nd2_xml_xy_position_count_with_valid_flags(&xml) {
+                    if count > 1 {
+                        loop_series_count = Some(count);
+                    }
+                }
+                let has_ndcontrol_loop = nd2_xml_ndcontrol_loop_dimensions(&xml).is_some();
+                has_declared_ndcontrol_loop_dimensions |= has_ndcontrol_loop;
+                has_ndcontrol_dimension_order |= has_ndcontrol_loop;
+                nd2_update_loop_descriptors_from_xml(&xml, &mut loop_descriptors);
+                nd2_replace_position_names_if_more_informative(
+                    &mut position_names,
+                    nd2_xml_old_jp2_valid_position_names(&xml),
+                );
+                has_spectral_loop |= !nd2_xml_loop_container_counts(&xml, "SpectLoop").is_empty();
+            }
+        }
+        for text in lv.text_infos.clone() {
+            if let Some(xml) = nd2_text_xml_fragment(&text) {
                 parse_nd2_xml_metadata(&xml, &mut lv);
                 nd2_update_loop_counts_from_xml(
                     &xml,
@@ -2868,7 +4197,20 @@ impl FormatReader for Nd2Reader {
                     &mut loop_size_t,
                     &mut loop_series_count,
                 );
+                if let Some(count) = nd2_xml_xy_position_count_with_valid_flags(&xml) {
+                    if count > 1 {
+                        loop_series_count = Some(count);
+                    }
+                }
+                let has_ndcontrol_loop = nd2_xml_ndcontrol_loop_dimensions(&xml).is_some();
+                has_declared_ndcontrol_loop_dimensions |= has_ndcontrol_loop;
+                has_ndcontrol_dimension_order |= has_ndcontrol_loop;
                 nd2_update_loop_descriptors_from_xml(&xml, &mut loop_descriptors);
+                nd2_replace_position_names_if_more_informative(
+                    &mut position_names,
+                    nd2_xml_old_jp2_valid_position_names(&xml),
+                );
+                has_spectral_loop |= !nd2_xml_loop_container_counts(&xml, "SpectLoop").is_empty();
             }
         }
         // Build the backup handler from the text-annotation blocks, mirroring
@@ -2881,6 +4223,21 @@ impl FormatReader for Nd2Reader {
         for text in &lv.text_infos {
             let mut candidate = Nd2LvValues::default();
             parse_text(text, &mut candidate);
+            if let Some(z) = candidate.text_size_z.filter(|&z| z > 0) {
+                if loop_size_z.is_none_or(|current| current <= 1 || z < current) {
+                    loop_size_z = Some(z);
+                }
+            }
+            if let Some(t) = candidate.text_size_t.filter(|&t| t > 0) {
+                if loop_size_t.is_none_or(|current| current <= 1 || t < current) {
+                    loop_size_t = Some(t);
+                }
+            }
+            if let Some(count) = candidate.text_series_count.filter(|&count| count > 1) {
+                if loop_series_count.is_none_or(|current| current <= 1) {
+                    loop_series_count = Some(count);
+                }
+            }
             if backup.channel_names.is_empty() {
                 backup = candidate;
             }
@@ -2888,28 +4245,28 @@ impl FormatReader for Nd2Reader {
         self.backup_channel_names = backup.channel_names;
         self.backup_emission_wavelengths = backup.emission_wavelengths;
         self.backup_excitation_wavelengths = backup.excitation_wavelengths;
-
-        // Binary ImageMetadataLV eType/uiCount walk (ND2Reader.initFile
-        // java:967-1062). Builds imageMetadataLVOrder (M/T/Z) and the T/Z/M counts
-        // directly from the binary metadata. Java guards this with
-        // `!imageMetadataLVProcessed`, so only the FIRST block whose name starts
-        // with "ImageMetadat" is walked. We scan chunks in their natural order and
-        // stop at the first that yields a processed LV experiment.
-        let mut image_metadata_lv = ImageMetadataLv::default();
-        for mc in chunks.iter().filter(|c| c.name.starts_with("ImageMetadat")) {
-            if image_metadata_lv.processed {
-                break;
-            }
-            if let Ok(data) = read_chunk_data(&mut reader, mc) {
-                let scan_data = image_metadata_lv_scan_bytes(&mc.name, &data);
-                if let Some(result) = parse_image_metadata_lv(&scan_data) {
-                    if result.processed {
-                        image_metadata_lv = result;
-                        break;
-                    }
-                }
+        if let Some(z) = lv.text_size_z.filter(|&z| z > 0) {
+            if loop_size_z.is_none_or(|current| current <= 1) {
+                loop_size_z = Some(z);
             }
         }
+        if let Some(t) = lv.text_size_t.filter(|&t| t > 0) {
+            if loop_size_t.is_none_or(|current| current <= 1 || t < current) {
+                loop_size_t = Some(t);
+            }
+        }
+        if let Some(count) = lv.text_series_count.filter(|&count| count > 1) {
+            if loop_series_count.is_none_or(|current| current <= 1) {
+                loop_series_count = Some(count);
+            }
+        }
+        if let Some(w) = lv.lv_size_x.filter(|&w| w > 0) {
+            size_x = w;
+        }
+        if let Some(h) = lv.lv_size_y.filter(|&h| h > 0) {
+            size_y = h;
+        }
+        let z_count_from_range = nd2_z_count_from_range(lv.z_high, lv.z_low, lv.z_step);
 
         self.physical_size = lv.calibration;
         self.physical_size_z = lv.z_step;
@@ -2922,6 +4279,7 @@ impl FormatReader for Nd2Reader {
         self.pos_x = lv.pos_x;
         self.pos_y = lv.pos_y;
         self.pos_z = lv.pos_z;
+        self.position_names = position_names;
         self.position_count = lv.position_count;
         self.lens_na = lv.lens_na;
         self.objective_mag = lv.objective_mag;
@@ -3016,6 +4374,12 @@ impl FormatReader for Nd2Reader {
             .transpose()
             .map_err(BioFormatsError::Io)?
             .unwrap_or_default();
+        let has_float_comp_range = chunks
+            .iter()
+            .any(|c| c.name.starts_with("CustomData|FloatCompRange"));
+        let has_nikon_sim_acq_data = chunks
+            .iter()
+            .any(|c| c.name.starts_with("CustomData|NikonSimAcqData"));
 
         // Per-effective-channel colors: look each channel name up in the
         // channelColors map (ND2Reader.populateMetadataStore:2271-2288). Names
@@ -3043,17 +4407,46 @@ impl FormatReader for Nd2Reader {
             })
             .collect();
 
-        // Dimension order: Java ND2Reader builds "XY" + order, then appends any
-        // of Z/C/T not already present. With no acquisition-loop order and a
-        // single channel this yields XYZCT (see ND2Reader ~1530, ~2014).
-        let dimension_order = if size_c > 1 {
+        // Dimension order: Java ND2Reader builds "XY" + the handler's seed
+        // order, then appends any of Z/C/T not already present. Text loop counts
+        // and XML loop descriptors do not by themselves make the seed C-first;
+        // ImageMetadataLV-present Z/T `uiCount` handlers are explicitly skipped
+        // in ND2Handler. The NDControl `LoopSize` branch is different: it sets
+        // `dimensionOrder = "CZT"` unconditionally.
+        let mut dimension_order = if size_c > 1
+            || (has_spectral_loop && loop_size_t.is_some())
+            || has_ndcontrol_dimension_order
+            || loop_series_count.is_some_and(|count| count > 1)
+        {
             DimensionOrder::XYCZT
         } else {
             DimensionOrder::XYZCT
         };
 
-        let image_count = image_chunks.len() as u32;
+        let has_time_loop_descriptor = loop_descriptors
+            .iter()
+            .any(|descriptor| descriptor.kind == "TimeLoop");
+        let has_z_loop_descriptor = loop_descriptors
+            .iter()
+            .any(|descriptor| descriptor.kind == "ZStackLoop");
+        let mut image_count = image_chunks.len() as u32;
         let mut position_count = loop_series_count.filter(|&count| count > 1).unwrap_or(1);
+        if self.position_names.len() > 1 {
+            position_count = self.position_names.len() as u32;
+        }
+        if !has_z_loop_descriptor
+            && loop_size_z.is_some_and(|z| z == position_count || Some(z) == loop_series_count)
+        {
+            loop_size_z = None;
+            if size_z == position_count {
+                size_z = 1;
+            }
+        }
+        if !has_time_loop_descriptor
+            && loop_size_t.is_some_and(|t| t == position_count || Some(t) == loop_series_count)
+        {
+            loop_size_t = None;
+        }
         let mut size_t = 1u32;
 
         // Validate the binary ImageMetadataLV result (ND2Reader.initFile
@@ -3077,17 +4470,102 @@ impl FormatReader for Nd2Reader {
             position_count = (image_metadata_lv.xy_count.max(0) as u32).max(1);
         } else {
             image_metadata_lv.processed = false;
-            if let Some(z) = loop_size_z {
-                size_z = z.max(1);
-            }
             if let Some(t) = loop_size_t {
                 size_t = t.max(1);
+            }
+            if position_count > 1 && size_z <= 1 {
+                let complete_t = image_chunks.len() as u32 / position_count.max(1);
+                if complete_t > 0 && complete_t < size_t {
+                    size_t = complete_t;
+                }
+            }
+            let z_candidate_matches_image_count =
+                image_metadata_z_count_candidate.is_some_and(|z| {
+                    image_count > 0
+                        && image_count
+                            % position_count
+                                .max(1)
+                                .saturating_mul(size_t.max(1))
+                                .saturating_mul(z.max(1))
+                            == 0
+                });
+            if z_candidate_matches_image_count {
+                size_z = image_metadata_z_count_candidate.unwrap().max(1);
+            } else if let Some(z) = loop_size_z {
+                size_z = z.max(1);
+            } else if let Some(z) = image_metadata_z_count_candidate {
+                size_z = z.max(1);
+            } else if let Some(z) = z_count_from_range {
+                size_z = z.max(1);
+            }
+            if size_c > 1 && position_count > 1 {
+                let denom = position_count
+                    .max(1)
+                    .saturating_mul(size_t.max(1))
+                    .saturating_mul(size_c.max(1));
+                if denom > 0 && image_count > 0 && image_count % denom == 0 {
+                    let inferred_z = image_count / denom;
+                    if inferred_z > size_z {
+                        size_z = inferred_z;
+                    }
+                }
+            }
+            if size_c > 1 && position_count > 1 && size_z > 1 {
+                let denom = position_count
+                    .max(1)
+                    .saturating_mul(size_z.max(1))
+                    .saturating_mul(size_c.max(1));
+                if denom > 0 && image_count > 0 && image_count % denom == 0 {
+                    size_t = (image_count / denom).max(1);
+                }
+            }
+            if image_count > 0 && image_count % position_count.max(1) == 0 {
+                let per_series_planes = image_count / position_count;
+                let count = if size_c > 1 {
+                    per_series_planes
+                } else if per_series_planes >= size_c.max(1) {
+                    per_series_planes / size_c.max(1)
+                } else {
+                    per_series_planes
+                };
+                let zt = size_z.saturating_mul(size_t);
+                if count > zt && count - zt == size_z {
+                    size_t = size_t.saturating_add(1);
+                }
             }
             let expected_planes = size_z
                 .saturating_mul(size_t)
                 .saturating_mul(position_count.max(1));
-            if image_count > 0 && expected_planes != image_count {
-                if size_t > 1 && image_count % size_t == 0 {
+            let has_explicit_plane_count_evidence = loop_size_z.is_some()
+                || loop_size_t.is_some()
+                || image_metadata_z_count_candidate.is_some()
+                || z_count_from_range.is_some();
+            if size_c > 1
+                && position_count <= 1
+                && expected_planes > 0
+                && expected_planes <= image_count
+                && has_explicit_plane_count_evidence
+            {
+                image_count = expected_planes;
+            }
+            if has_declared_ndcontrol_loop_dimensions
+                && expected_planes > 0
+                && expected_planes < image_count
+            {
+                image_count = expected_planes;
+            }
+            if image_count > 0
+                && expected_planes != image_count
+                && !has_declared_ndcontrol_loop_dimensions
+            {
+                let positioned_z_planes = position_count.max(1).saturating_mul(size_z.max(1));
+                if position_count > 1
+                    && size_z > 1
+                    && positioned_z_planes > 0
+                    && image_count % positioned_z_planes == 0
+                {
+                    size_t = (image_count / positioned_z_planes).max(1);
+                } else if size_t > 1 && image_count % size_t == 0 {
                     size_z = (image_count / size_t).max(1);
                 } else if size_z > 1 && image_count % size_z == 0 {
                     size_t = (image_count / size_z).max(1);
@@ -3109,6 +4587,101 @@ impl FormatReader for Nd2Reader {
             // to 1 and sizeT becomes imageOffsets.size()/seriesCount.
             size_t = image_count;
         }
+        if size_c > 1
+            && position_count <= 1
+            && loop_size_z.is_none()
+            && loop_size_t == Some(size_t)
+            && image_count > 0
+            && image_count == size_z
+        {
+            size_t = 1;
+        }
+        if size_c == 1
+            && !image_metadata_lv_found
+            && !has_image_metadata_lv_chunk
+            && !has_ndcontrol_dimension_order
+            && !(loop_size_z.is_some() && loop_size_t.is_some())
+            && !loop_descriptors.is_empty()
+        {
+            let z_index = loop_descriptors
+                .iter()
+                .position(|descriptor| descriptor.kind == "ZStackLoop");
+            let t_index = loop_descriptors
+                .iter()
+                .position(|descriptor| descriptor.kind == "TimeLoop");
+            if let (Some(z_index), Some(t_index)) = (z_index, t_index) {
+                dimension_order = if t_index < z_index {
+                    DimensionOrder::XYZTC
+                } else {
+                    DimensionOrder::XYTZC
+                };
+            }
+        }
+        if size_c == 1
+            && size_t > 1
+            && !has_ndcontrol_dimension_order
+            && loop_size_t.is_some_and(|declared_t| declared_t != size_t)
+            && loop_descriptors
+                .first()
+                .is_some_and(|descriptor| descriptor.kind == "TimeLoop")
+        {
+            dimension_order = DimensionOrder::XYZTC;
+        }
+        let mut too_small_row_corrected = false;
+        if image_chunks.len() > 1 && size_x > 0 && size_y > 0 && size_c > 0 {
+            let first = &chunks[image_chunks[0]];
+            let second = &chunks[image_chunks[1]];
+            // Java computes availableBytes from the distance between consecutive
+            // image offsets. In this map-reader representation the comparable
+            // offset is block_offset + 16, i.e. after magic/nameLen/dataLen.
+            let available_bytes = second
+                .block_offset
+                .saturating_add(16)
+                .saturating_sub(first.block_offset.saturating_add(16));
+            let row_size = u64::from(size_x)
+                .saturating_mul(u64::from(size_c.max(1)))
+                .saturating_mul(pixel_type.bytes_per_sample() as u64);
+            let first_encoding = read_chunk_prefix(&mut reader, first, 8192)
+                .ok()
+                .map(|prefix| {
+                    let bps = pixel_type.bytes_per_sample();
+                    let stored_expected = if size_c > 1 {
+                        let scanline_pad = if size_x % 2 != 0 && size_c % 2 != 0 {
+                            1usize
+                        } else {
+                            0usize
+                        };
+                        (size_x as usize + scanline_pad)
+                            .saturating_mul(size_y as usize)
+                            .saturating_mul(size_c as usize)
+                            .saturating_mul(bps)
+                    } else {
+                        let scanline_pad = ((bps * size_x as usize) % 4) / bps;
+                        (size_x as usize + scanline_pad)
+                            .saturating_mul(size_y as usize)
+                            .saturating_mul(bps)
+                    };
+                    nd2_frame_payload_layout(&prefix, first.data_length as usize, stored_expected)
+                        .0
+                        .to_string()
+                })
+                .unwrap_or_default();
+            let too_small_row_candidate = first_encoding == "too_small" && size_y > 1000;
+            let java_style_row_correction =
+                first_encoding.starts_with("raw") || too_small_row_candidate;
+            if java_style_row_correction && row_size > 0 {
+                let corrected_size_y = (available_bytes / row_size) as u32;
+                if corrected_size_y > 0 && corrected_size_y < size_y {
+                    size_y = corrected_size_y;
+                    too_small_row_corrected = too_small_row_candidate;
+                }
+            }
+        }
+        if too_small_row_corrected {
+            self.channel_colors.clear();
+            self.colors.clear();
+            self.text_channel_names.clear();
+        }
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
         series_metadata.insert("nd2_chunks".into(), MetadataValue::Int(chunks.len() as i64));
         series_metadata.insert(
@@ -3117,6 +4690,8 @@ impl FormatReader for Nd2Reader {
         );
         let mut plane_delta_t = vec![None; image_count as usize];
         let mut plane_position_z = vec![None; image_count as usize];
+        let eager_plane_metadata =
+            image_chunks.len() <= ND2_EAGER_PLANE_METADATA_LIMIT || position_count > 1;
         if let Some(z) = loop_size_z {
             series_metadata.insert("nd2_loop_size_z".into(), MetadataValue::Int(z as i64));
         }
@@ -3156,36 +4731,96 @@ impl FormatReader for Nd2Reader {
             }
         }
         if !image_sequence_indices.is_empty() {
-            series_metadata.insert(
-                "nd2_image_data_sequence_indices".into(),
-                MetadataValue::String(
-                    image_sequence_indices
-                        .iter()
-                        .map(|index| index.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-            );
-            series_metadata.insert(
-                "nd2_image_data_chunk_lengths".into(),
-                MetadataValue::String(
-                    image_chunks
-                        .iter()
-                        .map(|&chunk_index| chunks[chunk_index].data_length.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-            );
-
-            let mut image_data_encodings = Vec::with_capacity(image_chunks.len());
-            let mut image_data_payload_offsets = Vec::with_capacity(image_chunks.len());
+            let mut image_data_encodings = Vec::new();
+            let mut image_data_payload_offsets = Vec::new();
             let mut image_data_chunk_tables = Vec::new();
             let mut image_data_chunk_table_ranges = Vec::new();
             let mut image_data_timestamps = Vec::new();
-            for (plane, &chunk_index) in image_chunks.iter().enumerate() {
-                let chunk = &chunks[chunk_index];
-                let stored_expected =
-                    stored_expected_for_nd2_frame(size_x, size_y, size_c, pixel_type);
+            let bps = pixel_type.bytes_per_sample();
+            let stored_expected = if size_c > 1 {
+                let scanline_pad = if size_x % 2 != 0 && size_c % 2 != 0 {
+                    1usize
+                } else {
+                    0usize
+                };
+                (size_x as usize + scanline_pad)
+                    .saturating_mul(size_y as usize)
+                    .saturating_mul(size_c as usize)
+                    .saturating_mul(bps)
+            } else {
+                let scanline_pad = ((bps * size_x as usize) % 4) / bps;
+                (size_x as usize + scanline_pad)
+                    .saturating_mul(size_y as usize)
+                    .saturating_mul(bps)
+            };
+            if eager_plane_metadata {
+                series_metadata.insert(
+                    "nd2_image_data_sequence_indices".into(),
+                    MetadataValue::String(
+                        image_sequence_indices
+                            .iter()
+                            .map(|index| index.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+                series_metadata.insert(
+                    "nd2_image_data_chunk_lengths".into(),
+                    MetadataValue::String(
+                        image_chunks
+                            .iter()
+                            .map(|&chunk_index| chunks[chunk_index].data_length.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+                image_data_encodings.reserve(image_chunks.len());
+                image_data_payload_offsets.reserve(image_chunks.len());
+                for (plane, &chunk_index) in image_chunks.iter().enumerate() {
+                    let chunk = &chunks[chunk_index];
+                    if let Ok(prefix) = read_chunk_prefix(&mut reader, chunk, 8192) {
+                        let (encoding, payload_offset) = nd2_frame_payload_layout(
+                            &prefix,
+                            chunk.data_length as usize,
+                            stored_expected,
+                        );
+                        image_data_encodings.push(encoding.to_string());
+                        image_data_payload_offsets.push(payload_offset.to_string());
+                        if let Some((_, table)) = nd2_chunk_table_payload_encoding(
+                            &prefix,
+                            chunk.data_length as usize,
+                            stored_expected,
+                        ) {
+                            image_data_chunk_tables.push(format!(
+                                "plane={plane}:offset={},entry_width={},count={},first_payload={},payload_bytes={}",
+                                table.table_offset,
+                                table.entry_width,
+                                table.chunk_count,
+                                table.first_payload_offset,
+                                table.total_payload_len
+                            ));
+                            image_data_chunk_table_ranges.push(format!(
+                                "plane={plane}:{}",
+                                table
+                                    .ranges
+                                    .iter()
+                                    .map(|&(start, end)| format!("{start}..{end}"))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            ));
+                        }
+                        if let Some(timestamp) =
+                            nd2_prefix_timestamp_seconds(&prefix, payload_offset)
+                        {
+                            image_data_timestamps.push(timestamp.to_string());
+                            if let Some(slot) = plane_delta_t.get_mut(plane) {
+                                *slot = Some(timestamp);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(&first_chunk_index) = image_chunks.first() {
+                let chunk = &chunks[first_chunk_index];
                 if let Ok(prefix) = read_chunk_prefix(&mut reader, chunk, 8192) {
                     let (encoding, payload_offset) = nd2_frame_payload_layout(
                         &prefix,
@@ -3194,35 +4829,6 @@ impl FormatReader for Nd2Reader {
                     );
                     image_data_encodings.push(encoding.to_string());
                     image_data_payload_offsets.push(payload_offset.to_string());
-                    if let Some((_, table)) = nd2_chunk_table_payload_encoding(
-                        &prefix,
-                        chunk.data_length as usize,
-                        stored_expected,
-                    ) {
-                        image_data_chunk_tables.push(format!(
-                            "plane={plane}:offset={},entry_width={},count={},first_payload={},payload_bytes={}",
-                            table.table_offset,
-                            table.entry_width,
-                            table.chunk_count,
-                            table.first_payload_offset,
-                            table.total_payload_len
-                        ));
-                        image_data_chunk_table_ranges.push(format!(
-                            "plane={plane}:{}",
-                            table
-                                .ranges
-                                .iter()
-                                .map(|&(start, end)| format!("{start}..{end}"))
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ));
-                    }
-                    if let Some(timestamp) = nd2_prefix_timestamp_seconds(&prefix, payload_offset) {
-                        image_data_timestamps.push(timestamp.to_string());
-                        if let Some(slot) = plane_delta_t.get_mut(plane) {
-                            *slot = Some(timestamp);
-                        }
-                    }
                 }
             }
             if !image_data_encodings.is_empty() {
@@ -3254,18 +4860,11 @@ impl FormatReader for Nd2Reader {
                 }
             }
 
-            if let Some(&first_chunk_index) = image_chunks.first() {
-                let first_chunk = &chunks[first_chunk_index];
-                let stored_expected =
-                    stored_expected_for_nd2_frame(size_x, size_y, size_c, pixel_type);
-                if let Ok(data) = read_chunk_data(&mut reader, first_chunk) {
-                    series_metadata.insert(
-                        "nd2_first_image_data_encoding".into(),
-                        MetadataValue::String(
-                            nd2_frame_payload_hint(&data, stored_expected).to_string(),
-                        ),
-                    );
-                }
+            if let Some(first_encoding) = image_data_encodings.first() {
+                series_metadata.insert(
+                    "nd2_first_image_data_encoding".into(),
+                    MetadataValue::String(first_encoding.clone()),
+                );
             }
         }
         if !metadata_sequence_indices.is_empty() {
@@ -3273,50 +4872,54 @@ impl FormatReader for Nd2Reader {
                 "nd2_image_metadata_seq_chunks".into(),
                 MetadataValue::Int(metadata_chunks.len() as i64),
             );
-            series_metadata.insert(
-                "nd2_image_metadata_seq_indices".into(),
-                MetadataValue::String(
-                    metadata_sequence_indices
-                        .iter()
-                        .map(|index| index.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-            );
-            series_metadata.insert(
-                "nd2_image_metadata_seq_chunk_lengths".into(),
-                MetadataValue::String(
-                    metadata_chunks
-                        .iter()
-                        .map(|&chunk_index| chunks[chunk_index].data_length.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-            );
+            if eager_plane_metadata {
+                series_metadata.insert(
+                    "nd2_image_metadata_seq_indices".into(),
+                    MetadataValue::String(
+                        metadata_sequence_indices
+                            .iter()
+                            .map(|index| index.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+                series_metadata.insert(
+                    "nd2_image_metadata_seq_chunk_lengths".into(),
+                    MetadataValue::String(
+                        metadata_chunks
+                            .iter()
+                            .map(|&chunk_index| chunks[chunk_index].data_length.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+            }
             series_metadata.insert(
                 "nd2_image_metadata_seq_matches_images".into(),
                 MetadataValue::Bool(metadata_sequence_indices == image_sequence_indices),
             );
             let mut metadata_timestamps = Vec::with_capacity(metadata_chunks.len());
-            for (ordinal, &chunk_index) in metadata_chunks.iter().enumerate() {
-                let chunk = &chunks[chunk_index];
-                if let Ok(data) = read_chunk_data(&mut reader, chunk) {
-                    let xml = String::from_utf8_lossy(&data);
-                    let plane = metadata_sequence_indices
-                        .get(ordinal)
-                        .copied()
-                        .unwrap_or(ordinal);
-                    if let Some(timestamp) = nd2_xml_plane_timestamp_seconds(&xml) {
-                        metadata_timestamps.push(timestamp.to_string());
-                        if let Some(slot) = plane_delta_t.get_mut(plane) {
-                            if slot.is_none() {
-                                *slot = Some(timestamp);
+            if eager_plane_metadata {
+                for (ordinal, &chunk_index) in metadata_chunks.iter().enumerate() {
+                    let chunk = &chunks[chunk_index];
+                    if let Ok(data) = read_chunk_data(&mut reader, chunk) {
+                        let xml = String::from_utf8_lossy(&data);
+                        let plane = metadata_sequence_indices
+                            .get(ordinal)
+                            .copied()
+                            .unwrap_or(ordinal);
+                        if let Some(timestamp) = nd2_xml_plane_timestamp_seconds(&xml) {
+                            metadata_timestamps.push(timestamp.to_string());
+                            if let Some(slot) = plane_delta_t.get_mut(plane) {
+                                if slot.is_none() {
+                                    *slot = Some(timestamp);
+                                }
                             }
                         }
-                    }
-                    if let Some(z) = nd2_xml_plane_z_position(&xml) {
-                        if let Some(slot) = plane_position_z.get_mut(plane) {
-                            *slot = Some(z);
+                        if let Some(z) = nd2_xml_plane_z_position(&xml) {
+                            if let Some(slot) = plane_position_z.get_mut(plane) {
+                                *slot = Some(z);
+                            }
                         }
                     }
                 }
@@ -3344,6 +4947,35 @@ impl FormatReader for Nd2Reader {
         let mut series_size_z_overrides: Vec<u32> = Vec::new();
         let mut series_size_t_overrides: Vec<u32> = Vec::new();
         let mut series_image_count_overrides: Vec<u32> = Vec::new();
+
+        if has_declared_ndcontrol_loop_dimensions
+            && !has_time_loop_descriptor
+            && !has_z_loop_descriptor
+            && size_z.saturating_mul(size_t) != image_count
+            && size_c > 1
+            && position_count <= 1
+            && image_count > 0
+            && image_count <= image_chunks.len() as u32
+        {
+            size_z = image_count.max(1);
+            size_t = 1;
+            series_size_z = size_z;
+            series_size_t = size_t;
+            series_image_count = size_z.saturating_mul(size_c.max(1));
+        }
+        if size_c > 1 && self.position_count > 1 && size_z > 1 {
+            let position_count = self.position_count.max(1);
+            let denom = position_count.saturating_mul(size_z.max(1));
+            if denom > 0 && (image_chunks.len() as u32) % denom == 0 {
+                let inferred_t = (image_chunks.len() as u32 / denom).max(1);
+                if inferred_t > size_t {
+                    size_t = inferred_t;
+                    series_size_t = size_t;
+                    series_image_count =
+                        size_z.saturating_mul(size_t).saturating_mul(size_c.max(1));
+                }
+            }
+        }
 
         // When the binary ImageMetadataLV was processed, drive series/plane mapping
         // from the faithful FormatTools.rasterToPosition layout (ND2Reader.initFile
@@ -3448,10 +5080,227 @@ impl FormatReader for Nd2Reader {
                 "nd2_image_metadata_lv_field_index".into(),
                 MetadataValue::Int(mapping.field_index as i64),
             );
-        } else if !image_metadata_lv.processed {
+        } else if (has_float_comp_range || has_nikon_sim_acq_data)
+            && size_c == 1
+            && size_z == 1
+            && image_chunks.len() > 1
+            && loop_size_t.is_some()
+        {
+            // Nikon SIM ND2s can carry one stored image per SIM angle/phase.
+            // Java's ND2Handler sees initialized Z/T core dimensions and takes
+            // the `qName == "no_name" && v > 1` branch for NDControl LoopSize,
+            // expanding the core list instead of treating the value as a time
+            // count. Raw SIM files may have LoopSize one less than the stored
+            // offset count, so the series count follows imageOffsets.
+            series_count = image_chunks.len();
+            series_image_count = 1;
+            series_size_z = 1;
+            series_size_t = 1;
+            series_image_chunks = image_chunks.iter().map(|&chunk| vec![chunk]).collect();
+            series_plane_offsets = (0..series_count).collect();
+            series_source_planes = (0..series_count).map(|plane| vec![plane]).collect();
+            series_handling = "ndcontrol_nikon_sim_loop_size_rebuilt_series";
+        } else {
             if let Some(position_count) = loop_series_count.filter(|&count| count > 1) {
                 let position_count = position_count as usize;
-                if image_count as usize == position_count {
+                let global_plane_count = image_chunks.len();
+                let logical_planes_per_series = size_z as usize
+                    * size_t as usize
+                    * if size_c > 1 { size_c as usize } else { 1 };
+                let compacted_series = (logical_planes_per_series > 0
+                    && global_plane_count % logical_planes_per_series == 0)
+                    .then_some(global_plane_count / logical_planes_per_series)
+                    .filter(|&count| count > 1 && count <= position_count);
+                let java_non_lv_mapping = if global_plane_count > 0 {
+                    let mut lengths = [1i32; 4];
+                    let field_index = 2usize;
+                    let mut axes = match dimension_order {
+                        DimensionOrder::XYCTZ => ['C', 'T', 'Z'].into_iter(),
+                        DimensionOrder::XYCZT => ['C', 'Z', 'T'].into_iter(),
+                        DimensionOrder::XYTCZ => ['T', 'C', 'Z'].into_iter(),
+                        DimensionOrder::XYTZC => ['T', 'Z', 'C'].into_iter(),
+                        DimensionOrder::XYZCT => ['Z', 'C', 'T'].into_iter(),
+                        DimensionOrder::XYZTC => ['Z', 'T', 'C'].into_iter(),
+                    };
+                    for (i, length) in lengths.iter_mut().enumerate() {
+                        if i == field_index {
+                            *length = position_count as i32;
+                        } else if let Some(axis) = axes.next() {
+                            *length = match axis {
+                                'Z' => size_z.max(1) as i32,
+                                'T' => size_t.max(1) as i32,
+                                // Java uses length 1 for C in this mapping; split
+                                // channel selection happens later in openBytes.
+                                'C' => 1,
+                                _ => 1,
+                            };
+                        }
+                    }
+                    let mut zct_lengths = lengths;
+                    zct_lengths[field_index] = 1;
+                    let in_series_planes = zct_lengths
+                        .iter()
+                        .map(|&length| length.max(1) as usize)
+                        .product::<usize>();
+                    let mut placed =
+                        vec![vec![None; in_series_planes]; lengths[field_index].max(1) as usize];
+                    let mut one_indexed = false;
+                    for compact in 0..global_plane_count {
+                        let mut ndx = image_sequence_indices
+                            .get(compact)
+                            .copied()
+                            .unwrap_or(compact) as i32;
+                        if ndx == 1 && compact == 0 {
+                            one_indexed = true;
+                        }
+                        if one_indexed {
+                            ndx -= 1;
+                        }
+                        if ndx < 0 {
+                            continue;
+                        }
+                        let mut pos = raster_to_position(&lengths, ndx);
+                        let series_index = pos[field_index];
+                        pos[field_index] = 0;
+                        let plane = position_to_raster(&zct_lengths, &pos);
+                        if series_index >= 0
+                            && (series_index as usize) < placed.len()
+                            && plane >= 0
+                            && (plane as usize) < in_series_planes
+                        {
+                            placed[series_index as usize][plane as usize] = Some(compact);
+                        }
+                    }
+                    let source_planes = placed
+                        .into_iter()
+                        .filter(|planes| planes.first().is_some_and(Option::is_some))
+                        .map(|planes| planes.into_iter().flatten().collect::<Vec<_>>())
+                        .filter(|planes| !planes.is_empty())
+                        .collect::<Vec<_>>();
+                    let max_source_planes = source_planes.iter().map(Vec::len).max().unwrap_or(0);
+                    let expected_source_planes = compacted_series
+                        .map(|count| global_plane_count / count)
+                        .unwrap_or_else(|| size_z.max(1) as usize * size_t.max(1) as usize);
+                    (source_planes.len() > 1 && max_source_planes == expected_source_planes)
+                        .then_some(source_planes)
+                } else {
+                    None
+                };
+                if let Some(source_planes) = java_non_lv_mapping {
+                    series_count = source_planes.len();
+                    let stored_planes_per_series =
+                        source_planes.iter().map(Vec::len).max().unwrap_or(0);
+                    let inferred_t =
+                        if size_z > 0 && stored_planes_per_series % size_z as usize == 0 {
+                            (stored_planes_per_series / size_z as usize) as u32
+                        } else {
+                            size_t
+                        };
+                    series_image_count = size_z
+                        .max(1)
+                        .saturating_mul(inferred_t.max(1))
+                        .saturating_mul(size_c.max(1));
+                    series_size_z = size_z;
+                    series_size_t = inferred_t.max(1);
+                    series_source_planes = source_planes;
+                    series_image_chunks = series_source_planes
+                        .iter()
+                        .map(|planes| planes.iter().map(|&plane| image_chunks[plane]).collect())
+                        .collect();
+                    series_plane_offsets = series_source_planes
+                        .iter()
+                        .map(|planes| planes.first().copied().unwrap_or(0))
+                        .collect();
+                    series_metadata.insert(
+                        "nd2_loop_series_layout_source".into(),
+                        MetadataValue::String("java_non_lv_raster_mapping".into()),
+                    );
+                    series_handling = "split_xy_positions_non_lv_raster_mapping";
+                } else if let Some(compacted_series) = compacted_series {
+                    let stored_planes_per_series = global_plane_count / compacted_series;
+                    let inferred_t =
+                        if size_z > 0 && stored_planes_per_series % size_z as usize == 0 {
+                            (stored_planes_per_series / size_z as usize) as u32
+                        } else {
+                            size_t
+                        };
+                    series_count = compacted_series;
+                    series_image_count = size_z
+                        .max(1)
+                        .saturating_mul(inferred_t.max(1))
+                        .saturating_mul(size_c.max(1));
+                    series_size_z = size_z;
+                    series_size_t = inferred_t.max(1);
+                    let mut lengths = [1i32; 4];
+                    let field_index = 2usize;
+                    let mut axes = match dimension_order {
+                        DimensionOrder::XYCTZ => ['C', 'T', 'Z'].into_iter(),
+                        DimensionOrder::XYCZT => ['C', 'Z', 'T'].into_iter(),
+                        DimensionOrder::XYTCZ => ['T', 'C', 'Z'].into_iter(),
+                        DimensionOrder::XYTZC => ['T', 'Z', 'C'].into_iter(),
+                        DimensionOrder::XYZCT => ['Z', 'C', 'T'].into_iter(),
+                        DimensionOrder::XYZTC => ['Z', 'T', 'C'].into_iter(),
+                    };
+                    for (i, length) in lengths.iter_mut().enumerate() {
+                        if i == field_index {
+                            *length = compacted_series as i32;
+                        } else if let Some(axis) = axes.next() {
+                            *length = match axis {
+                                'Z' => size_z.max(1) as i32,
+                                'T' => inferred_t.max(1) as i32,
+                                'C' => 1,
+                                _ => 1,
+                            };
+                        }
+                    }
+                    let mut zct_lengths = lengths;
+                    zct_lengths[field_index] = 1;
+                    let mut placed = vec![vec![None; stored_planes_per_series]; compacted_series];
+                    let mut one_indexed = false;
+                    for compact in 0..global_plane_count {
+                        let mut ndx = image_sequence_indices
+                            .get(compact)
+                            .copied()
+                            .unwrap_or(compact) as i32;
+                        if ndx == 1 && compact == 0 {
+                            one_indexed = true;
+                        }
+                        if one_indexed {
+                            ndx -= 1;
+                        }
+                        if ndx < 0 {
+                            continue;
+                        }
+                        let mut pos = raster_to_position(&lengths, ndx);
+                        let series_index = pos[field_index];
+                        pos[field_index] = 0;
+                        let plane = position_to_raster(&zct_lengths, &pos);
+                        if series_index >= 0
+                            && (series_index as usize) < placed.len()
+                            && plane >= 0
+                            && (plane as usize) < stored_planes_per_series
+                        {
+                            placed[series_index as usize][plane as usize] = Some(compact);
+                        }
+                    }
+                    series_source_planes = placed
+                        .into_iter()
+                        .map(|planes| planes.into_iter().flatten().collect::<Vec<_>>())
+                        .collect();
+                    series_image_chunks = series_source_planes
+                        .iter()
+                        .map(|planes| planes.iter().map(|&plane| image_chunks[plane]).collect())
+                        .collect();
+                    series_plane_offsets = series_source_planes
+                        .iter()
+                        .map(|planes| planes.first().copied().unwrap_or(0))
+                        .collect();
+                    series_metadata.insert(
+                        "nd2_loop_series_layout_source".into(),
+                        MetadataValue::String("java_offset_compaction_raster_mapping".into()),
+                    );
+                    series_handling = "split_xy_positions_offset_compaction";
+                } else if global_plane_count == position_count {
                     // Java exposes simple XY-position loops as separate series. The
                     // general ImageDataSeq mapping is index/dimension-order based;
                     // only split the unambiguous one-frame-per-position case here.
@@ -3463,54 +5312,219 @@ impl FormatReader for Nd2Reader {
                     series_plane_offsets = (0..position_count).collect();
                     series_source_planes = (0..position_count).map(|plane| vec![plane]).collect();
                     series_handling = "split_xy_positions_one_plane_each";
-                } else if image_count as usize % position_count == 0 {
-                    let planes_per_position = image_count as usize / position_count;
+                } else {
                     let expected_planes_per_position = size_z as usize * size_t as usize;
-                    if expected_planes_per_position == planes_per_position {
-                        let (layout, source_planes, layout_source) = nd2_choose_xy_position_layout(
-                            position_count,
-                            planes_per_position,
-                            size_z,
-                            &plane_position_z,
-                            &loop_descriptors,
-                        );
-                        series_count = position_count;
-                        series_image_count = planes_per_position as u32;
-                        series_source_planes = source_planes;
-                        series_image_chunks = (0..position_count)
-                            .map(|series| {
-                                series_source_planes[series]
+                    if global_plane_count % position_count == 0 {
+                        let planes_per_position = global_plane_count / position_count;
+                        if expected_planes_per_position == planes_per_position {
+                            let (layout, source_planes, layout_source) =
+                                nd2_choose_xy_position_layout(
+                                    position_count,
+                                    planes_per_position,
+                                    size_z,
+                                    &plane_position_z,
+                                    &loop_descriptors,
+                                );
+                            series_count = position_count;
+                            series_image_count = planes_per_position as u32;
+                            series_source_planes = source_planes;
+                            series_image_chunks = (0..position_count)
+                                .map(|series| {
+                                    series_source_planes[series]
+                                        .iter()
+                                        .map(|&plane| image_chunks[plane])
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect();
+                            series_plane_offsets = series_source_planes
+                                .iter()
+                                .map(|planes| planes.first().copied().unwrap_or(0))
+                                .collect();
+                            series_metadata.insert(
+                                "nd2_loop_series_candidate_layouts".into(),
+                                MetadataValue::String("interleaved,contiguous".into()),
+                            );
+                            series_metadata.insert(
+                                "nd2_loop_series_assumed_layout".into(),
+                                MetadataValue::String(layout.into()),
+                            );
+                            series_metadata.insert(
+                                "nd2_loop_series_layout_source".into(),
+                                MetadataValue::String(layout_source.into()),
+                            );
+                            series_handling = if layout == "contiguous" {
+                                "split_xy_positions_contiguous_full_series"
+                            } else {
+                                "split_xy_positions_interleaved_full_series"
+                            };
+                        } else {
+                            series_handling = "unsupported_multi_position_layout_kept_flat";
+                        }
+                    } else if expected_planes_per_position > 0 {
+                        let expected_total =
+                            position_count.saturating_mul(expected_planes_per_position);
+                        let missing_planes = expected_total.saturating_sub(global_plane_count);
+                        let trailing_planes = global_plane_count.saturating_sub(expected_total);
+                        let use_sequence_indices = global_plane_count <= expected_total;
+                        let sequence_to_compact: HashMap<usize, usize> = image_sequence_indices
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(compact, sequence)| (sequence, compact))
+                            .collect();
+
+                        if (global_plane_count <= expected_total
+                            && missing_planes <= position_count)
+                            || (global_plane_count >= expected_total
+                                && trailing_planes <= position_count)
+                        {
+                            let mut source_planes = (0..position_count)
+                                .map(|_| Vec::with_capacity(expected_planes_per_position))
+                                .collect::<Vec<_>>();
+                            for frame in 0..expected_planes_per_position {
+                                for (series, planes) in source_planes.iter_mut().enumerate() {
+                                    let sequence = frame * position_count + series;
+                                    let source = if !use_sequence_indices
+                                        || sequence_to_compact.is_empty()
+                                    {
+                                        (sequence < image_chunks.len()).then_some(sequence)
+                                    } else {
+                                        sequence_to_compact.get(&sequence).copied()
+                                    };
+                                    if let Some(source) = source {
+                                        planes.push(source);
+                                    }
+                                }
+                            }
+                            if source_planes
+                                .iter()
+                                .filter(|planes| !planes.is_empty())
+                                .count()
+                                > 1
+                            {
+                                series_count = position_count;
+                                series_image_count = expected_planes_per_position as u32;
+                                series_source_planes = source_planes;
+                                series_image_chunks = (0..position_count)
+                                    .map(|series| {
+                                        series_source_planes[series]
+                                            .iter()
+                                            .map(|&plane| image_chunks[plane])
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .collect();
+                                series_plane_offsets = series_source_planes
                                     .iter()
-                                    .map(|&plane| image_chunks[plane])
-                                    .collect::<Vec<_>>()
-                            })
+                                    .map(|planes| planes.first().copied().unwrap_or(0))
+                                    .collect();
+                                series_metadata.insert(
+                                    "nd2_loop_series_candidate_layouts".into(),
+                                    MetadataValue::String("interleaved_sparse".into()),
+                                );
+                                series_metadata.insert(
+                                    "nd2_loop_series_assumed_layout".into(),
+                                    MetadataValue::String("interleaved".into()),
+                                );
+                                series_metadata.insert(
+                                    "nd2_loop_series_layout_source".into(),
+                                    MetadataValue::String("sparse_sequence_indices".into()),
+                                );
+                                series_handling =
+                                    "split_xy_positions_interleaved_sparse_full_series";
+                            } else {
+                                series_handling = "unsupported_multi_position_layout_kept_flat";
+                            }
+                        } else {
+                            series_handling = "unsupported_multi_position_layout_kept_flat";
+                        }
+                    } else if image_count > 0 {
+                        series_handling = "unsupported_multi_position_layout_kept_flat";
+                    }
+                }
+            } else if size_c > 1 && self.position_count > 1 {
+                let stored_planes_per_series = size_z.max(1).saturating_mul(size_t.max(1)) as usize;
+                if stored_planes_per_series > 0
+                    && image_chunks.len() > stored_planes_per_series
+                    && image_chunks.len() % stored_planes_per_series == 0
+                {
+                    let inferred_series = image_chunks.len() / stored_planes_per_series;
+                    if inferred_series > 1 && inferred_series <= self.position_count as usize {
+                        series_count = inferred_series;
+                        series_image_count = stored_planes_per_series as u32;
+                        series_size_z = size_z;
+                        series_size_t = size_t;
+                        let mut lengths = [1i32; 4];
+                        let field_index = 2usize;
+                        let mut axes = match dimension_order {
+                            DimensionOrder::XYCTZ => ['C', 'T', 'Z'].into_iter(),
+                            DimensionOrder::XYCZT => ['C', 'Z', 'T'].into_iter(),
+                            DimensionOrder::XYTCZ => ['T', 'C', 'Z'].into_iter(),
+                            DimensionOrder::XYTZC => ['T', 'Z', 'C'].into_iter(),
+                            DimensionOrder::XYZCT => ['Z', 'C', 'T'].into_iter(),
+                            DimensionOrder::XYZTC => ['Z', 'T', 'C'].into_iter(),
+                        };
+                        for (i, length) in lengths.iter_mut().enumerate() {
+                            if i == field_index {
+                                *length = inferred_series as i32;
+                            } else if let Some(axis) = axes.next() {
+                                *length = match axis {
+                                    'Z' => size_z.max(1) as i32,
+                                    'T' => size_t.max(1) as i32,
+                                    'C' => 1,
+                                    _ => 1,
+                                };
+                            }
+                        }
+                        let mut zct_lengths = lengths;
+                        zct_lengths[field_index] = 1;
+                        let mut placed =
+                            vec![vec![None; stored_planes_per_series]; inferred_series];
+                        let mut one_indexed = false;
+                        for compact in 0..image_chunks.len() {
+                            let mut ndx = image_sequence_indices
+                                .get(compact)
+                                .copied()
+                                .unwrap_or(compact)
+                                as i32;
+                            if ndx == 1 && compact == 0 {
+                                one_indexed = true;
+                            }
+                            if one_indexed {
+                                ndx -= 1;
+                            }
+                            if ndx < 0 {
+                                continue;
+                            }
+                            let mut pos = raster_to_position(&lengths, ndx);
+                            let series_index = pos[field_index];
+                            pos[field_index] = 0;
+                            let plane = position_to_raster(&zct_lengths, &pos);
+                            if series_index >= 0
+                                && (series_index as usize) < placed.len()
+                                && plane >= 0
+                                && (plane as usize) < stored_planes_per_series
+                            {
+                                placed[series_index as usize][plane as usize] = Some(compact);
+                            }
+                        }
+                        series_source_planes = placed
+                            .into_iter()
+                            .map(|planes| planes.into_iter().flatten().collect::<Vec<_>>())
+                            .collect();
+                        series_image_chunks = series_source_planes
+                            .iter()
+                            .map(|planes| planes.iter().map(|&plane| image_chunks[plane]).collect())
                             .collect();
                         series_plane_offsets = series_source_planes
                             .iter()
                             .map(|planes| planes.first().copied().unwrap_or(0))
                             .collect();
                         series_metadata.insert(
-                            "nd2_loop_series_candidate_layouts".into(),
-                            MetadataValue::String("interleaved,contiguous".into()),
-                        );
-                        series_metadata.insert(
-                            "nd2_loop_series_assumed_layout".into(),
-                            MetadataValue::String(layout.into()),
-                        );
-                        series_metadata.insert(
                             "nd2_loop_series_layout_source".into(),
-                            MetadataValue::String(layout_source.into()),
+                            MetadataValue::String("java_position_count_raster_mapping".into()),
                         );
-                        series_handling = if layout == "contiguous" {
-                            "split_xy_positions_contiguous_full_series"
-                        } else {
-                            "split_xy_positions_interleaved_full_series"
-                        };
-                    } else {
-                        series_handling = "unsupported_multi_position_layout_kept_flat";
+                        series_handling = "position_count_non_lv_raster_mapping";
                     }
-                } else if image_count > 0 {
-                    series_handling = "unsupported_multi_position_layout_kept_flat";
                 }
             }
         }
@@ -3707,6 +5721,14 @@ impl FormatReader for Nd2Reader {
                     .saturating_mul(this_size_t.max(1))
                     .saturating_mul(size_c.max(1));
             }
+            let this_bits_per_pixel = if ((size_c == 1 && series_count > 1)
+                || (split_channels && series_count > 1 && bpp == 14))
+                && bpp < storage_bits_for_pixel_type
+            {
+                storage_bits_for_pixel_type
+            } else {
+                bpp
+            };
             metas.push(ImageMetadata {
                 size_x,
                 size_y,
@@ -3714,12 +5736,16 @@ impl FormatReader for Nd2Reader {
                 size_c,
                 size_t: this_size_t,
                 pixel_type,
-                bits_per_pixel: bpp,
+                bits_per_pixel: this_bits_per_pixel,
                 image_count: this_image_count,
                 dimension_order,
                 is_rgb: false,
                 is_interleaved: false,
-                is_indexed: nd2_is_indexed_from_channel_colors(&self.channel_colors),
+                is_indexed: if size_c == 3 && pixel_type == PixelType::Uint8 {
+                    false
+                } else {
+                    nd2_is_indexed_from_channel_colors(&self.channel_colors)
+                },
                 is_little_endian: true,
                 resolution_count: 1,
                 thumbnail: false,
@@ -3778,6 +5804,7 @@ impl FormatReader for Nd2Reader {
         self.pos_x.clear();
         self.pos_y.clear();
         self.pos_z.clear();
+        self.position_names.clear();
         self.position_count = 0;
         self.n_x_fields = 0;
         self.lens_na = None;
@@ -3830,9 +5857,32 @@ impl FormatReader for Nd2Reader {
                 .map_err(BioFormatsError::Io)?;
             let mut data = vec![0u8; plane.data_length as usize];
             f.read_exact(&mut data).map_err(BioFormatsError::Io)?;
-            let expected =
-                meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
-            let decoded = crate::common::codec::decompress_jpeg2000(&data)?;
+            let samples = if meta.is_rgb {
+                meta.size_c.max(1) as usize
+            } else {
+                1
+            };
+            let expected = meta.size_x as usize
+                * meta.size_y as usize
+                * samples
+                * meta.pixel_type.bytes_per_sample();
+            let mut decoded =
+                crate::common::codec::decompress_jpeg2000_with_endianness(&data, false)?;
+            if meta.is_rgb && samples > 1 {
+                let plane_pixels = meta.size_x as usize * meta.size_y as usize;
+                let bps = meta.pixel_type.bytes_per_sample();
+                if decoded.len() >= plane_pixels * samples * bps {
+                    let mut planar = vec![0u8; plane_pixels * samples * bps];
+                    for pixel in 0..plane_pixels {
+                        for sample in 0..samples {
+                            let src = (pixel * samples + sample) * bps;
+                            let dst = (sample * plane_pixels + pixel) * bps;
+                            planar[dst..dst + bps].copy_from_slice(&decoded[src..src + bps]);
+                        }
+                    }
+                    decoded = planar;
+                }
+            }
             return require_exact_frame(decoded, expected, "old ND2 JPEG2000").map_err(
                 |e| match e {
                     BioFormatsError::Format(msg) => {
@@ -3871,56 +5921,153 @@ impl FormatReader for Nd2Reader {
         let size_y = meta.size_y as usize;
         let size_c = meta.size_c as usize;
 
-        // Java ND2Reader.getScanlinePad() (~2650-2654): one padding sample per
-        // row total (not per channel) when BOTH sizeX and sizeC are odd. The
-        // stored plane is therefore (sizeX + scanlinePad) * sizeY * sizeC * bpp
-        // bytes (openBytes ~277,308), while the output buffer is unpadded.
+        let split = self.split_channels && meta.size_c > 1;
         let scanline_pad = if meta.size_x % 2 != 0 && meta.size_c % 2 != 0 {
-            1
+            1usize
         } else {
-            0
+            0usize
         };
-
-        // Stored row length in bytes: sizeX*sizeC samples plus one pad sample.
-        let stored_row = (size_x * size_c + scanline_pad) * bps;
+        let split_java_buffer_branch =
+            split && (meta.size_c <= 4 || scanline_pad == 0) && self.n_x_fields == 1;
+        let stored_row = if split {
+            if split_java_buffer_branch {
+                (size_x + scanline_pad) * size_c * bps
+            } else {
+                let row_length = size_x * size_c * bps;
+                let row_mod = row_length % 4;
+                row_length + if row_mod == 0 { 0 } else { 4 - row_mod }
+            }
+        } else {
+            // Java ND2Reader.openBytes resets scanlinePad for uncompressed
+            // non-split planes to 4-byte boundaries before calling readPlane.
+            let raw_scanline_pad = ((bps * size_x) % 4) / bps;
+            (size_x + raw_scanline_pad) * bps
+        };
         let stored_expected = stored_row * size_y;
 
         let chunk_context = format!(
             "plane {plane_index}: {} at offset {} length {}",
             chunk.name, chunk.data_offset, chunk.data_length
         );
-        let decoded = decode_nd2_frame_payload(&data, stored_expected).map_err(|e| match e {
-            BioFormatsError::Format(msg) => {
-                BioFormatsError::Format(format!("ND2: {chunk_context}: {msg}"))
+        let decoded = match decode_nd2_frame_payload(&data, stored_expected) {
+            Ok(decoded) => decoded,
+            Err(BioFormatsError::Format(msg))
+                if msg.starts_with("frame data too small")
+                    && !looks_like_zlib(&data)
+                    && !looks_like_jpeg2000(&data)
+                    && data.get(7..).is_none_or(|payload| {
+                        !looks_like_zlib(payload) && !looks_like_jpeg2000(payload)
+                    })
+                    && data.get(8..).is_none_or(|payload| {
+                        !looks_like_zlib(payload) && !looks_like_jpeg2000(payload)
+                    }) =>
+            {
+                let payload_offset = if nd2_prefix_timestamp_seconds(&data, 8).is_some() {
+                    8
+                } else {
+                    0
+                };
+                f.seek(SeekFrom::Start(chunk.data_offset + payload_offset))
+                    .map_err(BioFormatsError::Io)?;
+                let mut decoded = vec![0u8; stored_expected];
+                let mut filled = 0usize;
+                while filled < decoded.len() {
+                    let n = f
+                        .read(&mut decoded[filled..])
+                        .map_err(BioFormatsError::Io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                decoded
             }
-            BioFormatsError::UnsupportedFormat(msg) => {
-                BioFormatsError::UnsupportedFormat(format!("ND2: {chunk_context}: {msg}"))
+            Err(e) => {
+                return Err(match e {
+                    BioFormatsError::Format(msg) => {
+                        BioFormatsError::Format(format!("ND2: {chunk_context}: {msg}"))
+                    }
+                    BioFormatsError::UnsupportedFormat(msg) => {
+                        BioFormatsError::UnsupportedFormat(format!("ND2: {chunk_context}: {msg}"))
+                    }
+                    BioFormatsError::Codec(msg) => {
+                        BioFormatsError::Codec(format!("ND2: {chunk_context}: {msg}"))
+                    }
+                    other => other,
+                });
             }
-            BioFormatsError::Codec(msg) => {
-                BioFormatsError::Codec(format!("ND2: {chunk_context}: {msg}"))
-            }
-            other => other,
-        })?;
-
-        let decoded = if scanline_pad == 0 {
-            decoded
-        } else {
-            // De-pad: strip the trailing pad sample from each row so the returned
-            // buffer is the unpadded sizeX*sizeY*sizeC*bpp plane (Java openBytes
-            // copies rowLength bytes then skips scanlinePad*bpp per row, ~280-289).
-            let out_row = size_x * size_c * bps;
-            let mut out = Vec::with_capacity(out_row * size_y);
-            for row in 0..size_y {
-                let start = row * stored_row;
-                out.extend_from_slice(&decoded[start..start + out_row]);
-            }
-            out
         };
 
         if let Some(channel) = split_channel {
-            return nd2_split_interleaved_channel(&decoded, size_x, size_y, size_c, bps, channel);
+            if split_java_buffer_branch {
+                let split_width = size_x + scanline_pad;
+                let split = nd2_split_interleaved_channel(
+                    &decoded,
+                    split_width,
+                    size_y,
+                    size_c,
+                    bps,
+                    channel,
+                )?;
+                if scanline_pad == 0 {
+                    return Ok(split);
+                }
+                let in_row = split_width * bps;
+                let out_row = size_x * bps;
+                let mut out = vec![0u8; out_row * size_y];
+                for row in 0..size_y {
+                    let src = row * in_row;
+                    let dst = row * out_row;
+                    if src >= split.len() {
+                        break;
+                    }
+                    let available = (split.len() - src).min(out_row);
+                    out[dst..dst + available].copy_from_slice(&split[src..src + available]);
+                }
+                return Ok(out);
+            }
+
+            let row_bytes = size_x * size_c * bps;
+            let out_row = size_x * bps;
+            let mut out = vec![0u8; out_row * size_y];
+            for row in 0..size_y {
+                let src = row * stored_row;
+                if src >= decoded.len() {
+                    break;
+                }
+                let available = (decoded.len() - src).min(row_bytes);
+                let split_row = nd2_split_interleaved_channel(
+                    &decoded[src..src + available],
+                    available / (size_c * bps),
+                    1,
+                    size_c,
+                    bps,
+                    channel,
+                )?;
+                let dst = row * out_row;
+                let copy_len = split_row.len().min(out_row);
+                out[dst..dst + copy_len].copy_from_slice(&split_row[..copy_len]);
+            }
+            return Ok(out);
         }
-        Ok(decoded)
+
+        let raw_scanline_pad = ((bps * size_x) % 4) / bps;
+        if raw_scanline_pad == 0 {
+            return Ok(decoded);
+        }
+        let in_row = (size_x + raw_scanline_pad) * bps;
+        let out_row = size_x * bps;
+        let mut out = vec![0u8; out_row * size_y];
+        for row in 0..size_y {
+            let src = row * in_row;
+            let dst = row * out_row;
+            if src >= decoded.len() {
+                break;
+            }
+            let available = (decoded.len() - src).min(out_row);
+            out[dst..dst + available].copy_from_slice(&decoded[src..src + available]);
+        }
+        Ok(out)
     }
 
     fn open_bytes_region(
@@ -3931,10 +6078,123 @@ impl FormatReader for Nd2Reader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        {
+            let meta = self
+                .meta
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            if plane_index >= meta.image_count {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            validate_region("ND2", meta.size_x, meta.size_y, x, y, w, h)?;
+
+            if self.old_jp2_planes.is_empty()
+                && !self.is_lossless
+                && !self.split_channels
+                && meta.size_c == 1
+            {
+                let series_chunks = self
+                    .series_image_chunks
+                    .get(self.current_series)
+                    .unwrap_or(&self.image_chunks);
+                let chunk_idx = series_chunks
+                    .get(plane_index as usize)
+                    .copied()
+                    .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+                let chunk = &self.chunks[chunk_idx];
+                let chunk_data_offset = chunk.data_offset;
+                let chunk_data_length = chunk.data_length;
+
+                let bps = meta.pixel_type.bytes_per_sample();
+                let raw_scanline_pad = ((bps * meta.size_x as usize) % 4) / bps;
+                let stored_row = (meta.size_x as usize + raw_scanline_pad) * bps;
+                let stored_expected = stored_row * meta.size_y as usize;
+                let expected = stored_expected as u64;
+
+                let f = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+                let probe_len = chunk_data_length.min(4096 + 16) as usize;
+                f.seek(SeekFrom::Start(chunk_data_offset))
+                    .map_err(BioFormatsError::Io)?;
+                let mut probe = vec![0u8; probe_len];
+                f.read_exact(&mut probe).map_err(BioFormatsError::Io)?;
+
+                let raw_payload_offset = if chunk_data_length == expected {
+                    (!looks_like_zlib(&probe) && !looks_like_jpeg2000(&probe)).then_some(0usize)
+                } else if chunk_data_length == expected + 8 {
+                    probe.get(8..).and_then(|payload| {
+                        (!looks_like_zlib(payload) && !looks_like_jpeg2000(payload))
+                            .then_some(8usize)
+                    })
+                } else if chunk_data_length > expected + 8
+                    && chunk_data_length - expected - 8 <= 4096
+                    && nd2_prefix_timestamp_seconds(&probe, 8).is_some()
+                {
+                    probe.get(8..).and_then(|payload| {
+                        (!looks_like_zlib(payload) && !looks_like_jpeg2000(payload))
+                            .then_some(8usize)
+                    })
+                } else if chunk_data_length > expected + 4096
+                    && chunk_data_length - expected - 4096 <= 4096
+                {
+                    probe.get(4096..).and_then(|payload| {
+                        (!looks_like_zlib(payload) && !looks_like_jpeg2000(payload))
+                            .then_some(4096usize)
+                    })
+                } else if chunk_data_length > expected && chunk_data_length - expected <= 4096 {
+                    (!looks_like_zlib(&probe) && !looks_like_jpeg2000(&probe)).then_some(0usize)
+                } else {
+                    None
+                };
+
+                if let Some(payload_offset) = raw_payload_offset {
+                    let out_row = w as usize * bps;
+                    let mut out = vec![0u8; out_row * h as usize];
+                    let base = chunk_data_offset + payload_offset as u64;
+                    for row in 0..h as usize {
+                        let src =
+                            base + ((y as usize + row) * stored_row + x as usize * bps) as u64;
+                        let dst = row * out_row;
+                        f.seek(SeekFrom::Start(src)).map_err(BioFormatsError::Io)?;
+                        let mut filled = 0usize;
+                        while filled < out_row {
+                            let n = f
+                                .read(&mut out[dst + filled..dst + out_row])
+                                .map_err(BioFormatsError::Io)?;
+                            if n == 0 {
+                                break;
+                            }
+                            filled += n;
+                        }
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+
         let full = self.open_bytes(plane_index)?;
         let meta = self.metadata();
+        if !self.old_jp2_planes.is_empty() && meta.is_rgb && !meta.is_interleaved {
+            validate_region("ND2", meta.size_x, meta.size_y, x, y, w, h)?;
+            let bps = meta.pixel_type.bytes_per_sample();
+            let channel_count = meta.size_c.max(1) as usize;
+            let row_bytes = meta.size_x as usize * bps;
+            let channel_bytes = row_bytes * meta.size_y as usize;
+            let out_row = w as usize * bps;
+            let mut out = vec![0u8; channel_count * h as usize * out_row];
+            for channel in 0..channel_count {
+                let channel_base = channel * channel_bytes;
+                for row in 0..h as usize {
+                    let src = channel_base + (y as usize + row) * row_bytes + x as usize * bps;
+                    let dst = channel * h as usize * out_row + row * out_row;
+                    out[dst..dst + out_row].copy_from_slice(&full[src..src + out_row]);
+                }
+            }
+            return Ok(out);
+        }
         let spp = if self.split_channels {
             1
+        } else if !self.old_jp2_planes.is_empty() && meta.is_rgb {
+            meta.size_c as usize
         } else if self.old_jp2_planes.is_empty() {
             meta.size_c as usize
         } else {
@@ -4062,215 +6322,218 @@ impl FormatReader for Nd2Reader {
         use crate::common::ome_metadata::{
             create_lsid, OmeDetector, OmeInstrument, OmeMetadata, OmeObjective, OmePlane,
         };
-        let meta = self.meta.get(self.current_series)?;
-        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if self.meta.is_empty() {
+            return None;
+        }
+        let mut ome = OmeMetadata::default();
+        for (series, meta) in self.meta.iter().enumerate() {
+            let mut series_ome = OmeMetadata::from_image_metadata(meta);
+            let mut img = series_ome.images.pop().unwrap_or_default();
+
+            // Image name: "<filename> (series <n>)" per ND2Reader (~2263).
+            if let Some(path) = &self.path {
+                if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                    let width = self.meta.len().to_string().len();
+                    let series_suffix = format!("(series {:0width$})", series + 1, width = width);
+                    let suffix = self
+                        .position_names
+                        .get(series)
+                        .filter(|name| !name.is_empty())
+                        .map(String::as_str)
+                        .unwrap_or(&series_suffix);
+                    img.name = Some(format!("{} {}", fname, suffix).trim().to_string());
+                }
+            }
+
+            // Physical pixel size: dCalibration applies to X and Y (µm/px).
+            if let Some(cal) = self.physical_size.filter(|v| *v > 0.0) {
+                img.physical_size_x = Some(cal);
+                img.physical_size_y = Some(cal);
+            }
+            if let Some(z) = self.physical_size_z.filter(|v| *v > 0.0) {
+                img.physical_size_z = Some(z);
+            }
+
+            img.instrument_ref = Some(0);
+            img.objective_ref = Some(0);
+
+            // Channel names, emission wavelengths and colors. The effective channel
+            // count is the per-series channel count.
+            let effective_size_c = img.channels.len();
+
+            // Channel-name fallback chain (ND2Reader.populateMetadataStore:2275-2281):
+            // primary channel names; if fewer than effectiveSizeC and a backup
+            // handler exists, use the backup's; if still short, use textChannelNames.
+            let channel_names: &[String] = if self.channel_names.len() < effective_size_c
+                && !self.backup_channel_names.is_empty()
+            {
+                &self.backup_channel_names
+            } else {
+                &self.channel_names
+            };
+            let channel_names: &[String] = if channel_names.len() < effective_size_c {
+                &self.text_channel_names
+            } else {
+                channel_names
+            };
+
+            // Wavelength fallback (ND2Reader.populateMetadataStore:2493-2499): use the
+            // backup handler only when the primary list is empty.
+            let emission_wavelengths: &[f64] = if self.emission_wavelengths.is_empty() {
+                &self.backup_emission_wavelengths
+            } else {
+                &self.emission_wavelengths
+            };
+            let excitation_wavelengths: &[f64] = if self.excitation_wavelengths.is_empty() {
+                &self.backup_excitation_wavelengths
+            } else {
+                &self.excitation_wavelengths
+            };
+
+            for (c, channel) in img.channels.iter_mut().enumerate() {
+                channel.detector_ref = Some(create_lsid("Detector", &[0, 0]));
+                if let Some(name) = channel_names.get(c) {
+                    channel.name = Some(name.clone());
+                }
+                if let Some(em) = emission_wavelengths.get(c).filter(|v| **v > 0.0) {
+                    channel.emission_wavelength = Some(*em);
+                }
+                if let Some(ex) = excitation_wavelengths.get(c).filter(|v| **v > 0.0) {
+                    channel.excitation_wavelength = Some(*ex);
+                }
+                // Java sets the channel color only when the recorded BGR color is
+                // non-black (populateMetadataStore:2303-2313), packing it as RGBA.
+                if let Some(&packed) = self.colors.get(c).filter(|&&c| c != 0) {
+                    let red = packed & 0xff;
+                    let green = (packed >> 8) & 0xff;
+                    let blue = (packed >> 16) & 0xff;
+                    channel.color = Some((red << 24) | (green << 16) | (blue << 8) | 0xff);
+                }
+            }
+
+            // Per-position stage coordinates for this series. Java indexes posX/Y/Z
+            // by acquisition position; here each split series is one XY position, so
+            // the series index selects the position (falling back to index 0 when a
+            // single list applies to all planes).
+            let series_count = self.meta.len().max(1);
+            let pos_index = |list: &[f64]| -> Option<f64> {
+                if list.is_empty() {
+                    None
+                } else if list.len() == series_count {
+                    list.get(series).copied()
+                } else {
+                    list.first().copied()
+                }
+            };
+            let plane_pos_x = pos_index(&self.pos_x);
+            let plane_pos_y = pos_index(&self.pos_y);
+            let plane_pos_z_value = pos_index(&self.pos_z);
+            // A single shared exposure time applies to every plane (Java: index 0
+            // when exposureTime.size() == 1, populateMetadataStore:2423-2426).
+            let shared_exposure = (self.exposure_time.len() == 1)
+                .then(|| self.exposure_time[0])
+                .filter(|t| *t > 0.0);
+
+            // The CustomData|AcqTimesCache stream is the authoritative per-plane
+            // DeltaT when it covers every global plane (Java: tsT, used directly as
+            // stampIndex = n when tsT.size() == getImageCount()).
+            let ts_t_global = (self.ts_t.len() == self.image_chunks.len() && !self.ts_t.is_empty())
+                .then_some(self.ts_t.as_slice());
+
+            if self.plane_delta_t.iter().any(Option::is_some)
+                || self.plane_position_z.iter().any(Option::is_some)
+                || ts_t_global.is_some()
+                || plane_pos_x.is_some()
+                || plane_pos_y.is_some()
+                || plane_pos_z_value.is_some()
+                || !self.exposure_time.is_empty()
+            {
+                // Java split mode exposes one logical plane per channel while one
+                // ImageDataSeq chunk stores the interleaved channels for a Z/T plane.
+                let effective_c = if self.split_channels {
+                    meta.size_c.max(1)
+                } else {
+                    1
+                };
+                let plane_offset = self.series_plane_offsets.get(series).copied().unwrap_or(0);
+                let source_planes = self.series_source_planes.get(series);
+                img.planes = (0..meta.image_count)
+                    .map(|i| {
+                        let c = i % effective_c;
+                        let z = (i / effective_c) % meta.size_z.max(1);
+                        let t = i / (effective_c * meta.size_z.max(1));
+                        let source_plane = source_planes
+                            .and_then(|planes| {
+                                planes
+                                    .get(if self.split_channels {
+                                        (i / effective_c) as usize
+                                    } else {
+                                        i as usize
+                                    })
+                                    .copied()
+                            })
+                            .unwrap_or_else(|| {
+                                plane_offset
+                                    + if self.split_channels {
+                                        (i / effective_c) as usize
+                                    } else {
+                                        i as usize
+                                    }
+                            });
+                        // Per-channel exposure when the list matches sizeC, else the
+                        // shared single value (ND2Reader:2419-2430).
+                        let exposure_time = if self.exposure_time.len() == meta.size_c as usize {
+                            self.exposure_time
+                                .get((i % meta.size_c.max(1)) as usize)
+                                .copied()
+                                .filter(|t| *t > 0.0)
+                        } else {
+                            shared_exposure
+                        };
+                        OmePlane {
+                            the_z: z,
+                            the_c: c,
+                            the_t: t,
+                            delta_t: ts_t_global
+                                .and_then(|ts| ts.get(source_plane).copied())
+                                .or_else(|| {
+                                    self.plane_delta_t.get(source_plane).copied().flatten()
+                                }),
+                            position_x: plane_pos_x,
+                            position_y: plane_pos_y,
+                            position_z: self
+                                .plane_position_z
+                                .get(source_plane)
+                                .copied()
+                                .flatten()
+                                .or(plane_pos_z_value),
+                            exposure_time,
+                        }
+                    })
+                    .collect();
+            }
+
+            ome.images.push(img);
+        }
 
         // Java ND2Reader always creates Detector:0:0 with type Other, then links
         // every channel's DetectorSettings to it.
-        let objective = (self.lens_na.is_some()
-            || self.objective_mag.is_some()
-            || self.objective_model.is_some())
-        .then(|| OmeObjective {
+        let objective = OmeObjective {
             calibrated_magnification: self.objective_mag,
             lens_na: self.lens_na,
             model: self.objective_model.clone(),
             ..Default::default()
-        });
+        };
         let instrument = OmeInstrument {
             detectors: vec![OmeDetector {
                 id: Some(create_lsid("Detector", &[0, 0])),
                 detector_type: Some("Other".to_string()),
                 ..Default::default()
             }],
-            objectives: objective.into_iter().collect(),
+            objectives: vec![objective],
             ..Default::default()
         };
         ome.instruments.push(instrument);
-        if let Some(img) = ome.images.get_mut(0) {
-            img.instrument_ref = Some(0);
-            if self.lens_na.is_some()
-                || self.objective_mag.is_some()
-                || self.objective_model.is_some()
-            {
-                img.objective_ref = Some(0);
-            }
-        }
-        let img = ome.images.get_mut(0)?;
-
-        // Image name: "<filename> (series <n>)" per ND2Reader (~2263).
-        if let Some(path) = &self.path {
-            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                img.name = Some(format!("{} (series {})", fname, self.current_series + 1));
-            }
-        }
-
-        // Physical pixel size: dCalibration applies to X and Y (µm/px).
-        if let Some(cal) = self.physical_size.filter(|v| *v > 0.0) {
-            img.physical_size_x = Some(cal);
-            img.physical_size_y = Some(cal);
-        }
-        if let Some(z) = self.physical_size_z.filter(|v| *v > 0.0) {
-            img.physical_size_z = Some(z);
-        }
-
-        // Channel names, emission wavelengths and colors. The effective channel
-        // count is the per-series channel count.
-        let effective_size_c = img.channels.len();
-
-        // Channel-name fallback chain (ND2Reader.populateMetadataStore:2275-2281):
-        // primary channel names; if fewer than effectiveSizeC and a backup
-        // handler exists, use the backup's; if still short, use textChannelNames.
-        let channel_names: &[String] = if self.channel_names.len() < effective_size_c
-            && !self.backup_channel_names.is_empty()
-        {
-            &self.backup_channel_names
-        } else {
-            &self.channel_names
-        };
-        let channel_names: &[String] = if channel_names.len() < effective_size_c {
-            &self.text_channel_names
-        } else {
-            channel_names
-        };
-
-        // Wavelength fallback (ND2Reader.populateMetadataStore:2493-2499): use the
-        // backup handler only when the primary list is empty.
-        let emission_wavelengths: &[f64] = if self.emission_wavelengths.is_empty() {
-            &self.backup_emission_wavelengths
-        } else {
-            &self.emission_wavelengths
-        };
-        let excitation_wavelengths: &[f64] = if self.excitation_wavelengths.is_empty() {
-            &self.backup_excitation_wavelengths
-        } else {
-            &self.excitation_wavelengths
-        };
-
-        for (c, channel) in img.channels.iter_mut().enumerate() {
-            channel.detector_ref = Some(create_lsid("Detector", &[0, 0]));
-            if let Some(name) = channel_names.get(c) {
-                channel.name = Some(name.clone());
-            }
-            if let Some(em) = emission_wavelengths.get(c).filter(|v| **v > 0.0) {
-                channel.emission_wavelength = Some(*em);
-            }
-            if let Some(ex) = excitation_wavelengths.get(c).filter(|v| **v > 0.0) {
-                channel.excitation_wavelength = Some(*ex);
-            }
-            // Java sets the channel color only when the recorded BGR color is
-            // non-black (populateMetadataStore:2303-2313), packing it as RGBA.
-            if let Some(&packed) = self.colors.get(c).filter(|&&c| c != 0) {
-                let red = packed & 0xff;
-                let green = (packed >> 8) & 0xff;
-                let blue = (packed >> 16) & 0xff;
-                channel.color = Some((red << 24) | (green << 16) | (blue << 8) | 0xff);
-            }
-        }
-
-        // Per-position stage coordinates for this series. Java indexes posX/Y/Z
-        // by acquisition position; here each split series is one XY position, so
-        // the series index selects the position (falling back to index 0 when a
-        // single list applies to all planes).
-        let series = self.current_series;
-        let series_count = self.meta.len().max(1);
-        let pos_index = |list: &[f64]| -> Option<f64> {
-            if list.is_empty() {
-                None
-            } else if list.len() == series_count {
-                list.get(series).copied()
-            } else {
-                list.first().copied()
-            }
-        };
-        let plane_pos_x = pos_index(&self.pos_x);
-        let plane_pos_y = pos_index(&self.pos_y);
-        let plane_pos_z_value = pos_index(&self.pos_z);
-        // A single shared exposure time applies to every plane (Java: index 0
-        // when exposureTime.size() == 1, populateMetadataStore:2423-2426).
-        let shared_exposure = (self.exposure_time.len() == 1)
-            .then(|| self.exposure_time[0])
-            .filter(|t| *t > 0.0);
-
-        // The CustomData|AcqTimesCache stream is the authoritative per-plane
-        // DeltaT when it covers every global plane (Java: tsT, used directly as
-        // stampIndex = n when tsT.size() == getImageCount()).
-        let ts_t_global = (self.ts_t.len() == self.image_chunks.len() && !self.ts_t.is_empty())
-            .then_some(self.ts_t.as_slice());
-
-        if self.plane_delta_t.iter().any(Option::is_some)
-            || self.plane_position_z.iter().any(Option::is_some)
-            || ts_t_global.is_some()
-            || plane_pos_x.is_some()
-            || plane_pos_y.is_some()
-            || plane_pos_z_value.is_some()
-            || !self.exposure_time.is_empty()
-        {
-            // Java split mode exposes one logical plane per channel while one
-            // ImageDataSeq chunk stores the interleaved channels for a Z/T plane.
-            let effective_c = if self.split_channels {
-                meta.size_c.max(1)
-            } else {
-                1
-            };
-            let plane_offset = self
-                .series_plane_offsets
-                .get(self.current_series)
-                .copied()
-                .unwrap_or(0);
-            let source_planes = self.series_source_planes.get(self.current_series);
-            img.planes = (0..meta.image_count)
-                .map(|i| {
-                    let c = i % effective_c;
-                    let z = (i / effective_c) % meta.size_z.max(1);
-                    let t = i / (effective_c * meta.size_z.max(1));
-                    let source_plane = source_planes
-                        .and_then(|planes| {
-                            planes
-                                .get(if self.split_channels {
-                                    (i / effective_c) as usize
-                                } else {
-                                    i as usize
-                                })
-                                .copied()
-                        })
-                        .unwrap_or_else(|| {
-                            plane_offset
-                                + if self.split_channels {
-                                    (i / effective_c) as usize
-                                } else {
-                                    i as usize
-                                }
-                        });
-                    // Per-channel exposure when the list matches sizeC, else the
-                    // shared single value (ND2Reader:2419-2430).
-                    let exposure_time = if self.exposure_time.len() == meta.size_c as usize {
-                        self.exposure_time
-                            .get((i % meta.size_c.max(1)) as usize)
-                            .copied()
-                            .filter(|t| *t > 0.0)
-                    } else {
-                        shared_exposure
-                    };
-                    OmePlane {
-                        the_z: z,
-                        the_c: c,
-                        the_t: t,
-                        delta_t: ts_t_global
-                            .and_then(|ts| ts.get(source_plane).copied())
-                            .or_else(|| self.plane_delta_t.get(source_plane).copied().flatten()),
-                        position_x: plane_pos_x,
-                        position_y: plane_pos_y,
-                        position_z: self
-                            .plane_position_z
-                            .get(source_plane)
-                            .copied()
-                            .flatten()
-                            .or(plane_pos_z_value),
-                        exposure_time,
-                    }
-                })
-                .collect();
-        }
 
         Some(ome)
     }
@@ -4324,6 +6587,58 @@ mod tests {
             frame.extend_from_slice(payload);
         }
         frame
+    }
+
+    #[test]
+    fn nd2_zero_timestamp_raw_frame_skips_eight_bytes_like_java() {
+        let mut frame = vec![0; 8];
+        frame.extend_from_slice(&[17, 23]);
+
+        let (encoding, payload_offset) = nd2_frame_payload_layout(&frame, frame.len(), 2);
+        assert_eq!(encoding, "raw_with_8_byte_prefix");
+        assert_eq!(payload_offset, 8);
+        assert_eq!(decode_nd2_frame_payload(&frame, 2).unwrap(), vec![17, 23]);
+    }
+
+    #[test]
+    fn nd2_chunk_map_uses_each_image_data_name_length() {
+        let path = temp_nd2_path("chunk_map_variable_image_name_lengths.nd2");
+        let mut bytes = Vec::new();
+        let mut entries = Vec::new();
+
+        for i in 0..=10 {
+            let name = format!("ImageDataSeq|{i}!");
+            let position = bytes.len() as u64;
+            let payload = [i as u8; 10];
+            bytes.extend_from_slice(&nd2_chunk(&name, &payload));
+            entries.extend_from_slice(name.as_bytes());
+            entries.extend_from_slice(&position.to_le_bytes());
+            let block_length = 16 + name.len() as u64 + payload.len() as u64;
+            entries.extend_from_slice(&block_length.to_le_bytes());
+        }
+
+        let map_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&nd2_chunk("ImageMetadataSeqLV|0!", &entries));
+        bytes.extend_from_slice(b"ND2 CHUNK MAP SIGNATURE 0000001");
+        bytes.push(0);
+        bytes.extend_from_slice(&map_offset.to_le_bytes());
+
+        std::fs::write(&path, bytes).unwrap();
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        let chunks = read_chunk_map(&mut reader).unwrap().unwrap();
+        let image_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| chunk.name.starts_with("ImageDataSeq"))
+            .collect();
+        assert_eq!(image_chunks.len(), 11);
+
+        let tenth = image_chunks[10];
+        assert_eq!(tenth.name, "ImageDataSeq|10!");
+        assert_eq!(
+            tenth.data_offset,
+            tenth.block_offset + 16 + "ImageDataSeq|10!".len() as u64
+        );
+        assert_eq!(tenth.data_length, 10);
     }
 
     #[test]
@@ -4422,6 +6737,101 @@ mod tests {
     }
 
     #[test]
+    fn nd2_z_count_from_high_low_step_matches_java() {
+        assert_eq!(
+            nd2_z_count_from_range(Some(14.0), Some(-14.0), Some(1.0)),
+            Some(29)
+        );
+        assert_eq!(
+            nd2_z_count_from_range(Some(0.0), Some(0.0), Some(1.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn nd2_xml_ignores_filter_spectrum_wavelengths_like_java() {
+        let xml = r#"<root>
+          <Channel_0>
+            <Name value="pdt-405"/>
+            <EmWavelength value="460"/>
+            <ExWavelength value="400"/>
+          </Channel_0>
+          <m_ExcitationSpectrum>
+            <dWavelength value="488"/>
+          </m_ExcitationSpectrum>
+          <m_EmissionSpectrum>
+            <dWavelength value="520"/>
+          </m_EmissionSpectrum>
+          <m_MirrorSpectrum>
+            <dWavelength value="999"/>
+          </m_MirrorSpectrum>
+        </root>"#;
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_xml_metadata(xml, &mut lv);
+        assert!(lv.excitation_wavelengths.is_empty());
+        assert_eq!(lv.emission_wavelengths, vec![460.0]);
+    }
+
+    #[test]
+    fn nd2_xml_ui_count_inherits_previous_runtype_like_sax_handler() {
+        let xml = r#"<root>
+          <no_name runtype="RLxExperiment.RLxExpXYPosLoop">
+            <uiCount runtype="lx_uint32" value="4"/>
+          </no_name>
+        </root>"#;
+
+        assert_eq!(nd2_xml_ui_count_for_runtype(xml, "XYPosLoop"), Some(4));
+    }
+
+    #[test]
+    fn nd2_xml_position_names_follow_java_pos_name_list() {
+        let xml = r##"<root>
+          <no_name runtype="RLxExperiment.RLxExpXYPosLoop">
+            <uiCount runtype="lx_uint32" value="14"/>
+            <pPosName runtype="CLxListVariant">
+              <item_00000 runtype="CLxStringW" value="#3"/>
+              <item_00001 runtype="CLxStringW" value="#4"/>
+              <item_00002 runtype="CLxStringW" value="#5"/>
+              <item_00003 runtype="CLxStringW" value="#6"/>
+              <item_00004 runtype="CLxStringW" value="#7"/>
+              <item_00005 runtype="CLxStringW" value="#8"/>
+              <item_00006 runtype="CLxStringW" value="#9"/>
+              <item_00007 runtype="CLxStringW" value="#10"/>
+              <item_00008 runtype="CLxStringW" value=""/>
+              <item_00009 runtype="CLxStringW" value=""/>
+              <item_00010 runtype="CLxStringW" value=""/>
+              <item_00011 runtype="CLxStringW" value=""/>
+              <item_00012 runtype="CLxStringW" value=""/>
+              <item_00013 runtype="CLxStringW" value=""/>
+            </pPosName>
+          </no_name>
+          <pItemValid runtype="CLxListVariant">
+            <_00 runtype="bool" value="true"/>
+            <_01 runtype="bool" value="true"/>
+            <_02 runtype="bool" value="true"/>
+            <_03 runtype="bool" value="true"/>
+            <_04 runtype="bool" value="true"/>
+            <_05 runtype="bool" value="true"/>
+            <_06 runtype="bool" value="true"/>
+            <_07 runtype="bool" value="true"/>
+            <_08 runtype="bool" value="false"/>
+            <_09 runtype="bool" value="false"/>
+            <_10 runtype="bool" value="true"/>
+            <_11 runtype="bool" value="true"/>
+            <_12 runtype="bool" value="true"/>
+            <_13 runtype="bool" value="true"/>
+          </pItemValid>
+        </root>"##;
+
+        let names = nd2_xml_old_jp2_valid_position_names(xml);
+        assert_eq!(
+            &names[..8],
+            ["#3", "#4", "#5", "#6", "#7", "#8", "#9", "#10"]
+        );
+        assert_eq!(names.len(), 12);
+    }
+
+    #[test]
     fn nd2_xml_captures_exposure_and_position_lists() {
         let xml = r#"<root>
           <dExposureTime>50</dExposureTime>
@@ -4453,6 +6863,43 @@ mod tests {
         assert_eq!(nd2_xml_ui_count_for_runtype(xml, "TimeLoop"), Some(3));
         assert_eq!(lv.calibration, Some(0.25));
         assert_eq!(lv.pos_x, vec![100.0, 200.0]);
+    }
+
+    #[test]
+    fn nd2_xml_ndcontrol_loop_size_uses_java_loop_state_rules() {
+        let xml = r#"<NDControl>
+          <LoopState>
+            <no_name value="1052433"/><no_name value="529"/>
+            <no_name value="3856"/><no_name value="529"/>
+          </LoopState>
+          <LoopSize>
+            <no_name value="1"/><no_name value="0"/>
+            <no_name value="21"/><no_name value="0"/>
+          </LoopSize>
+        </NDControl>"#;
+
+        assert_eq!(
+            nd2_xml_ndcontrol_loop_dimensions(xml),
+            Some((Some(21), Some(1)))
+        );
+    }
+
+    #[test]
+    fn nd2_xml_metadata_channels_supply_color_camera_names() {
+        let xml = r#"<Metadata>
+          <Channels>
+            <Channel_0><Color value="16711680"/><Name value="Blue"/></Channel_0>
+            <Channel_1><Color value="65280"/><Name value="Green"/></Channel_1>
+            <Channel_2><Color value="255"/><Name value="Red"/></Channel_2>
+          </Channels>
+        </Metadata>"#;
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_xml_metadata(xml, &mut lv);
+
+        assert_eq!(lv.channel_names, vec!["Blue", "Green", "Red"]);
+        assert_eq!(lv.channel_colors.get("Blue"), Some(&16711680));
+        assert_eq!(lv.channel_colors.get("Green"), Some(&65280));
+        assert_eq!(lv.channel_colors.get("Red"), Some(&255));
     }
 
     #[test]
@@ -4498,7 +6945,7 @@ mod tests {
           <uiBpcExtra value="16"/>
         </root>"#;
 
-        assert_eq!(parse_nd2_attributes(xml), (0, 0, 1, 1, 8));
+        assert_eq!(parse_nd2_attributes(xml), (0, 0, 1, 1, 0));
     }
 
     #[test]
@@ -4531,11 +6978,39 @@ mod tests {
 
         let mut lv = Nd2LvValues::default();
         parse_nd2_lv(&data, &mut lv);
-        assert_eq!(lv.channel_names, vec!["DAPI".to_string()]);
+        assert!(lv.channel_names.is_empty());
         assert_eq!(lv.text_channel_names, vec!["DAPI".to_string()]);
         assert_eq!(lv.channel_colors.get("DAPI"), Some(&0x0000FF));
         assert_eq!(lv.exposure_time, vec![0.025]);
         assert_eq!(lv.position_count, 1);
+    }
+
+    #[test]
+    fn nd2_binary_lv_extracts_image_attributes() {
+        fn entry(ty: u8, name: &str, value: &[u8]) -> Vec<u8> {
+            let mut e = vec![ty, name.chars().count() as u8];
+            for u in name.encode_utf16() {
+                e.extend_from_slice(&u.to_le_bytes());
+            }
+            e.extend_from_slice(value);
+            e
+        }
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&entry(3, "uiWidth", &2424u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiHeight", &1800u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiComp", &3u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiBpcInMemory", &16u32.to_le_bytes()));
+        data.extend_from_slice(&entry(3, "uiBpcSignificant", &14u32.to_le_bytes()));
+
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_lv(&data, &mut lv);
+
+        assert_eq!(lv.lv_size_x, Some(2424));
+        assert_eq!(lv.lv_size_y, Some(1800));
+        assert_eq!(lv.lv_size_c, Some(3));
+        assert_eq!(lv.lv_bpc_in_memory, Some(16));
+        assert_eq!(lv.lv_bpc_significant, Some(14));
     }
 
     #[test]
@@ -4696,6 +7171,17 @@ mod tests {
         );
         assert_eq!(backup.emission_wavelengths, vec![461.0, 519.0]);
         assert_eq!(backup.excitation_wavelengths, vec![358.0, 495.0]);
+    }
+
+    #[test]
+    fn nd2_parse_text_recovers_dimension_annotations_like_java() {
+        let text = "Metadata:\nDimensions: T'(41) x XY(4) x Z(7)\nTime Loop: 41\nZ Stack Loop: 7";
+        let mut backup = Nd2LvValues::default();
+        parse_text(text, &mut backup);
+
+        assert_eq!(backup.text_size_t, Some(41));
+        assert_eq!(backup.text_series_count, Some(4));
+        assert_eq!(backup.text_size_z, Some(7));
     }
 
     #[test]

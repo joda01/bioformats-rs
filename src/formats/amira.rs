@@ -501,7 +501,7 @@ impl FormatReader for AmiraReader {
             size_c: hdr.channels,
             size_t: 1,
             pixel_type: hdr.pixel_type,
-            bits_per_pixel: (hdr.pixel_type.bytes_per_sample() * 8) as u8,
+            bits_per_pixel: (hdr.pixel_type.bytes_per_sample() * 8) as u16,
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             // Java AmiraReader counts multiple @N streams as SizeC but does

@@ -10,6 +10,16 @@ The `java-bioformats/` directory is the upstream Java reference implementation â
 
 This is experimental software. The code need not be correct. The authoritative implementation is the original Java Bio-Formats.
 
+## Translation Parity Rule
+
+Prefer line-by-line auditability against the Java Bio-Formats source. Rust-only
+helper functions should be removed or inlined by default because they prevent
+direct audit against the original code and can drift from it. The only accepted
+helper exception is an adapter for a Java library call that has been replaced by
+a Rust library or API with a different shape; those helpers must preserve Java
+behavior rather than introduce a new abstraction. Do not introduce new helper
+layers during parity work unless they meet that adapter exception.
+
 ## Commands
 
 All commands run from the repo root:
