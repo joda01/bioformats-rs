@@ -2550,9 +2550,74 @@ impl FormatReader for ZeissCziReader {
         }
         if let Some(meta) = self.meta.as_ref() {
             let _ = ome.populate_pixels(meta, 0);
+            if let Some(image) = ome.images.first_mut() {
+                if image.planes.is_empty() {
+                    image.planes = czi_default_ome_planes(meta);
+                }
+                if !ome.instruments.is_empty() {
+                    image.instrument_ref = Some(0);
+                }
+            }
         }
         Some(ome)
     }
+}
+
+fn czi_default_ome_planes(meta: &ImageMetadata) -> Vec<crate::common::ome_metadata::OmePlane> {
+    let size_z = meta.size_z.max(1) as usize;
+    let size_c = meta.size_c.max(1) as usize;
+    let size_t = meta.size_t.max(1) as usize;
+    let mut planes = Vec::with_capacity(meta.image_count as usize);
+    for plane in 0..meta.image_count as usize {
+        let (the_z, the_c, the_t) =
+            czi_zct_coords(meta.dimension_order, size_z, size_c, size_t, plane);
+        planes.push(crate::common::ome_metadata::OmePlane {
+            the_z,
+            the_c,
+            the_t,
+            ..Default::default()
+        });
+    }
+    planes
+}
+
+fn czi_zct_coords(
+    order: DimensionOrder,
+    size_z: usize,
+    size_c: usize,
+    size_t: usize,
+    plane: usize,
+) -> (u32, u32, u32) {
+    let axes: &[char] = match order {
+        DimensionOrder::XYZCT => &['Z', 'C', 'T'],
+        DimensionOrder::XYZTC => &['Z', 'T', 'C'],
+        DimensionOrder::XYCZT => &['C', 'Z', 'T'],
+        DimensionOrder::XYCTZ => &['C', 'T', 'Z'],
+        DimensionOrder::XYTCZ => &['T', 'C', 'Z'],
+        DimensionOrder::XYTZC => &['T', 'Z', 'C'],
+    };
+    let mut rem = plane;
+    let mut z = 0usize;
+    let mut c = 0usize;
+    let mut t = 0usize;
+    for axis in axes.iter().rev() {
+        match axis {
+            'Z' => {
+                z = rem % size_z;
+                rem /= size_z;
+            }
+            'C' => {
+                c = rem % size_c;
+                rem /= size_c;
+            }
+            'T' => {
+                t = rem % size_t;
+                rem /= size_t;
+            }
+            _ => {}
+        }
+    }
+    (z as u32, c as u32, t as u32)
 }
 
 fn swap_bgr_to_rgb(buf: &mut [u8], bytes_per_sample: usize, samples_per_pixel: usize) {

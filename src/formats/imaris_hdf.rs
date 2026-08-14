@@ -57,8 +57,6 @@ pub struct ImarisHdfReader {
     // `channel_colors`) because the get8BitLookupTable/get16BitLookupTable ramp
     // computation needs the raw double components, not the rounded bytes.
     channel_colors_normalized: Vec<Option<[f64; 3]>>,
-    channel_emission_wavelengths: Vec<Option<f64>>,
-    channel_excitation_wavelengths: Vec<Option<f64>>,
     instrument: ImarisInstrumentMetadata,
     path_prefix: String,
     // Cache of the most recently decoded plane so that repeated reads of the
@@ -94,8 +92,6 @@ impl ImarisHdfReader {
             channel_names: Vec::new(),
             channel_colors: Vec::new(),
             channel_colors_normalized: Vec::new(),
-            channel_emission_wavelengths: Vec::new(),
-            channel_excitation_wavelengths: Vec::new(),
             instrument: ImarisInstrumentMetadata::default(),
             path_prefix: String::new(),
             cache: None,
@@ -653,8 +649,6 @@ struct ImsParse {
     channel_names: Vec<Option<String>>,
     channel_colors: Vec<Option<i32>>,
     channel_colors_normalized: Vec<Option<[f64; 3]>>,
-    channel_emission_wavelengths: Vec<Option<f64>>,
-    channel_excitation_wavelengths: Vec<Option<f64>>,
     instrument: ImarisInstrumentMetadata,
     path_prefix: String,
 }
@@ -875,8 +869,6 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     let mut channel_names: Vec<Option<String>> = vec![None; size_c as usize];
     let mut channel_colors: Vec<Option<i32>> = vec![None; size_c as usize];
     let mut channel_colors_normalized: Vec<Option<[f64; 3]>> = vec![None; size_c as usize];
-    let mut channel_emission_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
-    let mut channel_excitation_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
     for c in 0..size_c {
         if let Some(ch_path) = ims_dataset_info_channel_path(&file, &path_prefix, c) {
             let Ok(ch_group) = file.group(&ch_path) else {
@@ -915,7 +907,6 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
                     format!("imaris.channel.{c}.emission_wavelength"),
                     MetadataValue::Float(emission),
                 );
-                channel_emission_wavelengths[c as usize] = Some(emission);
             }
             if let Some(excitation) = read_str_attr(&ch_group, "LSMExcitationWavelength")
                 .and_then(|v| parse_imaris_f64(&v))
@@ -924,7 +915,6 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
                     format!("imaris.channel.{c}.excitation_wavelength"),
                     MetadataValue::Float(excitation),
                 );
-                channel_excitation_wavelengths[c as usize] = Some(excitation);
             }
             // ImarisHDFReader.parseAttributes() additionally parses the per-
             // channel Gain, Min, Max, Pinhole and MicroscopyMode attributes
@@ -1077,8 +1067,6 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         channel_names,
         channel_colors,
         channel_colors_normalized,
-        channel_emission_wavelengths,
-        channel_excitation_wavelengths,
         instrument,
         path_prefix,
     })
@@ -2982,8 +2970,6 @@ impl FormatReader for ImarisHdfReader {
         self.channel_names = parsed.channel_names;
         self.channel_colors = parsed.channel_colors;
         self.channel_colors_normalized = parsed.channel_colors_normalized;
-        self.channel_emission_wavelengths = parsed.channel_emission_wavelengths;
-        self.channel_excitation_wavelengths = parsed.channel_excitation_wavelengths;
         self.instrument = parsed.instrument;
         self.path_prefix = parsed.path_prefix;
         Ok(())
@@ -3002,8 +2988,6 @@ impl FormatReader for ImarisHdfReader {
         self.channel_names.clear();
         self.channel_colors.clear();
         self.channel_colors_normalized.clear();
-        self.channel_emission_wavelengths.clear();
-        self.channel_excitation_wavelengths.clear();
         self.instrument = ImarisInstrumentMetadata::default();
         self.path_prefix.clear();
         self.cache = None;
@@ -3306,17 +3290,16 @@ impl FormatReader for ImarisHdfReader {
 
             // Per-channel names.
             for (ci, ch) in img.channels.iter_mut().enumerate() {
+                // Java ImarisHDFReader parses LSMEmissionWavelength and
+                // LSMExcitationWavelength into internal lists but does not
+                // project them to OME Channel emission/excitation fields.
+                ch.emission_wavelength = None;
+                ch.excitation_wavelength = None;
                 if let Some(Some(name)) = self.channel_names.get(ci) {
                     ch.name = Some(name.clone());
                 }
                 if let Some(Some(color)) = self.channel_colors.get(ci) {
                     ch.color = Some(*color);
-                }
-                if let Some(Some(emission)) = self.channel_emission_wavelengths.get(ci) {
-                    ch.emission_wavelength = Some(*emission);
-                }
-                if let Some(Some(excitation)) = self.channel_excitation_wavelengths.get(ci) {
-                    ch.excitation_wavelength = Some(*excitation);
                 }
             }
             if !ome.instruments.is_empty() {
@@ -3327,7 +3310,6 @@ impl FormatReader for ImarisHdfReader {
             }
         }
         ome.rois.extend(imaris_ome_rois_from_metadata(meta));
-        let _ = ome.add_original_metadata_annotations(meta, 0);
 
         Some(ome)
     }

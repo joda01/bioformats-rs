@@ -188,6 +188,37 @@ impl TiffReader {
         &mut self.series
     }
 
+    /// Return metadata for a logical `(series, resolution)` pair without
+    /// changing the current reader position. Vendor wrappers use this to expose
+    /// Java's flattened public series view while preserving the internal
+    /// non-flattened pyramid.
+    pub fn metadata_at(&self, series: usize, resolution: usize) -> Result<ImageMetadata> {
+        let s = self
+            .series
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        if resolution == 0 {
+            return Ok(s.metadata.clone());
+        }
+
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let sub_ifds = s.sub_resolutions.get(resolution - 1).ok_or_else(|| {
+            BioFormatsError::Format(format!("resolution level {resolution} out of range"))
+        })?;
+        let first_ifd = sub_ifds
+            .first()
+            .and_then(|&idx| file.ifds.get(idx))
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("resolution level {resolution} has no planes"))
+            })?;
+
+        let mut meta = s.metadata.clone();
+        meta.size_x = first_ifd.image_width().unwrap_or(meta.size_x);
+        meta.size_y = first_ifd.image_length().unwrap_or(meta.size_y);
+        meta.image_count = sub_ifds.len() as u32;
+        Ok(meta)
+    }
+
     /// Replace the entire series list (used by vendor wrappers such as SVS that
     /// need to regroup the IFD chain into resolution levels of a single series).
     /// Resets the current series/resolution to 0.
@@ -1221,23 +1252,10 @@ impl TiffReader {
 
         let mut label_index: Option<usize> = None;
         let mut macro_index: Option<usize> = None;
-        let mut skip_positions: Vec<usize> = Vec::new();
-
         for (i, &ifd_idx) in main_ifds.iter().enumerate() {
             let ifd = &file.ifds[ifd_idx];
             let comment = ifd.get_str(tag::IMAGE_DESCRIPTION);
             let subfile_type = ifd.get_u32(tag::NEW_SUBFILE_TYPE).unwrap_or(0);
-            let stripped_thumbnail = subfile_type != 0
-                && ifd.get(tag::STRIP_BYTE_COUNTS).is_some()
-                && ifd.get(tag::TILE_BYTE_COUNTS).is_none()
-                && matches!(
-                    Compression::from(ifd.get_u16(tag::COMPRESSION).unwrap_or(1)),
-                    Compression::Lzw
-                );
-            if stripped_thumbnail {
-                skip_positions.push(i);
-                continue;
-            }
 
             match comment {
                 None => {
@@ -1281,7 +1299,7 @@ impl TiffReader {
         // Resolution images are the main IFDs that are NOT label/macro, in order.
         let extra: Vec<usize> = [label_index, macro_index].into_iter().flatten().collect();
         let resolution_positions: Vec<usize> = (0..main_ifds.len())
-            .filter(|i| !extra.contains(i) && !skip_positions.contains(i))
+            .filter(|i| !extra.contains(i))
             .collect();
         if resolution_positions.is_empty() {
             return Ok(());

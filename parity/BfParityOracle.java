@@ -25,6 +25,8 @@
 ///
 /// Usage: java -cp bioformats_package.jar:<dir> BfParityOracle <path> [maxPlanes] [region]
 ///   maxPlanes default 8, region (square edge) default 256.
+///   BIOFORMATS_RS_JAVA_PARITY_FULL_B64_MAX can raise/lower the raw full-plane
+///   base64 cap for focused tolerant comparisons. The default stays small.
 
 import loci.formats.ImageReader;
 import loci.formats.FormatTools;
@@ -41,7 +43,8 @@ public class BfParityOracle {
     static final long FULL_PLANE_MAX = 4L << 20; // 4 MiB
     /// Max full-plane size for embedding raw bytes in JSON for tolerant
     /// comparison. Larger planes still get an exact whole-plane CRC.
-    static final long FULL_PLANE_B64_MAX = 256L << 10; // 256 KiB
+    static final long FULL_PLANE_B64_MAX =
+        envLong("BIOFORMATS_RS_JAVA_PARITY_FULL_B64_MAX", 256L << 10); // 256 KiB
 
     public static void main(String[] args) {
         DebugTools.setRootLevel("ERROR");
@@ -324,5 +327,16 @@ public class BfParityOracle {
             }
         }
         return b.append("\"").toString();
+    }
+
+    private static long envLong(String name, long fallback) {
+        String value = System.getenv(name);
+        if (value == null || value.isEmpty()) return fallback;
+        try {
+            long parsed = Long.parseLong(value);
+            return parsed >= 0 ? parsed : fallback;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 }

@@ -223,6 +223,9 @@ fn xml_element_text(xml: &str, tag: &XmlTag) -> Option<String> {
 /// (magnification, stage offsets, source lens, serial number, capture mode).
 pub struct NdpiReader {
     inner: crate::tiff::TiffReader,
+    public_series: Vec<(usize, usize)>,
+    current_public_series: usize,
+    current_public_metadata: Option<ImageMetadata>,
     /// Detected number of focal planes (Z) for the pyramid series.
     size_z: u32,
     /// Number of resolution levels in the pyramid series (>= 1).
@@ -294,6 +297,9 @@ impl NdpiReader {
     pub fn new() -> Self {
         NdpiReader {
             inner: crate::tiff::TiffReader::new(),
+            public_series: Vec::new(),
+            current_public_series: 0,
+            current_public_metadata: None,
             size_z: 1,
             pyramid_height: 1,
             use_64bit: false,
@@ -314,6 +320,58 @@ impl NdpiReader {
     /// True when the file is >4 GB and uses wrapping 32-bit TIFF offsets.
     pub fn uses_64bit_offsets(&self) -> bool {
         self.use_64bit
+    }
+
+    fn rebuild_public_series(&mut self) -> Result<()> {
+        self.public_series.clear();
+        for (series_index, series) in self.inner.series_list().iter().enumerate() {
+            let resolution_count = series.metadata.resolution_count.max(1) as usize;
+            for resolution in 0..resolution_count {
+                self.public_series.push((series_index, resolution));
+            }
+        }
+        self.set_public_series(0)
+    }
+
+    fn set_public_series(&mut self, series: usize) -> Result<()> {
+        let &(logical_series, resolution) = self
+            .public_series
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        self.inner.set_series(logical_series)?;
+        self.inner.set_resolution(resolution)?;
+        let mut meta = self.inner.metadata_at(logical_series, resolution)?;
+        meta.resolution_count = 1;
+        if let Some(ifd_idx) = self.target_ifd_index(logical_series, resolution) {
+            meta.is_interleaved = self.ndpi_ifd_interleaved(ifd_idx);
+        }
+        self.current_public_series = series;
+        self.current_public_metadata = Some(meta);
+        Ok(())
+    }
+
+    fn current_inner_resolution(&self) -> usize {
+        self.public_series
+            .get(self.current_public_series)
+            .map(|&(_, resolution)| resolution)
+            .unwrap_or(0)
+    }
+
+    fn target_ifd_index(&self, logical_series: usize, resolution: usize) -> Option<usize> {
+        let series = self.inner.series_list().get(logical_series)?;
+        if resolution == 0 {
+            series.ifd_indices.first().copied()
+        } else {
+            series
+                .sub_resolutions
+                .get(resolution - 1)
+                .and_then(|ifds| ifds.first().copied())
+        }
+    }
+
+    fn current_ifd_index(&self) -> Option<usize> {
+        let &(logical_series, resolution) = self.public_series.get(self.current_public_series)?;
+        self.target_ifd_index(logical_series, resolution)
     }
 
     /// Read `SOURCE_LENS` (tag 65421) from an IFD as a float, if present.
@@ -484,29 +542,34 @@ impl NdpiReader {
     /// `MAX_SIZE` in BOTH dimensions. All other series are channel-separated.
     fn set_ndpi_interleaving(&mut self) {
         let mut flags: Vec<bool> = Vec::new();
-        for s in self.inner.series_list() {
-            let interleaved = s
-                .ifd_indices
-                .first()
-                .and_then(|&idx| self.inner.ifd(idx))
-                .map(|ifd| {
-                    let w = ifd.image_width().unwrap_or(0);
-                    let h = ifd.image_length().unwrap_or(0);
-                    let jpeg = matches!(
-                        ifd.compression(),
-                        crate::tiff::ifd::Compression::Jpeg
-                            | crate::tiff::ifd::Compression::JpegNew
-                    );
-                    let has_marker = ifd.get(NDPI_MARKER_TAG).is_some();
-                    // useTiffParser == false  =>  interleaved == true
-                    w > Self::NDPI_MAX_SIZE && h > Self::NDPI_MAX_SIZE && jpeg && has_marker
-                })
-                .unwrap_or(false);
+        for (series_index, s) in self.inner.series_list().iter().enumerate() {
+            let interleaved = series_index == 0
+                && s.ifd_indices
+                    .first()
+                    .map(|&idx| self.ndpi_ifd_interleaved(idx))
+                    .unwrap_or(false);
             flags.push(interleaved);
         }
         for (s, &interleaved) in self.inner.series_list_mut().iter_mut().zip(&flags) {
             s.metadata.is_interleaved = interleaved;
         }
+    }
+
+    fn ndpi_ifd_interleaved(&self, ifd_idx: usize) -> bool {
+        self.inner
+            .ifd(ifd_idx)
+            .map(|ifd| {
+                let w = ifd.image_width().unwrap_or(0);
+                let h = ifd.image_length().unwrap_or(0);
+                let jpeg = matches!(
+                    ifd.compression(),
+                    crate::tiff::ifd::Compression::Jpeg | crate::tiff::ifd::Compression::JpegNew
+                );
+                let has_marker = ifd.get(NDPI_MARKER_TAG).is_some();
+                // useTiffParser == false  =>  interleaved == true
+                w > Self::NDPI_MAX_SIZE && h > Self::NDPI_MAX_SIZE && jpeg && has_marker
+            })
+            .unwrap_or(false)
     }
 
     fn ndpi_pixel_bytes_for_metadata(m: &ImageMetadata, buf: Vec<u8>) -> Vec<u8> {
@@ -534,11 +597,8 @@ impl NdpiReader {
     fn ndpi_pixel_bytes(&self, buf: Vec<u8>, _w: u32, _h: u32) -> Vec<u8> {
         let m = self.inner.metadata();
         let marked_ndpi_ifd = self
-            .inner
-            .series_list()
-            .get(self.inner.series())
-            .and_then(|s| s.ifd_indices.first())
-            .and_then(|&idx| self.inner.ifd(idx))
+            .current_ifd_index()
+            .and_then(|idx| self.inner.ifd(idx))
             .map(|ifd| ifd.get(NDPI_MARKER_TAG).is_some())
             .unwrap_or(false);
         if !marked_ndpi_ifd {
@@ -557,14 +617,13 @@ impl NdpiReader {
         use crate::tiff::ifd::tag;
         let mut images: Vec<OmeImage> = Vec::new();
         let series: Vec<(usize, ImageMetadata)> = self
-            .inner
-            .series_list()
+            .public_series
             .iter()
-            .map(|s| {
-                (
-                    s.ifd_indices.first().copied().unwrap_or(0),
-                    s.metadata.clone(),
-                )
+            .filter_map(|&(logical_series, resolution)| {
+                let ifd_idx = self.target_ifd_index(logical_series, resolution)?;
+                let mut metadata = self.inner.metadata_at(logical_series, resolution).ok()?;
+                metadata.resolution_count = 1;
+                Some((ifd_idx, metadata))
             })
             .collect();
         for (i, (ifd_idx, metadata)) in series.into_iter().enumerate() {
@@ -961,6 +1020,9 @@ impl FormatReader for NdpiReader {
         self.pyramid_height = 1;
         self.use_64bit = false;
         self.ome_images.clear();
+        self.public_series.clear();
+        self.current_public_series = 0;
+        self.current_public_metadata = None;
         if !ndpi_has_hamamatsu_tags(path) {
             return Err(BioFormatsError::UnsupportedFormat(
                 "NDPI TIFF missing Hamamatsu marker/metadata tags".into(),
@@ -988,6 +1050,7 @@ impl FormatReader for NdpiReader {
         // larger than MAX_SIZE in both dimensions is decoded chunky/interleaved
         // by the custom NDPI service; everything else is read channel-separated.
         self.set_ndpi_interleaving();
+        self.rebuild_public_series()?;
         self.build_ndpi_ome();
         // BUG 2: per-element multi-strip/tile high-word arrays (Mechanism B).
         // The per-entry/single-strip high words (Mechanism A) and the IFD chain
@@ -1001,19 +1064,24 @@ impl FormatReader for NdpiReader {
         self.pyramid_height = 1;
         self.use_64bit = false;
         self.ome_images.clear();
+        self.public_series.clear();
+        self.current_public_series = 0;
+        self.current_public_metadata = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.public_series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        self.set_public_series(s)
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_public_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.current_public_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let (w, h) = {
@@ -1035,7 +1103,13 @@ impl FormatReader for NdpiReader {
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
-        self.inner.compressed_level_info(plane_index, level)
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "NDPI flattened public series expose one resolution level".into(),
+            });
+        }
+        self.inner
+            .compressed_level_info(plane_index, self.current_inner_resolution() as u32)
     }
     fn read_compressed_tile(
         &mut self,
@@ -1045,17 +1119,33 @@ impl FormatReader for NdpiReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        self.inner
-            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
+        if level != 0 {
+            return Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )));
+        }
+        self.inner.read_compressed_tile(
+            plane_index,
+            self.current_inner_resolution() as u32,
+            col,
+            row,
+            preferred_modes,
+        )
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        1
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        if level == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )))
+        }
     }
     fn resolution(&self) -> usize {
-        self.inner.resolution()
+        0
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
@@ -1086,6 +1176,9 @@ impl FormatReader for NdpiReader {
 /// becomes its own series; the dimensions with r>0 become pyramid resolutions.
 pub struct LeicaScnReader {
     inner: crate::tiff::TiffReader,
+    public_series: Vec<(usize, usize)>,
+    current_public_series: usize,
+    current_public_metadata: Option<ImageMetadata>,
     /// Per-flattened-series OME image metadata (name + physical sizes), built
     /// from the SCN XML before resolution flattening so each (image, resolution)
     /// gets its own name/calibration mirroring Java's LeicaSCNReader.
@@ -1132,8 +1225,44 @@ impl LeicaScnReader {
     pub fn new() -> Self {
         LeicaScnReader {
             inner: crate::tiff::TiffReader::new(),
+            public_series: Vec::new(),
+            current_public_series: 0,
+            current_public_metadata: None,
             ome_images: Vec::new(),
         }
+    }
+
+    fn rebuild_public_series(&mut self) -> Result<()> {
+        self.public_series.clear();
+        for (series_index, series) in self.inner.series_list().iter().enumerate() {
+            let resolution_count = series.metadata.resolution_count.max(1) as usize;
+            for resolution in 0..resolution_count {
+                self.public_series.push((series_index, resolution));
+            }
+        }
+        self.set_public_series(0)
+    }
+
+    fn set_public_series(&mut self, series: usize) -> Result<()> {
+        let &(logical_series, resolution) = self
+            .public_series
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        self.inner.set_series(logical_series)?;
+        self.inner.set_resolution(resolution)?;
+        let mut meta = self.inner.metadata_at(logical_series, resolution)?;
+        meta.resolution_count = 1;
+        meta.is_interleaved = false;
+        self.current_public_series = series;
+        self.current_public_metadata = Some(meta);
+        Ok(())
+    }
+
+    fn current_inner_resolution(&self) -> usize {
+        self.public_series
+            .get(self.current_public_series)
+            .map(|&(_, resolution)| resolution)
+            .unwrap_or(0)
     }
 
     fn scn_xml(&self) -> Option<String> {
@@ -1447,76 +1576,75 @@ impl LeicaScnReader {
             s.metadata.is_interleaved = false;
         }
 
-        // Build one OME image per logical SCN image. Java skips nonzero
-        // resolutions in initMetadataStore when flattened resolutions are
-        // disabled.
+        // Build one OME image per flattened SCN resolution. Java default
+        // `hasFlattenedResolutions()` names these `name (Rr)`.
         use crate::common::ome_metadata::{OmeChannel, OmeImage};
         let mut ome_images: Vec<OmeImage> = Vec::new();
         for img in images {
             if img.dims.is_empty() {
                 continue;
             }
-            let channels = if img
-                .lookup(0, 0, 0)
-                .or_else(|| img.dims.first())
-                .map(|d| d.ifd)
-                .and_then(|idx| self.inner.ifd(idx))
-                .map(|ifd| ifd.samples_per_pixel() > 1)
-                .unwrap_or(true)
-            {
-                self.inner
-                    .ifd(img.lookup(0, 0, 0).map(|d| d.ifd).unwrap_or(0))
-                    .map(|ifd| ifd.samples_per_pixel() as u32)
-                    .unwrap_or(3)
-            } else {
-                img.size_c.max(1)
-            };
-            let dim = img.lookup(0, 0, 0);
-            let width = dim
-                .map(|d| d.size_x)
-                .filter(|&w| w > 0)
-                .or_else(|| {
+            for r in 0..img.size_r.max(1) {
+                let dim = img.lookup(0, 0, r).or_else(|| img.dims.first());
+                let channels = if dim
+                    .map(|d| d.ifd)
+                    .and_then(|idx| self.inner.ifd(idx))
+                    .map(|ifd| ifd.samples_per_pixel() > 1)
+                    .unwrap_or(true)
+                {
                     dim.and_then(|d| self.inner.ifd(d.ifd))
-                        .and_then(|ifd| ifd.image_width())
-                })
-                .unwrap_or(0);
-            let height = dim
-                .map(|d| d.size_y)
-                .filter(|&h| h > 0)
-                .or_else(|| {
-                    dim.and_then(|d| self.inner.ifd(d.ifd))
-                        .and_then(|ifd| ifd.image_length())
-                })
-                .unwrap_or(0);
-            let px = if img.v_size_x > 0 && width > 0 {
-                Some((img.v_size_x as f64 / 1000.0) / width as f64)
-            } else {
-                None
-            };
-            let py = if img.v_size_y > 0 && height > 0 {
-                Some((img.v_size_y as f64 / 1000.0) / height as f64)
-            } else {
-                None
-            };
-            let objective_ref = images
-                .iter()
-                .position(|candidate| candidate.name == img.name)
-                .unwrap_or(0)
-                .min(1);
-            ome_images.push(OmeImage {
-                name: Some(img.name.clone()),
-                physical_size_x: px,
-                physical_size_y: py,
-                physical_size_z: (img.v_spacing_z > 0).then_some(img.v_spacing_z as f64 / 1000.0),
-                channels: vec![OmeChannel {
-                    samples_per_pixel: channels,
+                        .map(|ifd| ifd.samples_per_pixel() as u32)
+                        .unwrap_or(3)
+                } else {
+                    img.size_c.max(1)
+                };
+                let width = dim
+                    .map(|d| d.size_x)
+                    .filter(|&w| w > 0)
+                    .or_else(|| {
+                        dim.and_then(|d| self.inner.ifd(d.ifd))
+                            .and_then(|ifd| ifd.image_width())
+                    })
+                    .unwrap_or(0);
+                let height = dim
+                    .map(|d| d.size_y)
+                    .filter(|&h| h > 0)
+                    .or_else(|| {
+                        dim.and_then(|d| self.inner.ifd(d.ifd))
+                            .and_then(|ifd| ifd.image_length())
+                    })
+                    .unwrap_or(0);
+                let px = if img.v_size_x > 0 && width > 0 {
+                    Some((img.v_size_x as f64 / 1000.0) / width as f64)
+                } else {
+                    None
+                };
+                let py = if img.v_size_y > 0 && height > 0 {
+                    Some((img.v_size_y as f64 / 1000.0) / height as f64)
+                } else {
+                    None
+                };
+                let objective_ref = images
+                    .iter()
+                    .position(|candidate| candidate.name == img.name)
+                    .unwrap_or(0)
+                    .min(1);
+                ome_images.push(OmeImage {
+                    name: Some(format!("{} (R{})", img.name, r)),
+                    physical_size_x: px,
+                    physical_size_y: py,
+                    physical_size_z: (img.v_spacing_z > 0)
+                        .then_some(img.v_spacing_z as f64 / 1000.0),
+                    channels: vec![OmeChannel {
+                        samples_per_pixel: channels,
+                        ..Default::default()
+                    }],
+                    planes: vec![crate::common::ome_metadata::OmePlane::default()],
+                    instrument_ref: Some(0),
+                    objective_ref: Some(objective_ref),
                     ..Default::default()
-                }],
-                planes: vec![crate::common::ome_metadata::OmePlane::default()],
-                instrument_ref: Some(0),
-                objective_ref: Some(objective_ref),
-                ..Default::default()
-            });
+                });
+            }
         }
         self.ome_images = ome_images;
 
@@ -1564,27 +1692,39 @@ impl FormatReader for LeicaScnReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.ome_images.clear();
+        self.public_series.clear();
+        self.current_public_series = 0;
+        self.current_public_metadata = None;
         self.inner.close()?;
         self.inner.set_id(path)?;
         self.enrich_metadata();
-        Ok(())
+        if self.inner.series_count() == 0 {
+            Ok(())
+        } else {
+            self.rebuild_public_series()
+        }
     }
 
     fn close(&mut self) -> Result<()> {
         self.ome_images.clear();
+        self.public_series.clear();
+        self.current_public_series = 0;
+        self.current_public_metadata = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.public_series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        self.set_public_series(s)
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_public_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.current_public_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let (w, h) = {
@@ -1606,7 +1746,13 @@ impl FormatReader for LeicaScnReader {
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
-        self.inner.compressed_level_info(plane_index, level)
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "SCN flattened public series expose one resolution level".into(),
+            });
+        }
+        self.inner
+            .compressed_level_info(plane_index, self.current_inner_resolution() as u32)
     }
     fn read_compressed_tile(
         &mut self,
@@ -1616,17 +1762,33 @@ impl FormatReader for LeicaScnReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        self.inner
-            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
+        if level != 0 {
+            return Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )));
+        }
+        self.inner.read_compressed_tile(
+            plane_index,
+            self.current_inner_resolution() as u32,
+            col,
+            row,
+            preferred_modes,
+        )
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        1
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        if level == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )))
+        }
     }
     fn resolution(&self) -> usize {
-        self.inner.resolution()
+        0
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
@@ -1661,6 +1823,8 @@ impl FormatReader for LeicaScnReader {
 /// images are read directly via the inner `TiffReader`.
 pub struct VentanaReader {
     inner: crate::tiff::TiffReader,
+    public_series: Vec<(usize, usize)>,
+    current_public_series: usize,
     magnification: Option<f64>,
     physical_pixel_size: Option<f64>,
     tile_width: u32,
@@ -1718,6 +1882,8 @@ impl VentanaReader {
     pub fn new() -> Self {
         VentanaReader {
             inner: crate::tiff::TiffReader::new(),
+            public_series: Vec::new(),
+            current_public_series: 0,
             magnification: None,
             physical_pixel_size: None,
             tile_width: 0,
@@ -1981,8 +2147,32 @@ impl VentanaReader {
             let mut meta = self.inner.metadata().clone();
             meta.size_x = sx;
             meta.size_y = sy;
+            meta.resolution_count = 1;
             self.metadata_override = Some(meta);
         }
+    }
+
+    fn rebuild_public_series(&mut self) -> Result<()> {
+        self.public_series.clear();
+        for (series_index, series) in self.inner.series_list().iter().enumerate() {
+            let resolution_count = series.metadata.resolution_count.max(1) as usize;
+            for resolution in 0..resolution_count {
+                self.public_series.push((series_index, resolution));
+            }
+        }
+        self.set_public_series(0)
+    }
+
+    fn set_public_series(&mut self, series: usize) -> Result<()> {
+        let &(logical_series, resolution) = self
+            .public_series
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        self.inner.set_series(logical_series)?;
+        self.inner.set_resolution(resolution)?;
+        self.current_public_series = series;
+        self.refresh_metadata_override();
+        Ok(())
     }
 
     fn get_tile_column(index: i64, _rows: i64, cols: i64) -> i64 {
@@ -2320,8 +2510,25 @@ impl VentanaReader {
         self.ome_images.clear();
         let physical = self.physical_pixel_size;
         let file_name = self.file_name.as_deref().unwrap_or("Ventana image");
-        for (i, s) in self.inner.series_list().iter().enumerate() {
-            let channels = s.metadata.size_c.max(1);
+        let public: Vec<(usize, usize)> = if self.public_series.is_empty() {
+            self.inner
+                .series_list()
+                .iter()
+                .enumerate()
+                .flat_map(|(series_index, series)| {
+                    let resolution_count = series.metadata.resolution_count.max(1) as usize;
+                    (0..resolution_count).map(move |resolution| (series_index, resolution))
+                })
+                .collect()
+        } else {
+            self.public_series.clone()
+        };
+        for (i, (logical_series, resolution)) in public.into_iter().enumerate() {
+            let channels = self
+                .inner
+                .metadata_at(logical_series, resolution)
+                .map(|metadata| metadata.size_c.max(1))
+                .unwrap_or(1);
             self.ome_images.push(OmeImage {
                 name: Some(format!("{file_name} #{}", i + 1)),
                 physical_size_x: physical,
@@ -2458,8 +2665,19 @@ impl VentanaReader {
                 let mut res_y = self.scale_coordinate(tile.base_y, scale);
                 let off_y = res_y.rem_euclid(th);
                 res_y -= off_y;
-                (res_x, res_y, tw, th, off_x as usize, off_y as usize)
+                let m = self.inner.metadata();
+                (
+                    res_x,
+                    res_y,
+                    tw.min(m.size_x as i64 - res_x).max(0),
+                    th.min(m.size_y as i64 - res_y).max(0),
+                    off_x as usize,
+                    off_y as usize,
+                )
             };
+            if src_w <= 0 || src_h <= 0 {
+                continue;
+            }
             let src = self.inner.open_bytes_region(
                 0,
                 src_x as u32,
@@ -2525,9 +2743,17 @@ impl FormatReader for VentanaReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.public_series.clear();
+        self.current_public_series = 0;
+        self.metadata_override = None;
+        self.ome_images.clear();
         self.file_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
         self.inner.set_id(path)?;
         self.enrich_metadata();
+        if self.inner.series_count() > 0 {
+            self.rebuild_public_series()?;
+            self.build_ome_images();
+        }
         Ok(())
     }
 
@@ -2538,19 +2764,19 @@ impl FormatReader for VentanaReader {
         self.stitched_resolution_sizes.clear();
         self.metadata_override = None;
         self.ome_images.clear();
+        self.public_series.clear();
+        self.current_public_series = 0;
         self.file_name = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.public_series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)?;
-        self.refresh_metadata_override();
-        Ok(())
+        self.set_public_series(s)
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_public_series
     }
     fn metadata(&self) -> &ImageMetadata {
         if let Some(meta) = &self.metadata_override {
@@ -2591,15 +2817,19 @@ impl FormatReader for VentanaReader {
         self.inner.open_thumb_bytes(p)
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        1
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)?;
-        self.refresh_metadata_override();
-        Ok(())
+        if level == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )))
+        }
     }
     fn resolution(&self) -> usize {
-        self.inner.resolution()
+        0
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
@@ -2826,30 +3056,50 @@ mod leica_scn_ventana_tests {
     }
 
     #[test]
-    fn ventana_bif_pyramid_ifds_are_nested_resolutions_like_java_non_flattened() {
-        let path = temp_path("ventana_nested", "bif");
+    fn ventana_bif_pyramid_ifds_are_flattened_series_like_java_default() {
+        let path = temp_path("ventana_flattened", "bif");
         write_ventana_bif_two_resolution_tiff(&path);
 
         let mut reader = VentanaReader::new();
         reader.set_id(&path).unwrap();
 
-        assert_eq!(reader.series_count(), 3);
-        assert_eq!(reader.resolution_count(), 2);
-        assert_eq!(reader.metadata().resolution_count, 2);
+        assert_eq!(reader.series_count(), 4);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.metadata().resolution_count, 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
-
-        reader.set_resolution(1).unwrap();
-        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![30, 31, 32, 33]);
+        assert!(matches!(
+            reader.set_resolution(1),
+            Err(BioFormatsError::Format(_))
+        ));
 
         reader.set_series(1).unwrap();
         assert_eq!(reader.resolution_count(), 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![40]);
+
         reader.set_series(2).unwrap();
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        reader.set_series(3).unwrap();
         assert_eq!(reader.resolution_count(), 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 2));
 
         let ome = reader.ome_metadata().unwrap();
-        assert_eq!(ome.images.len(), 3);
+        assert_eq!(ome.images.len(), 4);
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            ome.images
+                .iter()
+                .map(|image| image.name.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{file_name} #1"),
+                format!("{file_name} #2"),
+                format!("{file_name} #3"),
+                format!("{file_name} #4")
+            ]
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -12613,7 +12863,7 @@ mod ndpi_offset64_tests {
         let mut reader = NdpiReader::new();
         reader.set_id(&path).unwrap();
 
-        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.series_count(), 3);
         assert_eq!(reader.pyramid_height(), 2);
 
         reader.set_series(0).unwrap();
@@ -12622,23 +12872,25 @@ mod ndpi_offset64_tests {
         assert!(!full.is_rgb);
         assert_eq!(full.bits_per_pixel, 14);
         assert_eq!(full.pixel_type, PixelType::Uint16);
-        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.resolution_count(), 1);
         assert_eq!(reader.resolution(), 0);
         assert_eq!((full.size_x, full.size_y), (4, 4));
+        assert!(matches!(
+            reader.set_resolution(1),
+            Err(BioFormatsError::Format(_))
+        ));
 
-        reader.set_resolution(1).unwrap();
+        reader.set_series(1).unwrap();
         let subres = reader.metadata();
         assert_eq!(subres.size_c, 1);
         assert!(!subres.is_rgb);
         assert_eq!(subres.bits_per_pixel, 14);
         assert_eq!(subres.pixel_type, PixelType::Uint16);
-        assert_eq!(reader.resolution(), 1);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.resolution(), 0);
         assert_eq!((subres.size_x, subres.size_y), (2, 2));
 
-        reader.set_resolution(0).unwrap();
-        assert_eq!(reader.resolution(), 0);
-
-        reader.set_series(1).unwrap();
+        reader.set_series(2).unwrap();
         let macro_image = reader.metadata();
         assert_eq!(macro_image.size_c, 3);
         assert!(macro_image.is_rgb);
@@ -12646,7 +12898,7 @@ mod ndpi_offset64_tests {
         assert_eq!(reader.resolution_count(), 1);
 
         let ome = reader.ome_metadata().unwrap();
-        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.images.len(), 3);
         assert_eq!(
             ome.images
                 .iter()
@@ -12875,7 +13127,7 @@ mod leica_scn_tests {
     }
 
     #[test]
-    fn scn_pyramid_exposes_resolution_levels_not_flattened_series() {
+    fn scn_pyramid_exposes_flattened_resolution_series_like_java_default() {
         let path = std::env::temp_dir().join(format!(
             "bioformats_rs_scn_pyramid_{}.scn",
             std::process::id()
@@ -12885,20 +13137,26 @@ mod leica_scn_tests {
         let mut reader = LeicaScnReader::new();
         reader.set_id(&path).unwrap();
 
-        assert_eq!(reader.series_count(), 1);
-        assert_eq!(reader.resolution_count(), 2);
-        assert_eq!(reader.metadata().resolution_count, 2);
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.metadata().resolution_count, 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 3));
         assert_eq!(reader.open_bytes(0).unwrap(), vec![1u8; 12]);
+        assert!(matches!(
+            reader.set_resolution(1),
+            Err(BioFormatsError::Format(_))
+        ));
 
-        reader.set_resolution(1).unwrap();
-        assert_eq!(reader.resolution(), 1);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!(reader.resolution_count(), 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
         assert_eq!(reader.open_bytes(0).unwrap(), vec![2u8; 2]);
 
         let ome = reader.ome_metadata().unwrap();
-        assert_eq!(ome.images.len(), 1);
-        assert_eq!(ome.images[0].name.as_deref(), Some("main"));
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.images[0].name.as_deref(), Some("main (R0)"));
+        assert_eq!(ome.images[1].name.as_deref(), Some("main (R1)"));
 
         let _ = std::fs::remove_file(path);
     }

@@ -1813,6 +1813,17 @@ impl FormatReader for MetamorphReader {
             return Some(ome);
         }
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let detector_id = crate::common::ome_metadata::create_lsid("Detector", &[0, 0]);
+        ome.instruments
+            .push(crate::common::ome_metadata::OmeInstrument {
+                id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                detectors: vec![crate::common::ome_metadata::OmeDetector {
+                    id: Some(detector_id.clone()),
+                    detector_type: Some("Other".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
         if let Some(image) = ome.images.first_mut() {
             // Java sets the image name (makeImageName, "" for a standalone STK)
             // and the physical pixel sizes from the UIC calibration tags.
@@ -1828,12 +1839,16 @@ impl FormatReader for MetamorphReader {
             if image.physical_size_z.is_none() {
                 image.physical_size_z = self.phys_z;
             }
+            image.instrument_ref = Some(0);
             // Java sets DetectorSettings binning (and gain) per channel from the
             // UIC1 CameraBin field / comment Gain (store.setDetectorSettingsBinning
             // / setDetectorSettingsGain). The generic OME builder only surfaces
             // channel name/wavelengths from series_metadata, so apply binning/gain
             // here directly.
             for ch in image.channels.iter_mut() {
+                if ch.detector_ref.is_none() {
+                    ch.detector_ref = Some(detector_id.clone());
+                }
                 if ch.detector_settings_binning.is_none() {
                     if let Some(binning) = &self.data.binning {
                         ch.detector_settings_binning = Some(binning.clone());

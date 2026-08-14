@@ -281,6 +281,10 @@ fn oracle_cache_path(path: &Path, max_planes: u32, full_plane: bool) -> Option<P
     key.push_str(&format!("max_planes={max_planes}\n"));
     key.push_str(&format!("region={REGION}\n"));
     key.push_str(&format!("full_plane={full_plane}\n"));
+    key.push_str(&format!(
+        "full_b64_max={}\n",
+        env::var("BIOFORMATS_RS_JAVA_PARITY_FULL_B64_MAX").unwrap_or_default()
+    ));
     let jar = jar_path();
     key.push_str(&format!(
         "jar={}:{}\n",

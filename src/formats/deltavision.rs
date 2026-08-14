@@ -86,6 +86,7 @@ pub struct DeltavisionReader {
     positions_in_time: bool,
     stage_ordering: StageOrdering,
     extended_headers: Vec<DvExtendedHeader>,
+    lens_id: i16,
     channel_emission_wavelengths: Vec<Option<f64>>,
     /// Per-channel neutral-density filter values (mirrors Java `ndFilters`).
     ///
@@ -111,6 +112,7 @@ impl DeltavisionReader {
             positions_in_time: false,
             stage_ordering: StageOrdering::default(),
             extended_headers: Vec::new(),
+            lens_id: 0,
             channel_emission_wavelengths: Vec::new(),
             nd_filters: Vec::new(),
             log_data: None,
@@ -1090,6 +1092,7 @@ impl FormatReader for DeltavisionReader {
         let dy = r_f32(&hdr, 44, le);
         let dz = r_f32(&hdr, 48, le);
         let file_type = r_i16(&hdr, 160, le);
+        let lens_id = r_i16(&hdr, 162, le);
 
         // NumWaves at offset 196, NumTimes at offset 180 (Bio-Formats offsets)
         let ints_per_section = r_u16(&hdr, 128, le);
@@ -1177,6 +1180,7 @@ impl FormatReader for DeltavisionReader {
         meta_map.insert("pixel_spacing_z".into(), MetadataValue::Float(dz as f64));
         meta_map.insert("dv_mode".into(), MetadataValue::Int(mode as i64));
         meta_map.insert("dv_file_type".into(), MetadataValue::Int(file_type as i64));
+        meta_map.insert("dv_lens_id".into(), MetadataValue::Int(lens_id as i64));
         meta_map.insert("dv_panels".into(), MetadataValue::Int(num_panels as i64));
         meta_map.insert(
             "dv_extended_header_planes".into(),
@@ -1305,6 +1309,7 @@ impl FormatReader for DeltavisionReader {
         self.positions_in_time = older_positions > 1;
         self.stage_ordering = stage_ordering(&extended_headers, series_count);
         self.extended_headers = extended_headers;
+        self.lens_id = lens_id;
         self.channel_emission_wavelengths = channel_emission_wavelengths;
         self.path = Some(path);
         self.log_data = None;
@@ -1324,6 +1329,7 @@ impl FormatReader for DeltavisionReader {
         self.positions_in_time = false;
         self.stage_ordering = StageOrdering::default();
         self.extended_headers.clear();
+        self.lens_id = 0;
         self.channel_emission_wavelengths.clear();
         self.nd_filters.clear();
         self.log_data = None;
@@ -1502,6 +1508,36 @@ impl FormatReader for DeltavisionReader {
                 }
             }
         }
+
+        {
+            use crate::common::ome_metadata::{create_lsid, OmeInstrument, OmeObjective};
+            let mut objective = OmeObjective {
+                id: Some(format!("Objective:{}", self.lens_id)),
+                ..Default::default()
+            };
+            // Java DeltavisionReader.populateObjective case 10002:
+            // Olympus 100X/1.40 Plan Apo IX70, model 1-UB935.
+            if self.lens_id == 10002 {
+                objective.lens_na = Some(1.40);
+                objective.nominal_magnification = Some(100.0);
+                objective.working_distance = Some(0.10);
+                objective.immersion = Some("Oil".to_string());
+                objective.model = Some("1-UB935".to_string());
+                objective.correction = Some("PlanApo".to_string());
+            }
+            if ome.instruments.is_empty() {
+                ome.instruments.push(OmeInstrument {
+                    id: Some(create_lsid("Instrument", &[0])),
+                    objectives: vec![objective],
+                    ..Default::default()
+                });
+            } else if ome.instruments[0].objectives.is_empty() {
+                ome.instruments[0].objectives.push(objective);
+            }
+            ome.images[0].instrument_ref = Some(0);
+            ome.images[0].objective_ref = Some(0);
+        }
+
         // Project metadata parsed from the `.log` companion file, mirroring the
         // OME `MetadataStore` writes in Java `DeltavisionReader.parseLogFile`.
         if let Some(log) = &self.log_data {
@@ -1538,18 +1574,31 @@ impl FormatReader for DeltavisionReader {
 
                 if log.has_objective() {
                     let o = &log.objective;
-                    inst.objectives.push(OmeObjective {
-                        id: o.id.clone(),
-                        model: o.model.clone(),
-                        manufacturer: o.manufacturer.clone(),
-                        serial_number: None,
-                        nominal_magnification: o.nominal_magnification,
-                        calibrated_magnification: None,
-                        lens_na: o.lens_na,
-                        immersion: o.immersion.clone(),
-                        correction: o.correction.clone(),
-                        working_distance: None,
-                    });
+                    if inst.objectives.is_empty() {
+                        inst.objectives.push(OmeObjective::default());
+                    }
+                    let objective = &mut inst.objectives[0];
+                    if o.id.is_some() {
+                        objective.id = o.id.clone();
+                    }
+                    if o.model.is_some() {
+                        objective.model = o.model.clone();
+                    }
+                    if o.manufacturer.is_some() {
+                        objective.manufacturer = o.manufacturer.clone();
+                    }
+                    if o.nominal_magnification.is_some() {
+                        objective.nominal_magnification = o.nominal_magnification;
+                    }
+                    if o.lens_na.is_some() {
+                        objective.lens_na = o.lens_na;
+                    }
+                    if o.immersion.is_some() {
+                        objective.immersion = o.immersion.clone();
+                    }
+                    if o.correction.is_some() {
+                        objective.correction = o.correction.clone();
+                    }
                 }
                 if log.has_detector() {
                     let d = &log.detector;
@@ -1570,7 +1619,6 @@ impl FormatReader for DeltavisionReader {
             }
         }
 
-        let _ = ome.add_original_metadata_annotations(meta, 0);
         Some(ome)
     }
 }
@@ -2034,10 +2082,7 @@ mod tests {
         assert_eq!(planes[1].the_t, 1);
         assert_eq!(planes[1].position_y, Some(21.0));
         assert_eq!(ome.images[0].channels[0].excitation_wavelength, Some(488.0));
-        assert!(ome
-            .annotations
-            .iter()
-            .any(|annotation| format!("{annotation:?}").contains("OriginalMetadata")));
+        assert!(ome.annotations.is_empty());
 
         assert_eq!(reader.open_bytes(1).unwrap(), vec![9]);
         fs::remove_file(path).ok();
@@ -2253,9 +2298,16 @@ mod tests {
         let path = write_synthetic_dv("no_log_companion", 1, 1, 1, 0, 1, 0, 1, &[&[42]]);
         let mut reader = DeltavisionReader::new();
         reader.set_id(&path).unwrap();
-        // No log -> no objective/detector instrument projected.
+        // Java still creates the default Instrument/Objective graph without a
+        // `.log` companion.
         let ome = reader.ome_metadata().unwrap();
-        assert!(ome.instruments.is_empty() || ome.instruments[0].objectives.is_empty());
+        assert_eq!(ome.instruments[0].id.as_deref(), Some("Instrument:0"));
+        assert_eq!(
+            ome.instruments[0].objectives[0].id.as_deref(),
+            Some("Objective:0")
+        );
+        assert_eq!(ome.images[0].instrument_ref, Some(0));
+        assert_eq!(ome.images[0].objective_ref, Some(0));
         fs::remove_file(&path).ok();
     }
 

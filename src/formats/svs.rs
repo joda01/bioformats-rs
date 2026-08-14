@@ -8,19 +8,57 @@
 use std::path::Path;
 
 use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
-use crate::common::error::Result;
+use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, MetadataValue};
 use crate::common::reader::FormatReader;
 
 pub struct SvsReader {
     inner: crate::tiff::TiffReader,
+    public_series: Vec<(usize, usize)>,
+    current_public_series: usize,
+    current_public_metadata: Option<ImageMetadata>,
 }
 
 impl SvsReader {
     pub fn new() -> Self {
         SvsReader {
             inner: crate::tiff::TiffReader::new(),
+            public_series: Vec::new(),
+            current_public_series: 0,
+            current_public_metadata: None,
         }
+    }
+
+    fn rebuild_public_series(&mut self) -> Result<()> {
+        self.public_series.clear();
+        for (series_index, series) in self.inner.series_list().iter().enumerate() {
+            let resolution_count = series.metadata.resolution_count.max(1) as usize;
+            for resolution in 0..resolution_count {
+                self.public_series.push((series_index, resolution));
+            }
+        }
+        self.set_public_series(0)
+    }
+
+    fn set_public_series(&mut self, series: usize) -> Result<()> {
+        let &(logical_series, resolution) = self
+            .public_series
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        self.inner.set_series(logical_series)?;
+        self.inner.set_resolution(resolution)?;
+        let mut meta = self.inner.metadata_at(logical_series, resolution)?;
+        meta.resolution_count = 1;
+        self.current_public_series = series;
+        self.current_public_metadata = Some(meta);
+        Ok(())
+    }
+
+    fn current_inner_resolution(&self) -> usize {
+        self.public_series
+            .get(self.current_public_series)
+            .map(|&(_, resolution)| resolution)
+            .unwrap_or(0)
     }
 
     /// Mirror Java `SVSReader.isThisType(String, true)`: when suffix detection
@@ -389,23 +427,29 @@ impl FormatReader for SvsReader {
             self.inner.regroup_as_svs_pyramid()?;
         }
         self.parse_aperio_metadata();
-        Ok(())
+        self.rebuild_public_series()
     }
 
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.inner.close()?;
+        self.public_series.clear();
+        self.current_public_series = 0;
+        self.current_public_metadata = None;
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.public_series.len()
     }
     fn set_series(&mut self, series: usize) -> Result<()> {
-        self.inner.set_series(series)
+        self.set_public_series(series)
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_public_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.current_public_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner.open_bytes(plane_index)
@@ -428,7 +472,13 @@ impl FormatReader for SvsReader {
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
-        self.inner.compressed_level_info(plane_index, level)
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "SVS flattened public series expose one resolution level".into(),
+            });
+        }
+        self.inner
+            .compressed_level_info(plane_index, self.current_inner_resolution() as u32)
     }
     fn read_compressed_tile(
         &mut self,
@@ -438,17 +488,33 @@ impl FormatReader for SvsReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        self.inner
-            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
+        if level != 0 {
+            return Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )));
+        }
+        self.inner.read_compressed_tile(
+            plane_index,
+            self.current_inner_resolution() as u32,
+            col,
+            row,
+            preferred_modes,
+        )
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        1
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        if level == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )))
+        }
     }
     fn resolution(&self) -> usize {
-        self.inner.resolution()
+        0
     }
 
     /// One OME image per series, named like Java `SVSReader.initMetadataStore`:
@@ -459,13 +525,14 @@ impl FormatReader for SvsReader {
     /// calibration. Each image has a single RGB channel (SamplesPerPixel =
     /// channel count).
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
-        let series = self.inner.series_list();
-        if series.is_empty() {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeChannel, OmeImage, OmeInstrument, OmeMetadata, OmeObjective, OmePlane,
+        };
+        if self.public_series.is_empty() {
             return None;
         }
         // Aperio MPP (micrometres per pixel) lives on the first series.
-        let mpp = series.first().and_then(|s| {
+        let mpp = self.inner.series_list().first().and_then(|s| {
             s.metadata
                 .series_metadata
                 .get("pixel.size.um")
@@ -475,22 +542,19 @@ impl FormatReader for SvsReader {
                     _ => None,
                 })
         });
-        let images = series
+        let images = self
+            .public_series
             .iter()
             .enumerate()
-            .map(|(i, s)| {
-                let m = &s.metadata;
+            .map(|(i, &(logical_series, resolution))| {
+                let mut owned_meta = self
+                    .inner
+                    .metadata_at(logical_series, resolution)
+                    .unwrap_or_else(|_| self.inner.series_list()[logical_series].metadata.clone());
+                owned_meta.resolution_count = 1;
+                let m = &owned_meta;
                 let (px, py) = if i == 0 { (mpp, mpp) } else { (None, None) };
-                let name = match m.series_metadata.get("svs.image_type") {
-                    Some(MetadataValue::String(kind)) if kind == "label" => {
-                        Some("label image".to_string())
-                    }
-                    Some(MetadataValue::String(kind)) if kind == "macro" => {
-                        Some("macro image".to_string())
-                    }
-                    _ if i == 0 => Some(String::new()),
-                    _ => Some(format!("Series {}", i + 1)),
-                };
+                let name = Some(format!("Series {}", i + 1));
                 let mut channel = OmeChannel {
                     samples_per_pixel: m.size_c.max(1),
                     ..Default::default()
@@ -522,12 +586,28 @@ impl FormatReader for SvsReader {
                     physical_size_x: px,
                     physical_size_y: py,
                     channels: vec![channel],
+                    planes: vec![OmePlane {
+                        the_z: 0,
+                        the_c: 0,
+                        the_t: 0,
+                        ..Default::default()
+                    }],
+                    instrument_ref: Some(0),
+                    objective_ref: Some(0),
                     ..Default::default()
                 }
             })
             .collect();
         Some(OmeMetadata {
             images,
+            instruments: vec![OmeInstrument {
+                id: Some(create_lsid("Instrument", &[0])),
+                objectives: vec![OmeObjective {
+                    id: Some(create_lsid("Objective", &[0, 0])),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
             ..Default::default()
         })
     }
@@ -937,7 +1017,7 @@ mod pyramid_tiff_tests {
     }
 
     #[test]
-    fn svs_pyramid_exposes_nested_resolution_levels_like_java_noflat() {
+    fn svs_pyramid_exposes_flattened_resolution_series_like_java_default() {
         let svs = build_svs_pyramid_tiff();
         let path = std::env::temp_dir().join(format!("aperio_pyramid_{}.svs", std::process::id()));
         std::fs::write(&path, &svs).unwrap();
@@ -947,24 +1027,26 @@ mod pyramid_tiff_tests {
 
         assert_eq!(
             reader.series_count(),
-            3,
-            "main pyramid plus label and macro series"
+            4,
+            "full resolution, sub-resolution, label, and macro public series"
         );
-        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.resolution_count(), 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 4));
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x11; 16]);
 
-        reader.set_resolution(1).unwrap();
-        assert_eq!(reader.resolution(), 1);
+        assert!(reader.set_resolution(1).is_err());
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!(reader.resolution_count(), 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x22; 4]);
 
-        reader.set_series(1).unwrap();
+        reader.set_series(2).unwrap();
         assert_eq!(reader.resolution(), 0);
         assert_eq!(reader.resolution_count(), 1);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x33]);
 
-        reader.set_series(2).unwrap();
+        reader.set_series(3).unwrap();
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x44]);
 
         reader.close().unwrap();
@@ -993,7 +1075,7 @@ mod pyramid_tiff_tests {
     }
 
     #[test]
-    fn svs_ome_names_match_java_label_macro_names() {
+    fn svs_ome_names_match_java_flattened_default_series_names() {
         let svs = build_svs_with_label_macro_tiff();
         let path =
             std::env::temp_dir().join(format!("aperio_label_macro_{}.svs", std::process::id()));
@@ -1010,7 +1092,7 @@ mod pyramid_tiff_tests {
             .collect();
         assert_eq!(
             names,
-            vec![Some(""), Some("label image"), Some("macro image")]
+            vec![Some("Series 1"), Some("Series 2"), Some("Series 3")]
         );
         let channel = &ome.images[0].channels[0];
         assert_eq!(channel.name.as_deref(), Some("DAPI"));

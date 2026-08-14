@@ -73,6 +73,7 @@ struct DicomAttrs {
     number_of_frames: u32,
     photometric_interpretation: String,
     planar_configuration: u16,
+    planar_configuration_present: bool,
     palette: PaletteLut,
     transfer_syntax: String,
     pixel_data_offset: u64,
@@ -1176,7 +1177,10 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
                 attrs.columns = attrs.columns.max(read_u16(&value));
             }
             (0x0028, 0x0002) => attrs.samples_per_pixel = read_u16(&value),
-            (0x0028, 0x0006) => attrs.planar_configuration = read_u16(&value),
+            (0x0028, 0x0006) => {
+                attrs.planar_configuration = read_u16(&value);
+                attrs.planar_configuration_present = true;
+            }
             (0x0028, 0x0100) => attrs.bits_allocated = read_u16(&value),
             (0x0028, 0x0101) => attrs.bits_stored = read_u16(&value),
             (0x0028, 0x0103) => attrs.pixel_representation = read_u16(&value),
@@ -1314,9 +1318,6 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
     // consumer (metadata + pixel-length validation + reads) sees a valid value.
     if attrs.samples_per_pixel == 0 {
         attrs.samples_per_pixel = 1;
-    }
-    if attrs.samples_per_pixel == 1 {
-        attrs.planar_configuration = 0;
     }
     let make_channel = |index: usize| -> Option<LutChannel> {
         let (_entries, _first_mapped, _bits_per_entry) = palette_descriptors[index]?;
@@ -1742,9 +1743,9 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
-        is_interleaved: !is_rgb
-            || (classify_transfer_syntax(&a.transfer_syntax) != EncapsulatedSyntax::Rle
-                && a.planar_configuration == 0),
+        // Java DicomReader leaves CoreMetadata.interleaved at the default
+        // false unless PlanarConfiguration is present and equals 0.
+        is_interleaved: a.planar_configuration_present && a.planar_configuration == 0,
         is_indexed: is_palette_color,
         is_little_endian: a.little_endian,
         resolution_count: 1,
@@ -3249,24 +3250,20 @@ impl FormatReader for DicomReader {
         // Java sets store.setPlanePosition*(value, series, plane) for each plane
         // index p < positionX.size(). Mirror that with one OmePlane per plane.
         let plane_count = meta.image_count as usize;
-        let has_positions = !self.position_x.is_empty()
-            || !self.position_y.is_empty()
-            || !self.position_z.is_empty();
-        if has_positions && plane_count > 0 {
-            // Ensure a plane entry exists for every image plane, with ZCT
-            // coordinates from the XYCZT ordering DICOM uses.
-            if img.planes.len() < plane_count {
-                let size_c = meta.size_c.max(1);
-                let size_z = meta.size_z.max(1);
-                img.planes = (0..plane_count as u32)
-                    .map(|p| OmePlane {
-                        the_c: p % size_c,
-                        the_z: (p / size_c) % size_z,
-                        the_t: p / (size_c * size_z),
-                        ..Default::default()
-                    })
-                    .collect();
-            }
+        if plane_count > 0 {
+            // Java DicomReader calls MetadataTools.populatePixels(..., true),
+            // which creates one Plane entry per image plane even if no
+            // per-plane position values are later populated.
+            let size_c = meta.size_c.max(1);
+            let size_z = meta.size_z.max(1);
+            img.planes = (0..plane_count as u32)
+                .map(|p| OmePlane {
+                    the_c: p % size_c,
+                    the_z: (p / size_c) % size_z,
+                    the_t: p / (size_c * size_z),
+                    ..Default::default()
+                })
+                .collect();
             for p in 0..plane_count {
                 if p < self.position_x.len() {
                     img.planes[p].position_x = self.position_x[p];

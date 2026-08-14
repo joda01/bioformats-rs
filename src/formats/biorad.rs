@@ -1315,13 +1315,17 @@ impl FormatReader for BioRadReader {
             img.physical_size_z = Some(v);
         }
 
-        // Instrument: Objective (model + nominal magnification) and Detectors
-        // (per-channel gain/offset). Mirrors the Java MetadataStore wiring.
+        // Instrument: Objective (header lens/magFactor plus note overrides)
+        // and Detectors (per-channel gain/offset). Mirrors Java initFile's
+        // full-metadata block, which always creates Instrument:0 and
+        // Objective:0:0 before parseNotes may enrich them.
         let objective_model = match sm.get("objective.model") {
             Some(MetadataValue::String(s)) => Some(s.clone()),
             _ => None,
         };
-        let objective_mag = get_f("objective.nominal_magnification");
+        let objective_mag =
+            get_f("objective.nominal_magnification").or_else(|| get_f("mag_factor"));
+        let objective_lens_na = get_f("lens");
 
         // Java initFile (lines ~512-528): for each effective channel, the
         // accumulated `offset`/`gain` lists drive a Detector element plus the
@@ -1349,24 +1353,23 @@ impl FormatReader for BioRadReader {
             }
         }
 
-        if objective_model.is_some() || objective_mag.is_some() || !detectors.is_empty() {
-            let mut instrument = OmeInstrument {
-                id: Some("Instrument:0".into()),
-                ..Default::default()
-            };
-            if objective_model.is_some() || objective_mag.is_some() {
-                instrument.objectives.push(OmeObjective {
-                    id: Some("Objective:0:0".into()),
-                    model: objective_model,
-                    nominal_magnification: objective_mag,
-                    correction: Some("Other".into()),
-                    immersion: Some("Other".into()),
-                    ..Default::default()
-                });
-            }
-            instrument.detectors = detectors;
-            ome.instruments.push(instrument);
-        }
+        let mut instrument = OmeInstrument {
+            id: Some("Instrument:0".into()),
+            ..Default::default()
+        };
+        instrument.objectives.push(OmeObjective {
+            id: Some("Objective:0:0".into()),
+            model: objective_model,
+            nominal_magnification: objective_mag,
+            lens_na: objective_lens_na,
+            correction: Some("Other".into()),
+            immersion: Some("Other".into()),
+            ..Default::default()
+        });
+        instrument.detectors = detectors;
+        img.instrument_ref = Some(0);
+        img.objective_ref = Some(0);
+        ome.instruments.push(instrument);
 
         Some(ome)
     }

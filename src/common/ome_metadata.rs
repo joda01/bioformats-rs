@@ -1612,6 +1612,7 @@ impl OmeMetadata {
         };
         OmeMetadata {
             images: vec![image],
+            instruments: czi_instruments(xml),
             ..Default::default()
         }
     }
@@ -2305,6 +2306,163 @@ fn czi_channels(xml: &str) -> Vec<OmeChannel> {
         pos = end;
     }
     channels
+}
+
+fn czi_instruments(xml: &str) -> Vec<OmeInstrument> {
+    let Some(information) = first_xml_block(xml, "Information") else {
+        return Vec::new();
+    };
+    let Some(instrument_xml) = first_xml_block(information, "Instrument") else {
+        return Vec::new();
+    };
+
+    let objectives = czi_objectives(xml);
+    let detectors = czi_detectors(instrument_xml);
+    let filters = czi_filters(instrument_xml);
+    let dichroics = czi_dichroics(instrument_xml);
+    if objectives.is_empty() && detectors.is_empty() && filters.is_empty() && dichroics.is_empty() {
+        return Vec::new();
+    }
+
+    vec![OmeInstrument {
+        id: Some(create_lsid("Instrument", &[0])),
+        microscope_model: czi_microscope_model(xml),
+        objectives,
+        detectors,
+        filters,
+        dichroics,
+        ..Default::default()
+    }]
+}
+
+fn czi_microscope_model(xml: &str) -> Option<String> {
+    let microscope_pos = all_tag_positions(xml, "Microscope").into_iter().next()?;
+    let tag = start_tag_at(xml, microscope_pos);
+    xml_attr(tag, "Name").filter(|s| !s.is_empty())
+}
+
+fn czi_objectives(xml: &str) -> Vec<OmeObjective> {
+    let Some(objective_changer) = first_xml_block(xml, "ObjectiveChanger") else {
+        return Vec::new();
+    };
+    all_tag_positions(objective_changer, "Objective")
+        .into_iter()
+        .enumerate()
+        .map(|(index, pos)| {
+            let tag = start_tag_at(objective_changer, pos);
+            let end = find_end_tag(
+                objective_changer,
+                "Objective",
+                pos + start_tag_at(objective_changer, pos).len(),
+            )
+            .unwrap_or_else(|| pos + tag.len());
+            let body = objective_changer.get(pos..end).unwrap_or(tag);
+            OmeObjective {
+                id: Some(create_lsid("Objective", &[0, index])),
+                model: xml_attr(tag, "Model").filter(|s| !s.is_empty()),
+                serial_number: xml_attr(tag, "UniqueName").filter(|s| !s.is_empty()),
+                nominal_magnification: xml_inner_text(body, "Magnification")
+                    .and_then(|s| s.parse::<f64>().ok()),
+                lens_na: xml_inner_text(body, "NumericalAperture")
+                    .and_then(|s| s.parse::<f64>().ok()),
+                immersion: xml_inner_text(body, "Immersions").filter(|s| !s.is_empty()),
+                correction: Some("Other".into()),
+                working_distance: xml_inner_text(body, "WorkingDistance")
+                    .and_then(|s| s.parse::<f64>().ok()),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn czi_detectors(instrument_xml: &str) -> Vec<OmeDetector> {
+    let Some(detectors_xml) = first_xml_block(instrument_xml, "Detectors") else {
+        return Vec::new();
+    };
+    let mut detectors = Vec::new();
+    for pos in all_tag_positions(detectors_xml, "Detector") {
+        let tag = start_tag_at(detectors_xml, pos);
+        let mut id = xml_attr(tag, "Id").unwrap_or_default().replace(' ', "");
+        if id.is_empty() {
+            continue;
+        }
+        if !id.starts_with("Detector:") {
+            id = format!("Detector:{id}");
+        }
+        if detectors
+            .iter()
+            .any(|detector: &OmeDetector| detector.id.as_deref() == Some(id.as_str()))
+        {
+            continue;
+        }
+        let end = find_end_tag(detectors_xml, "Detector", pos + tag.len())
+            .unwrap_or_else(|| pos + tag.len());
+        let body = detectors_xml.get(pos..end).unwrap_or(tag);
+        detectors.push(OmeDetector {
+            id: Some(id),
+            model: xml_attr(tag, "Name").filter(|s| !s.is_empty()),
+            gain: xml_inner_text(body, "Gain").and_then(|s| s.parse::<f64>().ok()),
+            offset: xml_inner_text(body, "Offset").and_then(|s| s.parse::<f64>().ok()),
+            detector_type: xml_inner_text(body, "Type").filter(|s| !s.is_empty()),
+            ..Default::default()
+        });
+    }
+    detectors
+}
+
+fn czi_filters(instrument_xml: &str) -> Vec<OmeFilter> {
+    let Some(filters_xml) = first_xml_block(instrument_xml, "Filters") else {
+        return Vec::new();
+    };
+    all_tag_positions(filters_xml, "Filter")
+        .into_iter()
+        .enumerate()
+        .map(|(index, pos)| {
+            let tag = start_tag_at(filters_xml, pos);
+            let end = find_end_tag(filters_xml, "Filter", pos + tag.len())
+                .unwrap_or_else(|| pos + tag.len());
+            let body = filters_xml.get(pos..end).unwrap_or(tag);
+            let transmittance = first_xml_block(body, "TransmittanceRange").unwrap_or(body);
+            OmeFilter {
+                id: xml_attr(tag, "Id")
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| Some(create_lsid("Filter", &[0, index]))),
+                model: xml_attr(tag, "Name").filter(|s| !s.is_empty()),
+                filter_type: xml_inner_text(body, "Type").filter(|s| !s.is_empty()),
+                cut_in: xml_inner_text(transmittance, "CutIn").and_then(|s| s.parse().ok()),
+                cut_out: xml_inner_text(transmittance, "CutOut").and_then(|s| s.parse().ok()),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn czi_dichroics(instrument_xml: &str) -> Vec<OmeDichroic> {
+    let Some(dichroics_xml) = first_xml_block(instrument_xml, "Dichroics") else {
+        return Vec::new();
+    };
+    all_tag_positions(dichroics_xml, "Dichroic")
+        .into_iter()
+        .enumerate()
+        .map(|(index, pos)| {
+            let tag = start_tag_at(dichroics_xml, pos);
+            OmeDichroic {
+                id: xml_attr(tag, "Id")
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| Some(create_lsid("Dichroic", &[0, index]))),
+                model: xml_attr(tag, "Name").filter(|s| !s.is_empty()),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn first_xml_block<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let pos = all_tag_positions(xml, tag).into_iter().next()?;
+    let start_tag = start_tag_at(xml, pos);
+    let content_start = pos + start_tag.len();
+    let end = find_end_tag(xml, tag, content_start).unwrap_or(content_start);
+    xml.get(pos..end)
 }
 
 fn metadata_value_to_string(value: &MetadataValue) -> String {

@@ -1727,22 +1727,20 @@ impl FormatReader for GatanReader {
         } else {
             (self.pos_x, self.pos_y, self.pos_z)
         };
-        if px.is_some() || py.is_some() || pz.is_some() || self.sample_time.is_some() {
-            let c_size = meta.size_c.max(1);
-            let z_size = meta.size_z.max(1);
-            img.planes = (0..meta.image_count)
-                .map(|p| OmePlane {
-                    the_z: (p / c_size) % z_size,
-                    the_c: p % c_size,
-                    the_t: p / (c_size * z_size),
-                    delta_t: None,
-                    exposure_time: self.sample_time,
-                    position_x: px,
-                    position_y: py,
-                    position_z: pz,
-                })
-                .collect();
-        }
+        let c_size = meta.size_c.max(1);
+        let z_size = meta.size_z.max(1);
+        img.planes = (0..meta.image_count)
+            .map(|p| OmePlane {
+                the_z: (p / c_size) % z_size,
+                the_c: p % c_size,
+                the_t: p / (c_size * z_size),
+                delta_t: None,
+                exposure_time: self.sample_time,
+                position_x: px,
+                position_y: py,
+                position_z: pz,
+            })
+            .collect();
 
         // Emit annotation ROIs (GatanReader.java:397-460). Java guards this on
         // metadata level != NO_OVERLAYS; we emit them whenever any were parsed.
