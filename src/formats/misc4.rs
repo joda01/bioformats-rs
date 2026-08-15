@@ -3125,6 +3125,14 @@ impl HisReader {
     }
 }
 
+fn his_read_at(file: &mut std::fs::File, offset: u64, len: usize) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+    Ok(buf)
+}
+
 fn unpack_his_packed_12(data: &[u8], samples: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples * 2);
     for sample in 0..samples {
@@ -3167,14 +3175,21 @@ impl FormatReader for HisReader {
         self.packed_12_bit.clear();
         self.current_series = 0;
 
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        if data.len() < 16 || &data[..2] != b"IM" {
+        let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = file.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)?;
+        if file_len < 16 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "HIS header missing IM magic".to_string(),
+            ));
+        }
+        let file_header = his_read_at(&mut file, 0, 16)?;
+        if &file_header[..2] != b"IM" {
             return Err(BioFormatsError::UnsupportedFormat(
                 "HIS header missing IM magic".to_string(),
             ));
         }
 
-        let series_count = u16::from_le_bytes([data[14], data[15]]) as usize;
+        let series_count = u16::from_le_bytes([file_header[14], file_header[15]]) as usize;
         if series_count == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "HIS header declares zero image series".to_string(),
@@ -3194,12 +3209,13 @@ impl FormatReader for HisReader {
         // 14) are treated as 16-bit for the remainder of the file.
         let mut adjusted_bit_depth = false;
         for series in 0..series_count {
-            if offset.checked_add(64).is_none_or(|end| end > data.len()) {
+            if offset.checked_add(64).is_none_or(|end| end as u64 > file_len) {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "HIS series {series} header is truncated"
                 )));
             }
-            if &data[offset..offset + 2] != b"IM" {
+            let mut header = his_read_at(&mut file, offset as u64, 64)?;
+            if &header[..2] != b"IM" {
                 // Mirror Java: only the previous series being 12-bit allows us to
                 // recover; otherwise the magic really is missing/corrupt.
                 if series > 0 && metas[series - 1].bits_per_pixel == 12 {
@@ -3223,12 +3239,13 @@ impl FormatReader for HisReader {
                     offset = (prev_pixel_offset + total_bytes) as usize;
                     adjusted_bit_depth = true;
 
-                    if offset.checked_add(64).is_none_or(|end| end > data.len()) {
+                    if offset.checked_add(64).is_none_or(|end| end as u64 > file_len) {
                         return Err(BioFormatsError::UnsupportedFormat(format!(
                             "HIS series {series} header is truncated"
                         )));
                     }
-                    if &data[offset..offset + 2] != b"IM" {
+                    header = his_read_at(&mut file, offset as u64, 64)?;
+                    if &header[..2] != b"IM" {
                         return Err(BioFormatsError::UnsupportedFormat(format!(
                             "HIS series {series} missing IM magic"
                         )));
@@ -3240,10 +3257,10 @@ impl FormatReader for HisReader {
                 }
             }
 
-            let comment_bytes = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
-            let w = u16::from_le_bytes([data[offset + 4], data[offset + 5]]) as u32;
-            let h = u16::from_le_bytes([data[offset + 6], data[offset + 7]]) as u32;
-            let data_type = u16::from_le_bytes([data[offset + 12], data[offset + 13]]);
+            let comment_bytes = u16::from_le_bytes([header[2], header[3]]) as usize;
+            let w = u16::from_le_bytes([header[4], header[5]]) as u32;
+            let h = u16::from_le_bytes([header[6], header[7]]) as u32;
+            let data_type = u16::from_le_bytes([header[12], header[13]]);
             if w == 0 || h == 0 {
                 return Err(BioFormatsError::UnsupportedFormat(
                     "HIS header is missing image dimensions".to_string(),
@@ -3298,7 +3315,7 @@ impl FormatReader for HisReader {
                 .ok_or_else(|| {
                     BioFormatsError::Format("HIS image plane is too large".to_string())
                 })?;
-            if next_offset > data.len() as u64 {
+            if next_offset > file_len {
                 return Err(BioFormatsError::UnsupportedFormat(
                     "HIS payload is shorter than declared image dimensions".to_string(),
                 ));
@@ -3306,9 +3323,9 @@ impl FormatReader for HisReader {
 
             let mut series_metadata = HashMap::new();
             if comment_bytes > 0 {
-                let comment_end = pixel_offset;
-                let comment_start = comment_end - comment_bytes;
-                let comment = String::from_utf8_lossy(&data[comment_start..comment_end]);
+                let comment_start = (pixel_offset - comment_bytes) as u64;
+                let comment_buf = his_read_at(&mut file, comment_start, comment_bytes)?;
+                let comment = String::from_utf8_lossy(&comment_buf);
                 for token in comment.split(';') {
                     if let Some((key, value)) = token.split_once('=') {
                         series_metadata

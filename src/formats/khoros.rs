@@ -38,13 +38,20 @@ struct ViffParsed {
     offset: u64,
 }
 
-fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
-    // Need at least the fixed 1024-byte header.
-    if data.len() < 584 {
+fn parse_khoros(file: &mut std::fs::File, file_len: u64) -> Result<ViffParsed> {
+    // Need at least the fixed portion of the 1024-byte header (through the LUT
+    // channel count at byte 580..584); the LUT payload itself, if present, is
+    // read separately below rather than pulling the whole file (which can be
+    // dominated by the pixel planes that follow the header) into memory.
+    if file_len < 584 {
         return Err(BioFormatsError::Format(
             "VIFF/Khoros header too short".into(),
         ));
     }
+    file.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+    let mut header = vec![0u8; 588u64.min(file_len) as usize];
+    file.read_exact(&mut header).map_err(BioFormatsError::Io)?;
+    let data = &header[..];
 
     // Java does `skipBytes(4); order(true); dependency = readInt()`: the
     // dependency word itself is always read little-endian, and then selects the
@@ -92,7 +99,7 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
     if lut_c > 1 {
         let size_c = lut_c as u32;
         // n = readInt() at 584.
-        if data.len() < 588 {
+        if file_len < 588 {
             return Err(BioFormatsError::Format(
                 "VIFF/Khoros header too short for LUT".into(),
             ));
@@ -112,11 +119,15 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         let lut_end = lut_start
             .checked_add(lut_bytes)
             .ok_or_else(|| BioFormatsError::Format("VIFF/Khoros LUT size overflow".into()))?;
-        if lut_end > data.len() {
+        if lut_end as u64 > file_len {
             return Err(BioFormatsError::Format(
                 "VIFF/Khoros LUT extends past end of file".into(),
             ));
         }
+        file.seek(SeekFrom::Start(lut_start as u64))
+            .map_err(BioFormatsError::Io)?;
+        let mut lut_data = vec![0u8; lut_bytes];
+        file.read_exact(&mut lut_data).map_err(BioFormatsError::Io)?;
         // lut[c][n]: build an RGB LookupTable from the first three bands when
         // available (n entries per band). Java exposes it as a c x n table; we
         // map bands 0/1/2 to R/G/B for the common 3-band palette case.
@@ -125,16 +136,16 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
             let mut green = vec![0u16; n];
             let mut blue = vec![0u16; n];
             for j in 0..n {
-                red[j] = data[lut_start + j] as u16;
-                green[j] = data[lut_start + n + j] as u16;
-                blue[j] = data[lut_start + 2 * n + j] as u16;
+                red[j] = lut_data[j] as u16;
+                green[j] = lut_data[n + j] as u16;
+                blue[j] = lut_data[2 * n + j] as u16;
             }
             lookup_table = Some(LookupTable { red, green, blue });
         } else if n > 0 {
             // Single-band palette: replicate across RGB.
             let mut chan = vec![0u16; n];
             for j in 0..n {
-                chan[j] = data[lut_start + j] as u16;
+                chan[j] = lut_data[j] as u16;
             }
             lookup_table = Some(LookupTable {
                 red: chan.clone(),
@@ -193,7 +204,7 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         modulo_t: None,
     };
 
-    validate_viff_payload(data.len() as u64, offset, &meta)?;
+    validate_viff_payload(file_len, offset, &meta)?;
 
     Ok(ViffParsed { meta, offset })
 }
@@ -278,8 +289,9 @@ impl FormatReader for KhorosReader {
         self.path = None;
         self.meta = None;
         self.data_offset = 1024;
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let parsed = parse_khoros(&data)?;
+        let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = file.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)?;
+        let parsed = parse_khoros(&mut file, file_len)?;
         self.path = Some(path.to_path_buf());
         self.data_offset = parsed.offset;
         self.meta = Some(parsed.meta);

@@ -11941,9 +11941,28 @@ impl FormatReader for LofReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let file_len = bytes.len() as u64;
-        let mut c = ByteCursor::new(&bytes, true);
+        // `.lof` files are a single Leica image whose raw pixel memory block
+        // sits directly between the small header and a small trailing XML
+        // block: `[header][pixel memory: memory_size bytes][xml chunk]`. Only
+        // the header and the XML need to be parsed here; open_bytes/
+        // open_bytes_region already seek the file directly for pixel reads
+        // rather than using a cached buffer, so reading the whole file (the
+        // pixel memory can be many GB) just to skip over it was pure I/O
+        // overhead - read the header, jump straight past the pixel memory,
+        // and read only the XML trailer.
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(BioFormatsError::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+        // Generously bounds the header (magic/version/type-name fields) -
+        // real LOF headers are well under 100 bytes; this is a wide margin,
+        // not a tight fit, unlike the file's actual (unbounded) pixel memory.
+        const HEADER_PREFIX_LEN: usize = 4096;
+        let mut header_buf = vec![0u8; (HEADER_PREFIX_LEN as u64).min(file_len) as usize];
+        file.read_exact(&mut header_buf)
+            .map_err(BioFormatsError::Io)?;
+        let mut c = ByteCursor::new(&header_buf, true);
 
         // ---- Part 1: header (Java LOFReader.checkForLofLayout) ----
         if c.read_i32("LOF header magic")? as u32 != LOF_MAGIC_BYTE {
@@ -11993,28 +12012,52 @@ impl FormatReader for LofReader {
         let data_offset = c.pos() as u64;
         let pixel_memory_present = memory_size > 0;
 
-        // ---- Part 2: memory block (raw pixel data) ----
-        c.skip(memory_size as usize);
-        if c.pos() >= c.len() {
+        // ---- Part 2: memory block (raw pixel data) - skip over it in the
+        // file directly instead of in a materialized buffer. ----
+        let xml_section_start = data_offset.saturating_add(memory_size as u64);
+        if xml_section_start >= file_len {
             return Err(BioFormatsError::Format(
                 "Not a valid Leica LOF file (xml section not found)".into(),
             ));
         }
 
         // ---- Part 3: XML ----
-        if c.read_i32("LOF xml magic")? as u32 != LOF_MAGIC_BYTE {
+        // Read the fixed-size xml chunk header (magic + chunk length +
+        // memory byte + xml length = 13 bytes) first to learn `xml_length`,
+        // then read exactly that many UTF-16 bytes - both tiny compared to
+        // the pixel memory block just skipped.
+        const XML_CHUNK_HEADER_LEN: u64 = 13;
+        if xml_section_start.saturating_add(XML_CHUNK_HEADER_LEN) > file_len {
             return Err(BioFormatsError::Format(
                 "Not a valid Leica LOF file (error at xml section)".into(),
             ));
         }
-        c.read_i32("LOF xml chunk length")?;
-        if c.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+        file.seek(SeekFrom::Start(xml_section_start))
+            .map_err(BioFormatsError::Io)?;
+        let mut xml_header_buf = vec![0u8; XML_CHUNK_HEADER_LEN as usize];
+        file.read_exact(&mut xml_header_buf)
+            .map_err(BioFormatsError::Io)?;
+        let mut xc = ByteCursor::new(&xml_header_buf, true);
+        if xc.read_i32("LOF xml magic")? as u32 != LOF_MAGIC_BYTE {
             return Err(BioFormatsError::Format(
                 "Not a valid Leica LOF file (error at xml section)".into(),
             ));
         }
-        let xml_length = c.read_i32("LOF xml length")?;
-        let lof_xml = c.read_utf16(xml_length, "LOF xml content")?;
+        xc.read_i32("LOF xml chunk length")?;
+        if xc.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at xml section)".into(),
+            ));
+        }
+        let xml_length = xc.read_i32("LOF xml length")?;
+        let xml_bytes_len = i64::from(xml_length).checked_mul(2).ok_or_else(|| {
+            BioFormatsError::Format("Leica LOF xml length overflows".into())
+        })?;
+        let mut xml_content_buf = vec![0u8; xml_bytes_len.max(0) as usize];
+        file.read_exact(&mut xml_content_buf)
+            .map_err(BioFormatsError::Io)?;
+        let mut xcc = ByteCursor::new(&xml_content_buf, true);
+        let lof_xml = xcc.read_utf16(xml_length, "LOF xml content")?;
 
         // Translate the Leica <ImageDescription> into core metadata.
         let info = lof_translate_metadata(&lof_xml)?;

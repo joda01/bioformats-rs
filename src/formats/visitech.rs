@@ -326,12 +326,20 @@ fn find_pixels_offset(
     plane_size: u64,
     plane_count: u64,
 ) -> Result<u64> {
-    let mut bytes = Vec::new();
     let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-    f.read_to_end(&mut bytes).map_err(BioFormatsError::Io)?;
+    let len = f.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)?;
+    f.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+
+    // The header marker sits in a short ASCII preamble before the (potentially
+    // huge) raw pixel payload; bound the search instead of reading the whole
+    // file just to locate it.
+    const HEADER_SEARCH_LEN: u64 = 65536;
+    let search_len = HEADER_SEARCH_LEN.min(len) as usize;
+    let mut prefix = vec![0u8; search_len];
+    f.read_exact(&mut prefix).map_err(BioFormatsError::Io)?;
 
     // Locate the header marker.
-    let marker_end = bytes
+    let marker_end = prefix
         .windows(HEADER_MARKER.len())
         .position(|w| w == HEADER_MARKER)
         .map(|p| (p + HEADER_MARKER.len()) as u64)
@@ -339,7 +347,6 @@ fn find_pixels_offset(
             BioFormatsError::Format("Visitech: header marker not found in .xys".into())
         })?;
 
-    let len = bytes.len() as u64;
     if plane_count == 0 {
         return Ok(marker_end);
     }
@@ -357,10 +364,18 @@ fn find_pixels_offset(
     }
     let skip = (len.saturating_sub(marker_end).saturating_sub(payload_bytes)) / plane_count;
     let mut fp = marker_end + skip - HEADER_MARKER.len() as u64;
+    let _ = little_endian;
     // PIXELS_MARKER last byte is 0x3f; nudge forward if present.
-    if let Some(&b) = bytes.get(fp as usize) {
-        let _ = little_endian;
-        if b == 0x3f {
+    if fp < len {
+        let byte = if (fp as usize) < prefix.len() {
+            prefix[fp as usize]
+        } else {
+            f.seek(SeekFrom::Start(fp)).map_err(BioFormatsError::Io)?;
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+            b[0]
+        };
+        if byte == 0x3f {
             fp += 1;
         }
     }
@@ -402,8 +417,12 @@ impl FormatReader for VisitechReader {
             }
             None => {
                 // No report; fall back to scanning the entry for textual dims.
-                let raw = std::fs::read(path).map_err(BioFormatsError::Io)?;
-                let text = String::from_utf8_lossy(&raw[..raw.len().min(4096)]).to_string();
+                // Only the first few KB can hold header text, so bound the read
+                // instead of pulling in the (potentially huge) pixel payload.
+                let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+                let mut buf = vec![0u8; 4096];
+                let n = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
                 parse_html(&text)?
             }
         };

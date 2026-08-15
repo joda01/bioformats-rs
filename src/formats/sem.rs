@@ -57,16 +57,25 @@ impl FormatReader for InrReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = file.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)?;
 
         // Header is first 256 bytes interpreted as ASCII text
-        if data.len() < 256 || !data.starts_with(b"#INRIMAGE-4#{") {
+        if file_len < 256 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "INR file is missing the 256-byte INRIMAGE-4 header".into(),
             ));
         }
-        let header_bytes = &data[..256];
-        let header_text = String::from_utf8_lossy(header_bytes);
+        file.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+        let mut header_bytes = [0u8; 256];
+        file.read_exact(&mut header_bytes)
+            .map_err(BioFormatsError::Io)?;
+        if !header_bytes.starts_with(b"#INRIMAGE-4#{") {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "INR file is missing the 256-byte INRIMAGE-4 header".into(),
+            ));
+        }
+        let header_text = String::from_utf8_lossy(&header_bytes);
 
         let mut size_x: Option<u32> = None;
         let mut size_y: Option<u32> = None;
@@ -184,7 +193,7 @@ impl FormatReader for InrReader {
                     .ok_or_else(|| BioFormatsError::Format("INR image size overflows".into()))?,
             )
             .ok_or_else(|| BioFormatsError::Format("INR image size overflows".into()))?;
-        if (data.len() as u64) < expected {
+        if file_len < expected {
             return Err(BioFormatsError::UnsupportedFormat(
                 "INR pixel payload is shorter than declared dimensions".into(),
             ));

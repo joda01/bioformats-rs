@@ -2119,10 +2119,23 @@ impl FormatReader for GatanDm2Reader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         // Port of GatanDM2Reader.initFile (big-endian, ISO-8859-1 strings).
-        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        if bytes.len() < 24 {
+        // Layout: [24-byte header][pixel plane: plane_size bytes][35-byte
+        // gap][trailing tag/metadata block to EOF]. `open_bytes` already
+        // seeks the file directly per plane rather than using a cached
+        // buffer, so reading the whole file here just to skip over the pixel
+        // plane (potentially tens of MB for one EM frame) was pure I/O
+        // overhead - read the small header, then only the trailing metadata
+        // region, skipping the plane bytes in the file rather than in memory.
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(BioFormatsError::Io)?;
+        if file_len < DM2_HEADER_SIZE {
             return Err(BioFormatsError::Format("DM2 file is too short".into()));
         }
+        file.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+        let mut bytes = vec![0u8; DM2_HEADER_SIZE as usize];
+        file.read_exact(&mut bytes).map_err(BioFormatsError::Io)?;
 
         let magic = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if magic != DM2_MAGIC_BYTES {
@@ -2157,14 +2170,22 @@ impl FormatReader for GatanDm2Reader {
         let required_len = (DM2_HEADER_SIZE as usize)
             .checked_add(plane_size)
             .ok_or_else(|| BioFormatsError::Format("DM2 file size overflows".into()))?;
-        if bytes.len() < required_len {
+        if (file_len as usize) < required_len {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "DM2 pixel payload is shorter than declared ({} < {required_len})",
-                bytes.len()
+                "DM2 pixel payload is shorter than declared ({file_len} < {required_len})",
             )));
         }
         let scan_start = DM2_HEADER_SIZE as usize + plane_size + 35;
-        let (name, date, time) = parse_dm2_metadata(&bytes, scan_start, &mut meta_map);
+        let tail = if scan_start < file_len as usize {
+            file.seek(SeekFrom::Start(scan_start as u64))
+                .map_err(BioFormatsError::Io)?;
+            let mut tail = vec![0u8; file_len as usize - scan_start];
+            file.read_exact(&mut tail).map_err(BioFormatsError::Io)?;
+            tail
+        } else {
+            Vec::new()
+        };
+        let (name, date, time) = parse_dm2_metadata(&tail, 0, &mut meta_map);
         if let Some(n) = name {
             meta_map.insert("Name".into(), MetadataValue::String(n));
         }

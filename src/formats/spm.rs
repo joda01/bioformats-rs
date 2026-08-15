@@ -4249,8 +4249,11 @@ impl PqBinReader {
     }
 
     /// Mirrors Java `initFile(String)`: parses the header and builds metadata.
-    fn init_file(&mut self, path: &Path) -> Result<()> {
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    ///
+    /// Takes the already-read header prefix and total file length rather than
+    /// re-reading the file, since the pixel cube that follows the 20-byte
+    /// header can be arbitrarily large and is never needed here.
+    fn init_file(&mut self, path: &Path, data: &[u8], file_len: u64) -> Result<()> {
         if data.len() < Self::HEADER_SIZE {
             return Err(BioFormatsError::UnsupportedFormat(
                 "PicoQuant Bin file is shorter than the 20-byte header".into(),
@@ -4278,7 +4281,7 @@ impl PqBinReader {
         let expected = (Self::HEADER_SIZE as u64)
             .checked_add(size_x as u64 * size_y as u64 * size_t as u64 * 4)
             .ok_or_else(|| BioFormatsError::Format("PicoQuant Bin size overflows".into()))?;
-        if (data.len() as u64) < expected {
+        if file_len < expected {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "PicoQuant Bin pixel payload is shorter than declared cube {size_x}x{size_y}x{size_t}"
             )));
@@ -4404,14 +4407,18 @@ impl FormatReader for PqBinReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        if !Self::is_this_type(&data, data.len() as u64) {
+        let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = file.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+        let mut header = vec![0u8; (Self::HEADER_SIZE as u64).min(file_len) as usize];
+        file.read_exact(&mut header).map_err(BioFormatsError::Io)?;
+        if !Self::is_this_type(&header, file_len) {
             return Err(BioFormatsError::UnsupportedFormat(
                 "PicoQuant Bin header does not match sizeX*sizeY*sizeT*4 + 20 == file length"
                     .into(),
             ));
         }
-        self.init_file(path)
+        self.init_file(path, &header, file_len)
     }
 
     fn close(&mut self) -> Result<()> {

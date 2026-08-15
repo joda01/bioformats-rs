@@ -1004,14 +1004,23 @@ fn tillvision_strict_raw_pixel_type(code: u16) -> Result<PixelType> {
 }
 
 fn load_tillvision_embedded_strict_raw(path: &Path) -> Result<Option<TillVisionSeries>> {
-    let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    if data.len() < TILLVISION_VWS_STRICT_RAW_MAGIC.len() {
+    let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+    let file_len = file.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)?;
+    if file_len < TILLVISION_VWS_STRICT_RAW_MAGIC.len() as u64 {
         return Ok(None);
     }
+    // Read only the fixed 40-byte header up front; the pixel payload that
+    // follows is referenced lazily via `TillVisionPixelSource::File` below
+    // rather than loaded here, so pulling the whole file into memory just to
+    // check this header would waste however large the payload is.
+    file.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+    let header_len = (TILLVISION_VWS_STRICT_RAW_HEADER_LEN as u64).min(file_len) as usize;
+    let mut data = vec![0u8; header_len];
+    file.read_exact(&mut data).map_err(BioFormatsError::Io)?;
     if &data[..TILLVISION_VWS_STRICT_RAW_MAGIC.len()] != TILLVISION_VWS_STRICT_RAW_MAGIC {
         return Ok(None);
     }
-    if data.len() < TILLVISION_VWS_STRICT_RAW_HEADER_LEN {
+    if (data.len() as u64) < TILLVISION_VWS_STRICT_RAW_HEADER_LEN as u64 {
         return Err(BioFormatsError::Format(
             "TillVision embedded VWS strict raw subset header is truncated".into(),
         ));
@@ -1063,10 +1072,9 @@ fn load_tillvision_embedded_strict_raw(path: &Path) -> Result<Option<TillVisionS
                 "TillVision embedded VWS strict raw subset file size overflows".into(),
             )
         })?;
-    if data.len() != expected_len {
+    if file_len != expected_len as u64 {
         return Err(BioFormatsError::Format(format!(
-            "TillVision embedded VWS strict raw subset payload length mismatch: got {} bytes, expected {expected_len}",
-            data.len()
+            "TillVision embedded VWS strict raw subset payload length mismatch: got {file_len} bytes, expected {expected_len}",
         )));
     }
 

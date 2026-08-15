@@ -515,8 +515,52 @@ impl FormatReader for LifReader {
                 h,
             );
         }
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        decode_lif_region(&data, block, info, tile as u64, plane_index, x, y, w, h)
+        // A compressed series' pixel data is a zlib/deflate/gzip stream that
+        // must be decompressed sequentially from its own start, so unlike the
+        // uncompressed case above we can't seek straight to the requested
+        // rows - but we only ever need THIS series' memory block, not the
+        // rest of the file. `.lif` containers commonly hold many series
+        // concatenated together (this fixture: 7 series in one 111MB file),
+        // so re-reading the entire file on every region request scales with
+        // total file size instead of with this one block's size. Read just
+        // `[block.file_offset, block.file_offset + block.byte_len)` and
+        // rebase the block onto that buffer's own start; `decode_lif_region`
+        // and its callees only ever index within that byte range.
+        let block_end = block
+            .file_offset
+            .checked_add(block.byte_len)
+            .ok_or_else(|| BioFormatsError::Format("Leica LIF block end overflows".into()))?;
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(BioFormatsError::Io)?;
+        if block_end > file_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Leica LIF compressed memory block {} exceeds file length (end {block_end}, file {file_len})",
+                block.id
+            )));
+        }
+        file.seek(SeekFrom::Start(block.file_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut block_bytes = vec![0u8; block.byte_len as usize];
+        file.read_exact(&mut block_bytes)
+            .map_err(BioFormatsError::Io)?;
+        let rebased_block = MemoryBlock {
+            file_offset: 0,
+            byte_len: block.byte_len,
+            id: block.id.clone(),
+        };
+        decode_lif_region(
+            &block_bytes,
+            &rebased_block,
+            info,
+            tile as u64,
+            plane_index,
+            x,
+            y,
+            w,
+            h,
+        )
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

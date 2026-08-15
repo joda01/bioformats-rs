@@ -14059,29 +14059,62 @@ impl CellSensReader {
     /// Parse one ETS file's volume header and tile index. Mirrors `parseETSFile`.
     /// ETS is always little-endian.
     fn parse_ets(path: &Path) -> Result<EtsVolume> {
-        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let rd = |off: usize, n: usize| -> Result<&[u8]> {
+        // Read only the small header + chunk-table regions directly off disk
+        // instead of slurping the whole file into memory: a `.ets` file IS
+        // the pixel tile data, and can be many GB, while everything parsed
+        // here is a handful of small, `n_used_chunks`-scaled reads (real
+        // observed case: 1.4 GB file, ~150 bytes of header + a chunk table a
+        // few hundred KB at most - reading the whole file made `set_id`
+        // dominated by I/O it never uses).
+        let mut file = BufReader::new(File::open(path).map_err(BioFormatsError::Io)?);
+        let file_len = file
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(BioFormatsError::Io)?;
+        let read_region = |file: &mut BufReader<File>, off: usize, n: usize| -> Result<Vec<u8>> {
             let end = off.checked_add(n).ok_or_else(|| {
                 BioFormatsError::Format(format!("ETS file {:?}: header offset overflows", path))
             })?;
-            bytes.get(off..end).ok_or_else(|| {
-                BioFormatsError::Format(format!(
+            if end as u64 > file_len {
+                return Err(BioFormatsError::Format(format!(
                     "ETS file {:?}: truncated header/table at offset {off}",
                     path
-                ))
-            })
+                )));
+            }
+            file.seek(std::io::SeekFrom::Start(off as u64))
+                .map_err(BioFormatsError::Io)?;
+            let mut buf = vec![0u8; n];
+            file.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+            Ok(buf)
         };
-        let u32_at = |off: usize| -> Result<u32> {
-            rd(off, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        let u32_at = |buf: &[u8], off: usize| -> Result<u32> {
+            buf.get(off..off + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "ETS file {:?}: truncated header/table at offset {off}",
+                        path
+                    ))
+                })
         };
-        let i32_at = |off: usize| -> Result<i32> { Ok(u32_at(off)? as i32) };
-        let u64_at = |off: usize| -> Result<u64> {
-            rd(off, 8).map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        let i32_at = |buf: &[u8], off: usize| -> Result<i32> { Ok(u32_at(buf, off)? as i32) };
+        let u64_at = |buf: &[u8], off: usize| -> Result<u64> {
+            buf.get(off..off + 8)
+                .map(|b| {
+                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                })
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "ETS file {:?}: truncated header/table at offset {off}",
+                        path
+                    ))
+                })
         };
 
-        // Volume header (offset 0): "SIS\0" magic, then ints/longs. The 4-byte
-        // tag is NUL-padded ("SIS\0"); strip trailing NULs as well as whitespace.
-        let magic = String::from_utf8_lossy(rd(0, 4)?)
+        // Primary header (bytes 0..44): "SIS\0" magic, then ints/longs. The
+        // 4-byte tag is NUL-padded; strip trailing NULs as well as whitespace.
+        const HEADER_LEN: usize = 44;
+        let header = read_region(&mut file, 0, HEADER_LEN)?;
+        let magic = String::from_utf8_lossy(&header[0..4])
             .trim_matches(|c: char| c.is_whitespace() || c == '\0')
             .to_string();
         if magic != "SIS" {
@@ -14092,23 +14125,23 @@ impl CellSensReader {
         }
         // headerSize(4) version(8) nDimensions(12) addHeaderOffset(16, long)
         // addHeaderSize(24) reserved(28) usedChunkOffset(32, long) nUsedChunks(40)
-        let n_dimensions = u32_at(12)?;
+        let n_dimensions = u32_at(&header, 12)?;
         if !(2..=16).contains(&n_dimensions) {
             return Err(BioFormatsError::Format(format!(
                 "ETS file {:?}: unsupported dimension count {n_dimensions}",
                 path
             )));
         }
-        let additional_header_offset = usize::try_from(u64_at(16)?).map_err(|_| {
+        let additional_header_offset = usize::try_from(u64_at(&header, 16)?).map_err(|_| {
             BioFormatsError::Format(format!(
                 "ETS file {:?}: additional header offset overflows",
                 path
             ))
         })?;
-        let used_chunk_offset = usize::try_from(u64_at(32)?).map_err(|_| {
+        let used_chunk_offset = usize::try_from(u64_at(&header, 32)?).map_err(|_| {
             BioFormatsError::Format(format!("ETS file {:?}: used chunk offset overflows", path))
         })?;
-        let n_used_chunks = u32_at(40)? as usize;
+        let n_used_chunks = u32_at(&header, 40)? as usize;
         if n_used_chunks == 0 {
             return Err(BioFormatsError::Format(format!(
                 "ETS file {:?}: chunk table must contain at least one tile",
@@ -14116,8 +14149,13 @@ impl CellSensReader {
             )));
         }
 
-        // Additional header (additionalHeaderOffset): "ETS\0" magic (NUL-padded).
-        let more_magic = String::from_utf8_lossy(rd(additional_header_offset, 4)?)
+        // Additional header (additionalHeaderOffset): "ETS\0" magic
+        // (NUL-padded), then pixelType/sizeC/.../usePyramid - all within the
+        // first 156 bytes (color_start(108) + componentOrder(4) +
+        // usePyramid(4) = 116..156, the last field read below).
+        const ADDITIONAL_HEADER_LEN: usize = 156;
+        let additional = read_region(&mut file, additional_header_offset, ADDITIONAL_HEADER_LEN)?;
+        let more_magic = String::from_utf8_lossy(&additional[0..4])
             .trim_matches(|c: char| c.is_whitespace() || c == '\0')
             .to_string();
         if more_magic != "ETS" {
@@ -14129,13 +14167,14 @@ impl CellSensReader {
         // skip 4 (extra version), then pixelType(int), sizeC(int), colorspace(int),
         // compression(int), quality(int), tileX(int), tileY(int), tileZ(int),
         // skip 4*17 (pixel info hints), color[sizeC*bpp], skip(40-color),
-        // componentOrder(int), usePyramid(int).
-        let base = additional_header_offset + 8;
-        let pixel_type_code = i32_at(base)?;
-        let size_c = u32_at(base + 4)?;
-        let compression = i32_at(base + 12)?;
-        let tile_x = u32_at(base + 20)?;
-        let tile_y = u32_at(base + 24)?;
+        // componentOrder(int), usePyramid(int). Offsets below are relative to
+        // `additional` (already shifted by `additional_header_offset`).
+        let base = 8;
+        let pixel_type_code = i32_at(&additional, base)?;
+        let size_c = u32_at(&additional, base + 4)?;
+        let compression = i32_at(&additional, base + 12)?;
+        let tile_x = u32_at(&additional, base + 20)?;
+        let tile_y = u32_at(&additional, base + 24)?;
         if size_c == 0 || tile_x == 0 || tile_y == 0 {
             return Err(BioFormatsError::Format(format!(
                 "ETS file {:?}: sizeC and tile dimensions must be non-zero",
@@ -14147,9 +14186,18 @@ impl CellSensReader {
         // color region begins at base + 32 + 68 = base + 100, always 40 bytes.
         let color_start = base + 32 + 4 * 17;
         let color_len = (size_c as usize).saturating_mul(bpp).min(40);
-        let background = rd(color_start, color_len)?.to_vec();
-        let component_order = i32_at(color_start + 40)?;
-        let use_pyramid = i32_at(color_start + 44)? != 0;
+        let background = additional
+            .get(color_start..color_start + color_len)
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "ETS file {:?}: truncated header/table at offset {}",
+                    path,
+                    additional_header_offset + color_start
+                ))
+            })?
+            .to_vec();
+        let component_order = i32_at(&additional, color_start + 40)?;
+        let use_pyramid = i32_at(&additional, color_start + 44)? != 0;
         let bgr = component_order == 1 && compression == ETS_RAW;
 
         // Used-chunk table at usedChunkOffset. Each entry:
@@ -14166,19 +14214,19 @@ impl CellSensReader {
         let table_len = entry_len.checked_mul(n_used_chunks).ok_or_else(|| {
             BioFormatsError::Format(format!("ETS file {:?}: chunk table length overflows", path))
         })?;
-        rd(used_chunk_offset, table_len)?;
+        let table = read_region(&mut file, used_chunk_offset, table_len)?;
         let mut tiles = Vec::with_capacity(n_used_chunks);
-        let mut off = used_chunk_offset;
+        let mut off = 0usize;
         for _ in 0..n_used_chunks {
             off += 4;
             let mut coord = Vec::with_capacity(n_dimensions as usize);
             for _ in 0..n_dimensions {
-                coord.push(i32_at(off)?);
+                coord.push(i32_at(&table, off)?);
                 off += 4;
             }
-            let tile_offset = u64_at(off)?;
+            let tile_offset = u64_at(&table, off)?;
             off += 8;
-            let n_bytes = u32_at(off)?;
+            let n_bytes = u32_at(&table, off)?;
             off += 4;
             off += 4; // reserved
             tiles.push((coord, tile_offset, n_bytes));

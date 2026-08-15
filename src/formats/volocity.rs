@@ -1,5 +1,6 @@
 //! Volocity (.mvd2) and Nikon NIS (.nif) format readers.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -24,6 +25,10 @@ const VOLOCITY_METAKIT_MAX_STRUCTURE: usize = 64 * 1024;
 const VOLOCITY_METAKIT_MAX_PREVIEW_BYTES: usize = 96;
 const VOLOCITY_MAX_COMPANION_SCAN_ENTRIES: usize = 4096;
 const VOLOCITY_MAX_COMPANION_SCAN_DEPTH: usize = 6;
+/// Bytes needed to cover every fixed-offset header field read by
+/// `volocity_init_core_aisf`/`volocity_init_core_native` (max offset used is
+/// 74, in the native `.dat` clipping-data branch), with margin.
+const VOLOCITY_HEADER_PREFIX_LEN: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
 struct VolocityBlindLayout {
@@ -1590,10 +1595,62 @@ impl VolocityPixels {
         }
     }
 
-    fn read_all(&self) -> Result<Vec<u8>> {
+    /// Total pixel-source length without reading its contents.
+    fn len(&self) -> Result<i64> {
         match self {
-            VolocityPixels::File(path) => std::fs::read(path).map_err(BioFormatsError::Io),
-            VolocityPixels::Embedded(bytes) => Ok(bytes.clone()),
+            VolocityPixels::File(path) => std::fs::metadata(path)
+                .map(|m| m.len() as i64)
+                .map_err(BioFormatsError::Io),
+            VolocityPixels::Embedded(bytes) => Ok(bytes.len() as i64),
+        }
+    }
+
+    /// Read only the first `max_len` bytes (used for header parsing, where the
+    /// pixel payload that follows can be arbitrarily large).
+    fn read_prefix(&self, max_len: usize) -> Result<Vec<u8>> {
+        match self {
+            VolocityPixels::File(path) => {
+                let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+                let file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
+                let mut buf = vec![0u8; (max_len as u64).min(file_len) as usize];
+                file.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+                Ok(buf)
+            }
+            VolocityPixels::Embedded(bytes) => Ok(bytes[..max_len.min(bytes.len())].to_vec()),
+        }
+    }
+
+    /// Read exactly `len` bytes starting at `start`.
+    fn read_exact_range(&self, start: usize, len: usize) -> Result<Vec<u8>> {
+        match self {
+            VolocityPixels::File(path) => {
+                let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+                file.seek(SeekFrom::Start(start as u64))
+                    .map_err(BioFormatsError::Io)?;
+                let mut buf = vec![0u8; len];
+                file.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+                Ok(buf)
+            }
+            VolocityPixels::Embedded(bytes) => Ok(bytes[start..start + len].to_vec()),
+        }
+    }
+
+    /// Read from `start` through end-of-source (used by the LZO clipping
+    /// path, which must decode forward until a full plane is produced and
+    /// cannot know the required length up front).
+    fn read_from(&self, start: usize) -> Result<Vec<u8>> {
+        match self {
+            VolocityPixels::File(path) => {
+                let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+                file.seek(SeekFrom::Start(start as u64))
+                    .map_err(BioFormatsError::Io)?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
+                Ok(buf)
+            }
+            VolocityPixels::Embedded(bytes) => {
+                Ok(bytes.get(start..).map(|s| s.to_vec()).unwrap_or_default())
+            }
         }
     }
 
@@ -1919,8 +1976,12 @@ fn volocity_init_core_metadata(stack: &mut VolocityStack) -> Result<()> {
         .ok_or(BioFormatsError::NotInitialized)?;
     let is_aisf = base.is_aisf();
     let embedded = matches!(base, VolocityPixels::Embedded(_));
-    let bytes = base.read_all()?;
-    let file_len = bytes.len() as i64;
+    // Only the fixed-offset header fields (up to byte 74 in the native
+    // branch) are read here; the file length is still needed in full since
+    // both branches infer pixel type/channel count from it, but the pixel
+    // payload itself (often the bulk of the file) never needs to be loaded.
+    let file_len = base.len()?;
+    let bytes = base.read_prefix(VOLOCITY_HEADER_PREFIX_LEN)?;
 
     if is_aisf {
         volocity_init_core_aisf(stack, &bytes, file_len)?;
@@ -2164,8 +2225,7 @@ fn volocity_open_plane(stack: &VolocityStack, no: u32) -> Result<Vec<u8>> {
         // Java fills with the fill color (0 by default).
         return Ok(buf);
     }
-    let data = pixels.read_all()?;
-    let pix_len = data.len() as i64;
+    let pix_len = pixels.len()?;
 
     let mut padding = (zct[2] as usize) * stack.plane_padding;
     let planes_in_file = if plane_size > 0 {
@@ -2192,14 +2252,20 @@ fn volocity_open_plane(stack: &VolocityStack, no: u32) -> Result<Vec<u8>> {
     }
 
     if stack.clipping_data {
-        volocity_read_clipping_plane(stack, &data, offset, &mut buf)?;
+        // The LZO block boundaries aren't known ahead of decoding, so this
+        // reads forward from the plane's start to end-of-file rather than a
+        // fixed-size region; it still skips everything before that point.
+        let pos_start = (offset - 3).max(0) as usize;
+        let tail = pixels.read_from(pos_start)?;
+        volocity_read_clipping_plane(stack, &tail, &mut buf)?;
     } else {
         let start = offset as usize;
         let end = start.saturating_add(plane_size);
-        if end > data.len() {
+        if end as i64 > pix_len {
             return Ok(buf);
         }
-        buf.copy_from_slice(&data[start..end]);
+        let region = pixels.read_exact_range(start, plane_size)?;
+        buf.copy_from_slice(&region);
     }
 
     // RGBA swap (Java lines 207-216): stored ARGB → RGBA.
@@ -2232,20 +2298,18 @@ fn volocity_open_plane(stack: &VolocityStack, no: u32) -> Result<Vec<u8>> {
 /// been produced (or the input is exhausted). Java also breaks on the first
 /// failing block by catching the IOException without advancing; we mirror that
 /// by stopping the loop as soon as a block fails to decode.
-fn volocity_read_clipping_plane(
-    stack: &VolocityStack,
-    data: &[u8],
-    offset: i64,
-    buf: &mut [u8],
-) -> Result<()> {
+///
+/// `tail` is already seeked to `offset - 3` (clamped to 0) by the caller, so
+/// this walks it from position 0 rather than re-deriving that offset.
+fn volocity_read_clipping_plane(stack: &VolocityStack, tail: &[u8], buf: &mut [u8]) -> Result<()> {
     let plane_size = volocity_plane_size(stack);
-    let mut pos = (offset - 3).max(0) as usize;
+    let mut pos = 0usize;
     let mut out: Vec<u8> = Vec::with_capacity(plane_size);
 
     // Java: while (v.length() < planeSize && pix.getFilePointer() < pix.length())
-    while out.len() < plane_size && pos < data.len() {
+    while out.len() < plane_size && pos < tail.len() {
         // Feed the raw LZO1X block starting here (no length prefix).
-        match crate::common::codec::decompress_lzo_with_consumed(&data[pos..]) {
+        match crate::common::codec::decompress_lzo_with_consumed(&tail[pos..]) {
             Ok((decoded, consumed)) => {
                 out.extend_from_slice(&decoded);
                 // Java: pix.skipBytes(4) after each decoded block.
