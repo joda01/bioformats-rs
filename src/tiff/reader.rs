@@ -5347,7 +5347,6 @@ impl crate::common::reader::FormatReader for TiffReader {
 mod tests {
     use super::*;
     use crate::common::reader::FormatReader;
-    #[cfg(feature = "jpeg2000-write")]
     use crate::common::writer::FormatWriter;
     use std::fs;
 
@@ -5397,8 +5396,6 @@ mod tests {
         data.extend_from_slice(&compressed);
         data
     }
-
-    #[cfg(feature = "jpeg2000-write")]
     fn synthetic_jpeg2000_tiff(jp2: &[u8], width: u32, height: u32) -> Vec<u8> {
         let entry_count = 10u16;
         let pixel_offset = 8 + 2 + u32::from(entry_count) * 12 + 4;
@@ -5506,8 +5503,6 @@ mod tests {
 
         let _ = fs::remove_file(path);
     }
-
-    #[cfg(feature = "jpeg2000-write")]
     #[test]
     fn jpeg2000_compressed_tiff_synthesizes_internal_resolutions_like_java() {
         let jp2_path = std::env::temp_dir().join(format!(

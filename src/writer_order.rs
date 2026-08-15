@@ -43,16 +43,7 @@ fn java_writer_for_class(class: &str) -> Option<Box<dyn FormatWriter>> {
         "loci.formats.out.OMETiffWriter" => return None,
         "loci.formats.out.TiffWriter" => Box::new(crate::tiff::TiffWriter::new()),
         "loci.formats.out.JPEGWriter" => Box::new(crate::formats::jpeg::JpegWriter::new()),
-        "loci.formats.out.JPEG2000Writer" => {
-            #[cfg(feature = "jpeg2000-write")]
-            {
-                Box::new(crate::formats::misc::Jpeg2000Writer::new())
-            }
-            #[cfg(not(feature = "jpeg2000-write"))]
-            {
-                return None;
-            }
-        }
+        "loci.formats.out.JPEG2000Writer" => Box::new(crate::formats::misc::Jpeg2000Writer::new()),
         "loci.formats.out.APNGWriter" => Box::new(crate::formats::extended::ApngWriter::new()),
         "loci.formats.out.AVIWriter" => Box::new(crate::formats::avi::AviWriter::new()),
         "loci.formats.out.QTWriter" => Box::new(crate::formats::misc::QtWriter::new()),

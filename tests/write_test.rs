@@ -2409,8 +2409,6 @@ fn jpeg_writer_round_trip_rgb8_with_lossy_tolerance() {
         "JPEG round-trip drift too high: mean={mean_abs_diff:.2}, max={max_abs_diff}"
     );
 }
-
-#[cfg(feature = "jpeg2000-write")]
 #[test]
 fn jpeg2000_writer_round_trip_gray8_lossless() {
     let mut meta = ImageMetadata::default();
@@ -2431,8 +2429,6 @@ fn jpeg2000_writer_round_trip_gray8_lossless() {
     assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
     assert_eq!(reader.open_bytes(0).unwrap(), data);
 }
-
-#[cfg(feature = "jpeg2000-write")]
 #[test]
 fn jpeg2000_writer_round_trip_rgb8_lossless() {
     let mut meta = ImageMetadata::default();

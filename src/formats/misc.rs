@@ -6723,7 +6723,7 @@ impl FormatReader for OpenlabReader {
 /// - `FF 4F FF 51` — JPEG 2000 codestream (J2C)
 /// - `00 00 00 0C 6A 50 20 20` — JP2 container
 ///
-/// Decodes pixel data using the `jpeg2k` crate (pure-Rust OpenJPEG port).
+/// Decodes pixel data using the pure-Rust OpenJPEG translation.
 pub struct Jpeg2000Reader {
     path: Option<PathBuf>,
     file_data: Option<Vec<u8>>,
@@ -6748,12 +6748,11 @@ impl Jpeg2000Reader {
             .file_data
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let image = jpeg2k::Image::from_bytes_with(
+        crate::common::codec::decompress_jpeg2000_with_endianness_and_reduce(
             file_data,
-            jpeg2k::DecodeParameters::new().reduce(reduce as u32),
+            false,
+            reduce as u32,
         )
-        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
-        jpeg2000_image_to_interleaved_be(&image)
     }
 }
 
@@ -6790,19 +6789,23 @@ impl FormatReader for Jpeg2000Reader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let file_data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let image = jpeg2k::Image::from_bytes_with(&file_data, jpeg2k::DecodeParameters::new())
-            .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
+        let image = openjp2::Decoder::new(
+            openjp2::Format::detect(&file_data).unwrap_or(openjp2::Format::J2k),
+        )
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?
+        .decode(file_data.clone())
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?;
 
-        let components = image.components();
+        let components = &image.components;
         if components.is_empty() {
             return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
         }
 
-        let width = components[0].width() as u32;
-        let height = components[0].height() as u32;
+        let width = components[0].width;
+        let height = components[0].height;
         let n_components = components.len() as u32;
-        let prec = components[0].precision() as u8;
-        let signed = components[0].is_signed();
+        let prec = components[0].precision;
+        let signed = components[0].signed;
         let (pixel_type, bpp) = jpeg2000_pixel_type(prec, signed);
         let is_rgb = n_components >= 3;
         let pixels = jpeg2000_image_to_interleaved_be(&image)?;
@@ -6953,24 +6956,24 @@ impl FormatReader for Jpeg2000Reader {
     }
 }
 
-fn jpeg2000_image_to_interleaved_be(image: &jpeg2k::Image) -> Result<Vec<u8>> {
-    let components = image.components();
+fn jpeg2000_image_to_interleaved_be(image: &openjp2::Image) -> Result<Vec<u8>> {
+    let components = &image.components;
     if components.is_empty() {
         return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
     }
-    let width = components[0].width() as usize;
-    let height = components[0].height() as usize;
+    let width = components[0].width as usize;
+    let height = components[0].height as usize;
     let n_components = components.len();
-    let prec = components[0].precision() as u8;
-    let signed = components[0].is_signed();
+    let prec = components[0].precision;
+    let signed = components[0].signed;
     let (_pixel_type, bpp) = jpeg2000_pixel_type(prec, signed);
     let bps = (bpp / 8) as usize;
     let mut pixels = Vec::with_capacity(width * height * n_components * bps);
     for y in 0..height {
         for x in 0..width {
             for (c, component) in components.iter().enumerate() {
-                let cw = component.width() as usize;
-                let ch = component.height() as usize;
+                let cw = component.width as usize;
+                let ch = component.height as usize;
                 if cw == 0 || ch == 0 {
                     return Err(BioFormatsError::Codec(format!(
                         "JPEG 2000: component {c} has zero geometry"
@@ -6978,7 +6981,7 @@ fn jpeg2000_image_to_interleaved_be(image: &jpeg2k::Image) -> Result<Vec<u8>> {
                 }
                 let cx = x * cw / width;
                 let cy = y * ch / height;
-                let data = component.data();
+                let data = &component.data;
                 let idx = cy * cw + cx;
                 if idx >= data.len() {
                     return Err(BioFormatsError::Codec(format!(
@@ -7096,7 +7099,6 @@ fn append_jpeg2000_sample(out: &mut Vec<u8>, value: i32, bytes_per_sample: usize
 #[cfg(test)]
 mod jpeg2000_tests {
     use super::*;
-    #[cfg(feature = "jpeg2000-write")]
     use crate::common::writer::FormatWriter;
 
     #[test]
@@ -7157,8 +7159,6 @@ mod jpeg2000_tests {
         assert_eq!(jpeg2000_codestream_offset(&jp2), Some(offset));
         assert_eq!(jpeg2000_resolution_levels(&jp2), Some(3));
     }
-
-    #[cfg(feature = "jpeg2000-write")]
     #[test]
     fn jpeg2000_reader_exposes_codestream_resolutions_like_java_non_flattened() {
         let path = std::env::temp_dir().join(format!(
@@ -7239,16 +7239,13 @@ mod jpeg2000_tests {
 ///
 /// Encodes a single 2D plane (1 grayscale or 3 RGB components) to a lossless
 /// JP2 file using the pure-Rust `openjp2` encoder, mirroring the lossless
-/// output of Java `JPEG2000Writer`. Gated behind the default-on
-/// `jpeg2000-write` feature.
-#[cfg(feature = "jpeg2000-write")]
+/// output of Java `JPEG2000Writer`.
 pub struct Jpeg2000Writer {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     wrote: bool,
 }
 
-#[cfg(feature = "jpeg2000-write")]
 impl Jpeg2000Writer {
     pub fn new() -> Self {
         Jpeg2000Writer {
@@ -7259,14 +7256,12 @@ impl Jpeg2000Writer {
     }
 }
 
-#[cfg(feature = "jpeg2000-write")]
 impl Default for Jpeg2000Writer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "jpeg2000-write")]
 impl crate::common::writer::FormatWriter for Jpeg2000Writer {
     fn is_this_type(&self, path: &Path) -> bool {
         let ext = path

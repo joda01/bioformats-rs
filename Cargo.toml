@@ -44,8 +44,7 @@ encoding_rs  = "0.8"
 cfb          = "0.14"
 byteorder    = "1"
 image        = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "tga", "webp", "pnm", "hdr", "exr", "dds", "ff"] }
-jpeg2k       = { version = "0.10", default-features = false, features = ["openjp2"] }
-openjp2      = { version = "0.6", optional = true }
+openjp2      = { package = "openjpeg2-pure-rs", git = "https://github.com/henriksson-lab/openjpeg2-pure-rs", rev = "94aeb9080a039d8b276d624877b955e6a97affb3" }
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr = { package = "jpegxr-pure-rs", version = "0.1", optional = true }
@@ -57,10 +56,9 @@ serde_json    = { version = "1", features = ["preserve_order"] }
 rusqlite      = { version = "0.37", features = ["bundled"], optional = true }
 
 [features]
-default = ["jpeg2000-write", "jpegxr", "zarr", "tissuefaxs"]
+default = ["jpegxr", "zarr", "tissuefaxs"]
 jpegxr = ["dep:jpegxr"]
 openslide = ["dep:openslide-pure-rs"]
-jpeg2000-write = ["dep:openjp2"]
 zarr = ["dep:zarrs"]
 # TissueFAXS (.aqproj/.tfcyto) reads SQLite project databases.
 tissuefaxs = ["dep:rusqlite"]

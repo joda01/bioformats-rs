@@ -2107,20 +2107,23 @@ impl JpxReader {
     }
 
     fn decode_plane_from_slice(slice: &[u8]) -> Result<(Vec<u8>, ImageMetadata)> {
-        let image = jpeg2k::Image::from_bytes(slice)
-            .map_err(|e| BioFormatsError::Codec(format!("JPX JPEG 2000: {e}")))?;
-        let components = image.components();
+        let image =
+            openjp2::Decoder::new(openjp2::Format::detect(slice).unwrap_or(openjp2::Format::J2k))
+                .map_err(|e| BioFormatsError::Codec(format!("JPX JPEG 2000: {e:?}")))?
+                .decode(slice.to_vec())
+                .map_err(|e| BioFormatsError::Codec(format!("JPX JPEG 2000: {e:?}")))?;
+        let components = &image.components;
         if components.is_empty() {
             return Err(BioFormatsError::Codec(
                 "JPX JPEG 2000: no components".to_string(),
             ));
         }
 
-        let width = components[0].width() as u32;
-        let height = components[0].height() as u32;
+        let width = components[0].width;
+        let height = components[0].height;
         let n_components = components.len() as u32;
-        let precision = components[0].precision() as u8;
-        let signed = components[0].is_signed();
+        let precision = components[0].precision;
+        let signed = components[0].signed;
         let (pixel_type, bits_per_pixel) = jpx_pixel_type(precision, signed);
         let bytes_per_sample = (bits_per_pixel / 8) as usize;
         let w = width as usize;
@@ -2130,7 +2133,7 @@ impl JpxReader {
         for y in 0..h {
             for x in 0..w {
                 for component in components.iter().take(nc) {
-                    let value = component.data()[y * w + x];
+                    let value = component.data[y * w + x];
                     append_jpx_sample(&mut pixels, value, bytes_per_sample, signed);
                 }
             }

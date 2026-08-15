@@ -14363,7 +14363,9 @@ impl EtsVolume {
         let mut buf = match self.compression {
             ETS_RAW => raw,
             ETS_JPEG => crate::common::codec::decompress_jpeg(&raw)?,
-            ETS_JPEG_2000 => crate::common::codec::decompress_jpeg2000(&raw)?,
+            ETS_JPEG_2000 => {
+                crate::common::codec::decompress_jpeg2000_with_endianness(&raw, false)?
+            }
             ETS_JPEG_LOSSLESS => crate::common::codec::decompress_jpeg(&raw)?,
             // PNG/BMP tiles store a full image payload; decode in memory via the
             // codec helpers (CellSensReader.java:1198-1210, APNGReader/BMPReader).
@@ -16151,13 +16153,10 @@ impl CellSensReader {
                         resolution,
                     });
                     let series_idx = self.series_map.len() - 1;
-                    if vi == 0 && resolution == 0 {
-                        let name = vol
-                            .meta
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("{filename} #{}", series_idx + 1));
-                        self.series_names.push(name);
+                    if resolution == 0 {
+                        self.series_names.push(cellsens_java_image_name(
+                            &self.ets, vi, series_idx, &filename,
+                        ));
                         self.series_phys
                             .push(match (vol.physical_size_x, vol.physical_size_y) {
                                 (Some(x), Some(y)) => Some((x, y)),
@@ -16284,6 +16283,14 @@ impl CellSensReader {
                     .unwrap_or(vol.size_c)
                     .max(1);
                 let channel_count = if spp > 1 { 1 } else { size_c.max(1) } as usize;
+                if resolution != 0 {
+                    return (0..channel_count)
+                        .map(|_| OmeChannel {
+                            samples_per_pixel: spp,
+                            ..OmeChannel::default()
+                        })
+                        .collect();
+                }
                 let mut channels = Vec::with_capacity(channel_count);
                 for c in 0..channel_count {
                     let detector_gain = match c {
@@ -16390,11 +16397,13 @@ impl CellSensReader {
 
         image.instrument_ref = Some(0);
         image.objective_ref = Some(volume);
-        if let Some(z) = meta.z_increment.filter(|v| v.is_finite() && *v > 0.0) {
-            image.physical_size_z = Some(z);
-        }
-        if let Some(acq) = meta.acquisition_time {
-            image.acquisition_date = Some(cellsens_unix_seconds_to_iso8601(acq));
+        if resolution == 0 {
+            if let Some(z) = meta.z_increment.filter(|v| v.is_finite() && *v > 0.0) {
+                image.physical_size_z = Some(z);
+            }
+            if let Some(acq) = meta.acquisition_time {
+                image.acquisition_date = Some(cellsens_unix_seconds_to_iso8601(acq));
+            }
         }
 
         let samples = vol.rgb_channels().max(1);
@@ -16410,7 +16419,7 @@ impl CellSensReader {
             || meta.z_increment.is_some()
             || !meta.z_values.is_empty()
             || !meta.t_values.is_empty();
-        if !needs_planes || !image.planes.is_empty() {
+        if resolution != 0 || !needs_planes || !image.planes.is_empty() {
             return;
         }
 
@@ -16510,6 +16519,29 @@ fn crop_chunky(
         }
     }
     out
+}
+
+fn cellsens_java_image_name(
+    volumes: &[EtsVolume],
+    volume: usize,
+    public_series: usize,
+    filename: &str,
+) -> String {
+    let Some(name) = volumes.get(volume).and_then(|v| v.meta.name.as_deref()) else {
+        return format!("{filename} #{}", public_series + 1);
+    };
+    if name == "Overview" || name == "Label" {
+        return name.to_ascii_lowercase();
+    }
+    let duplicate = volumes
+        .iter()
+        .enumerate()
+        .any(|(i, v)| i != volume && v.meta.name.as_deref() == Some(name));
+    if duplicate {
+        format!("{name} #{}", public_series)
+    } else {
+        name.to_string()
+    }
 }
 
 impl Default for CellSensReader {
@@ -25246,6 +25278,112 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         assert!(channels
             .iter()
             .all(|channel| channel.samples_per_pixel == 1));
+    }
+
+    #[test]
+    fn cellsens_ome_metadata_applies_pyramid_metadata_once_like_java() {
+        let make_vol = |name: &str, px: f64, py: f64, z_inc: f64, channel: &str| EtsVolume {
+            size_c: 1,
+            compression: ETS_JPEG_2000,
+            tile_x: 1,
+            tile_y: 1,
+            pixel_type_code: ETS_PT_USHORT,
+            levels: vec![
+                EtsLevel {
+                    size_x: 4,
+                    size_y: 4,
+                    size_z: 2,
+                    size_c: 1,
+                    size_t: 1,
+                    rows: 1,
+                    cols: 1,
+                },
+                EtsLevel {
+                    size_x: 2,
+                    size_y: 2,
+                    size_z: 2,
+                    size_c: 1,
+                    size_t: 1,
+                    rows: 1,
+                    cols: 1,
+                },
+            ],
+            meta: VsiPyramidMeta {
+                name: Some(name.to_string()),
+                channel_names: vec![channel.to_string()],
+                channel_wavelengths: vec![488.0],
+                z_increment: Some(z_inc),
+                ..Default::default()
+            },
+            physical_size_x: Some(px),
+            physical_size_y: Some(py),
+            ..Default::default()
+        };
+
+        let mut reader = CellSensReader::new();
+        reader
+            .ets
+            .push(make_vol("Label", 1.0, 2.0, 0.5, "Label Scan"));
+        reader
+            .ets
+            .push(make_vol("Overview", 3.0, 4.0, 0.75, "DAPI"));
+        for volume in 0..2 {
+            for resolution in 0..2 {
+                let public_series = reader.series_map.len();
+                reader
+                    .series_map
+                    .push(CellSensTarget::Ets { volume, resolution });
+                if resolution == 0 {
+                    reader.series_names.push(cellsens_java_image_name(
+                        &reader.ets,
+                        volume,
+                        public_series,
+                        "sample.vsi",
+                    ));
+                    let vol = &reader.ets[volume];
+                    reader.series_phys.push(Some((
+                        vol.physical_size_x.unwrap(),
+                        vol.physical_size_y.unwrap(),
+                    )));
+                } else {
+                    reader
+                        .series_names
+                        .push(format!("sample.vsi #{}", public_series + 1));
+                    reader.series_phys.push(None);
+                }
+            }
+        }
+
+        let ome = reader.ome_metadata().expect("CellSens OME metadata");
+        assert_eq!(ome.images.len(), 4);
+        assert_eq!(ome.images[0].name.as_deref(), Some("label"));
+        assert_eq!(ome.images[0].physical_size_x, Some(1.0));
+        assert_eq!(ome.images[0].physical_size_y, Some(2.0));
+        assert_eq!(ome.images[0].physical_size_z, Some(0.5));
+        assert_eq!(
+            ome.images[0].channels[0].name.as_deref(),
+            Some("Label Scan")
+        );
+        assert_eq!(ome.images[0].channels[0].emission_wavelength, Some(488.0));
+
+        assert_eq!(ome.images[1].name.as_deref(), Some("sample.vsi #2"));
+        assert_eq!(ome.images[1].physical_size_x, None);
+        assert_eq!(ome.images[1].physical_size_y, None);
+        assert_eq!(ome.images[1].physical_size_z, None);
+        assert_eq!(ome.images[1].channels[0].name, None);
+        assert_eq!(ome.images[1].channels[0].emission_wavelength, None);
+
+        assert_eq!(ome.images[2].name.as_deref(), Some("overview"));
+        assert_eq!(ome.images[2].physical_size_x, Some(3.0));
+        assert_eq!(ome.images[2].physical_size_y, Some(4.0));
+        assert_eq!(ome.images[2].physical_size_z, Some(0.75));
+
+        assert_eq!(ome.images[3].name.as_deref(), Some("sample.vsi #4"));
+        assert_eq!(ome.images[3].physical_size_x, None);
+        assert_eq!(ome.images[3].physical_size_y, None);
+        assert_eq!(ome.images[3].physical_size_z, None);
+        assert_eq!(ome.images[3].channels[0].name, None);
+        assert_eq!(ome.images[3].channels[0].emission_wavelength, None);
     }
 
     #[test]
