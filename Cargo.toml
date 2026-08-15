@@ -44,7 +44,7 @@ encoding_rs  = "0.8"
 cfb          = "0.14"
 byteorder    = "1"
 image        = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "tga", "webp", "pnm", "hdr", "exr", "dds", "ff"] }
-openjp2      = { package = "openjpeg2-pure-rs", git = "https://github.com/henriksson-lab/openjpeg2-pure-rs", rev = "94aeb9080a039d8b276d624877b955e6a97affb3" }
+openjp2      = { package = "openjpeg2-pure-rs", version = "0.1.1" }
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr = { package = "jpegxr-pure-rs", version = "0.1", optional = true }

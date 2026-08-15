@@ -6915,12 +6915,28 @@ impl FormatReader for Jpeg2000Reader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
         let meta = self
             .metas
             .get(self.current_resolution)
+            .cloned()
             .ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("JPEG-2000", &full, meta, meta.size_c as usize, x, y, w, h)
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if x == 0 && y == 0 && w == meta.size_x && h == meta.size_y {
+            return self.open_bytes(plane_index);
+        }
+        if self.current_resolution == 0 {
+            if let Some(file_data) = self.file_data.as_ref() {
+                if let Ok(region) = crate::common::codec::decompress_jpeg2000_region_with_endianness(
+                    file_data, false, x, y, w, h,
+                ) {
+                    return Ok(region);
+                }
+            }
+        }
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("JPEG-2000", &full, &meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -7196,6 +7212,40 @@ mod jpeg2000_tests {
         reader.set_resolution(1).unwrap();
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 4));
         assert_eq!(reader.open_bytes(0).unwrap().len(), 16);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn jpeg2000_reader_region_matches_full_plane_crop() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_jpeg2000_region_{}.jp2",
+            std::process::id()
+        ));
+        let meta = ImageMetadata {
+            size_x: 8,
+            size_y: 6,
+            size_c: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        };
+        let plane: Vec<u8> = (0..48).map(|v| v as u8).collect();
+
+        let mut writer = Jpeg2000Writer::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(&path).unwrap();
+        writer.save_bytes(0, &plane).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = Jpeg2000Reader::new();
+        reader.set_id(&path).unwrap();
+        let full = reader.open_bytes(0).unwrap();
+        let region = reader.open_bytes_region(0, 2, 1, 3, 2).unwrap();
+        let expected = vec![full[10], full[11], full[12], full[18], full[19], full[20]];
+        assert_eq!(region, expected);
 
         let _ = std::fs::remove_file(path);
     }

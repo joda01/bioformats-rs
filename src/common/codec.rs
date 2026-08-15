@@ -261,8 +261,50 @@ pub fn decompress_jpeg2000_with_endianness_and_reduce(
     let format = openjp2::Format::detect(data).unwrap_or(openjp2::Format::J2k);
     let image = openjp2::Decoder::new(format)
         .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?
-        .decode(data.to_vec())
+        .decode_slice(data)
         .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?;
+    pack_jpeg2000_image(&image, little_endian, reduce)
+}
+
+/// Decompress a rectangular JPEG 2000 region. The rectangle is expressed in
+/// full-resolution codestream coordinates; callers are responsible for mapping
+/// format-level tile/plane coordinates into that space.
+pub fn decompress_jpeg2000_region_with_endianness(
+    data: &[u8],
+    little_endian: bool,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::Codec(
+            "JPEG 2000 region: zero-sized region".into(),
+        ));
+    }
+    let format = openjp2::Format::detect(data).unwrap_or(openjp2::Format::J2k);
+    if let Ok(image) = openjp2::Decoder::new(format)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 region: {e:?}")))?
+        .decode_region_slice(data, x, y, width, height)
+    {
+        if image.width == width && image.height == height {
+            return pack_jpeg2000_image(&image, little_endian, 0);
+        }
+    }
+
+    let full = openjp2::Decoder::new(format)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 region fallback: {e:?}")))?
+        .decode_slice(data)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 region fallback: {e:?}")))?;
+    let packed = pack_jpeg2000_image(&full, little_endian, 0)?;
+    crop_packed_jpeg2000_region(&packed, &full, x, y, width, height)
+}
+
+fn pack_jpeg2000_image(
+    image: &openjp2::Image,
+    little_endian: bool,
+    reduce: u32,
+) -> Result<Vec<u8>> {
     let components = &image.components;
     if components.is_empty() {
         return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
@@ -343,6 +385,61 @@ pub fn decompress_jpeg2000_with_endianness_and_reduce(
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+fn crop_packed_jpeg2000_region(
+    packed: &[u8],
+    image: &openjp2::Image,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let components = &image.components;
+    if components.is_empty() {
+        return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
+    }
+    let image_width = components[0].width;
+    let image_height = components[0].height;
+    let x2 = x
+        .checked_add(width)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: width overflows".into()))?;
+    let y2 = y
+        .checked_add(height)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: height overflows".into()))?;
+    if x2 > image_width || y2 > image_height {
+        return Err(BioFormatsError::Codec(
+            "JPEG 2000 region: outside image bounds".into(),
+        ));
+    }
+    let precision = components[0].precision as usize;
+    let bytes_per_sample = if precision <= 8 {
+        1
+    } else if precision <= 16 {
+        2
+    } else {
+        4
+    };
+    let bytes_per_pixel = components
+        .len()
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: pixel size overflows".into()))?;
+    let row_bytes = image_width as usize * bytes_per_pixel;
+    let crop_row_bytes = width as usize * bytes_per_pixel;
+    let expected_full = row_bytes
+        .checked_mul(image_height as usize)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: image size overflows".into()))?;
+    if packed.len() < expected_full {
+        return Err(BioFormatsError::Codec(
+            "JPEG 2000 region: decoded full image is shorter than expected".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity(crop_row_bytes * height as usize);
+    for row in y as usize..y2 as usize {
+        let start = row * row_bytes + x as usize * bytes_per_pixel;
+        out.extend_from_slice(&packed[start..start + crop_row_bytes]);
     }
     Ok(out)
 }
@@ -3353,6 +3450,75 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(decoded, pixels, "lossless RGB JP2 must round-trip");
     }
+
+    fn crop_interleaved(
+        pixels: &[u8],
+        width: u32,
+        channels: usize,
+        bytes_per_sample: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let bytes_per_pixel = channels * bytes_per_sample;
+        let row_bytes = width as usize * bytes_per_pixel;
+        let crop_row_bytes = w as usize * bytes_per_pixel;
+        let mut out = Vec::with_capacity(crop_row_bytes * h as usize);
+        for row in y as usize..(y + h) as usize {
+            let start = row * row_bytes + x as usize * bytes_per_pixel;
+            out.extend_from_slice(&pixels[start..start + crop_row_bytes]);
+        }
+        out
+    }
+
+    #[test]
+    fn jpeg2000_region_decode_matches_full_decode_crop_gray8() {
+        let width = 16u32;
+        let height = 12u32;
+        let pixels: Vec<u8> = (0..(width * height)).map(|i| (i % 251) as u8).collect();
+        let path =
+            std::env::temp_dir().join(format!("bf_jp2_region_gray_{}.jp2", std::process::id()));
+        compress_jpeg2000(&pixels, width, height, 1, 8, false, &path).expect("encode gray JP2");
+        let bytes = std::fs::read(&path).expect("read JP2 back");
+        let full = decompress_jpeg2000(&bytes).expect("decode full JP2");
+        let region =
+            decompress_jpeg2000_region_with_endianness(&bytes, true, 3, 2, 7, 5).expect("region");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            region,
+            crop_interleaved(&full, width, 1, 1, 3, 2, 7, 5),
+            "region decode must match full decode plus crop"
+        );
+    }
+
+    #[test]
+    fn jpeg2000_region_decode_matches_full_decode_crop_rgb8() {
+        let width = 10u32;
+        let height = 8u32;
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for i in 0..(width * height) {
+            pixels.push((i % 256) as u8);
+            pixels.push(((i * 3) % 256) as u8);
+            pixels.push(((i * 7) % 256) as u8);
+        }
+        let path =
+            std::env::temp_dir().join(format!("bf_jp2_region_rgb_{}.jp2", std::process::id()));
+        compress_jpeg2000(&pixels, width, height, 3, 8, false, &path).expect("encode RGB JP2");
+        let bytes = std::fs::read(&path).expect("read JP2 back");
+        let full = decompress_jpeg2000(&bytes).expect("decode full JP2");
+        let region =
+            decompress_jpeg2000_region_with_endianness(&bytes, true, 1, 1, 6, 4).expect("region");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            region,
+            crop_interleaved(&full, width, 3, 1, 1, 1, 6, 4),
+            "RGB region decode must match full decode plus crop"
+        );
+    }
+
     #[test]
     fn jpeg2000_roundtrip_gray16_is_lossless() {
         let w = 8u32;

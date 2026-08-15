@@ -665,6 +665,31 @@ around the whole harness process, so Java RSS includes JVM overhead.
 
 Original benchmark baseline: Java Bio-Formats/Open Microscopy tooling via `bioformats_package.jar` and public Open Microscopy images; this README/scripts do not currently state an exact jar version.
 
+#### JPEG 2000 ETS Real-Data Check
+
+Focused CellSens/VSI benchmark for the JPEG 2000 ETS tile path added on
+2026-08-15:
+
+```bash
+bench/compare_subset.sh --warmup 1 --measure 3 --planes 1 --region 256x256 \
+  --timeout 600 --manifest bench/manifests/jpeg2000-ets-realdata.paths \
+  --out bench/target/jpeg2000-ets-realdata.csv \
+  --markdown bench/target/jpeg2000-ets-realdata.md
+```
+
+The manifest currently covers confirmed real VSI files backed by ETS JPEG 2000
+tiles: the large Joda issue fixture under `/big/henriksson/ome_images/from_joda`
+and the smaller repository VSI fixture. Add standalone JP2/J2K or
+JPEG-2000-compressed TIFF rows here when comparable real fixtures are available.
+
+| Format | Path | Java status | Rust status | Java ms | Rust ms | Rust speedup | Java RSS KiB | Rust RSS KiB | RSS ratio | Bytes J/R | Planes J/R |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| vsi | `/big/henriksson/ome_images/from_joda/haut/Image_045_M5_MEV_Sk3_Zstack_40x_decon.vsi` | ok | ok | 870.139 | 314.992 | 2.762 | 954992 | 18016 | 53.008 | 3099648/3099648 | 21/21 |
+| vsi | `testdata/vsi/HN 485 HNSCC APOBEC3A-1.1000.vsi` | ok | ok | 124.509 | 47.949 | 2.597 | 264944 | 14236 | 18.611 | 1648128/1648128 | 9/9 |
+
+`Rust speedup` and `RSS ratio` are Java divided by Rust. Values below `1.0x`
+mean Rust was slower or used more RSS for that row.
+
 #### Open Microscopy Corpus Screening
 
 Latest sampled real-data speed/RSS screening command:
