@@ -77,6 +77,20 @@ pub trait FormatReader: Send + Sync {
         0
     }
 
+    /// Whether sub-resolution pyramid levels are exposed as independent public
+    /// series. Defaults to Java Bio-Formats' `flattenedResolutions == true`.
+    fn has_flattened_resolutions(&self) -> bool {
+        true
+    }
+
+    /// Set whether pyramid resolutions should be flattened into public series.
+    ///
+    /// Must be called before [`FormatReader::set_id`] for readers that build
+    /// their public series map during initialization.
+    fn set_flattened_resolutions(&mut self, _flattened: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether the current series is a low-resolution thumbnail/preview rather
     /// than full-resolution image data. Mirrors Java
     /// `IFormatReader.isThumbnailSeries()`. The default reads
@@ -107,21 +121,6 @@ pub trait FormatReader: Send + Sync {
         // Default: ignore.
     }
 
-    /// Choose how pyramid resolution levels are exposed. Must be called
-    /// before `set_id`. Mirrors Java `IFormatReader.setFlattenedResolutions`:
-    ///
-    /// - `true` (the library-wide Java default): every (series, resolution)
-    ///   pair becomes its own top-level series, each with
-    ///   `resolution_count() == 1`.
-    /// - `false`: each logical image stays one series, with its pyramid
-    ///   levels reachable via `resolution_count()`/`set_resolution()`.
-    ///
-    /// The default implementation is a no-op: readers without a pyramid, or
-    /// that always produce one of the two shapes by construction, ignore it.
-    /// Readers that support both call this out explicitly.
-    fn set_flattened_resolutions(&mut self, _flattened: bool) {
-        // Default: ignore.
-    }
     /// Return structured OME metadata.
     ///
     /// The default implementation returns baseline OME metadata derived from

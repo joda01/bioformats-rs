@@ -77,7 +77,7 @@ fn load_image(path: &Path, behavior: RasterBehavior) -> Result<(ImageMetadata, V
         size_c: spp,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: bpp,
+        bits_per_pixel: (bpp).into(),
         image_count: 1,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
@@ -838,14 +838,8 @@ impl TargaReader {
 ///
 /// Each packet begins with a count byte `n` read as a signed value:
 ///   * `n >= 0`           — raw packet: the next `(n + 1)` pixels are literal.
-///   * `n < 0`            — run packet: one pixel repeated `(n & 0x7f) + 1` times.
-///
-/// Deviation from Java: the upstream `TargaRLECodec` treats `n == -128` (`0x80`)
-/// as a no-op (it falls through both branches). Per the Targa specification a
-/// `0x80` count byte is a valid one-pixel run packet, and spec-compliant
-/// encoders (e.g. the `image` crate's TGA writer) emit it. We therefore handle
-/// it as a run packet so such files decode correctly; for any encoder that
-/// never emits `0x80` the output is identical to Java's.
+///   * `-127 <= n <= -1`  — run packet: one pixel repeated `(n & 0x7f) + 1`.
+///   * `n == -128`        — no-op, matching Java `TargaRLECodec`.
 fn targa_rle_decompress(data: &[u8], max_bytes: usize, bits_per_sample: i32) -> Vec<u8> {
     let mut output: Vec<u8> = Vec::with_capacity(max_bytes);
     let bpp = (bits_per_sample / 8) as usize;
@@ -867,8 +861,8 @@ fn targa_rle_decompress(data: &[u8], max_bytes: usize, bits_per_sample: i32) -> 
                 output.push(data[pos]);
                 pos += 1;
             }
-        } else {
-            // -128 <= n <= -1: run packet of (n & 0x7f) + 1 repeats of one pixel.
+        } else if n != i8::MIN {
+            // -127 <= n <= -1: run packet of (n & 0x7f) + 1 repeats of one pixel.
             let len = ((n as i32) & 0x7f) as usize + 1;
             if pos + bpp > data.len() {
                 break;
@@ -969,7 +963,7 @@ fn targa_init_file(data: &[u8]) -> Result<(TargaState, ImageMetadata, String)> {
         size_c,
         size_t: 1,
         pixel_type: PixelType::Uint8,
-        bits_per_pixel,
+        bits_per_pixel: bits_per_pixel.into(),
         image_count: 1,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
@@ -1379,7 +1373,7 @@ fn load_pnm(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         size_c,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: (bytes_per_sample as u8) * 8,
+        bits_per_pixel: ((bytes_per_sample) as u16) * 8,
         image_count: 1,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb: size_c == 3,
@@ -1589,25 +1583,37 @@ impl FormatWriter for TgaWriter {
         let pixels = crate::common::writer::to_interleaved_samples(meta, data)?;
         let (w, h) = (meta.size_x, meta.size_y);
         let spp = meta.size_c as usize;
-        let img: image::DynamicImage = match spp {
-            1 => image::GrayImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageLuma8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            3 => image::RgbImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageRgb8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            4 => image::RgbaImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageRgba8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
+        let mut out = Vec::with_capacity(18 + pixels.len());
+        out.push(0); // ID length
+        out.push(0); // no color map
+        out.push(if spp == 1 { 3 } else { 2 }); // uncompressed gray/true-color
+        out.extend_from_slice(&[0, 0, 0, 0, 0]); // color map spec
+        out.extend_from_slice(&[0, 0, 0, 0]); // x/y origin
+        out.extend_from_slice(&(w as u16).to_le_bytes());
+        out.extend_from_slice(&(h as u16).to_le_bytes());
+        out.push((spp * 8) as u8);
+        out.push(0x20); // top-left origin
+
+        match spp {
+            1 => out.extend_from_slice(&pixels),
+            3 => {
+                for px in pixels.chunks_exact(3) {
+                    out.extend_from_slice(&[px[2], px[1], px[0]]);
+                }
+            }
+            4 => {
+                for px in pixels.chunks_exact(4) {
+                    out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                }
+            }
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "TGA: spp={}",
                     spp
                 )))
             }
-        };
-        img.save(path)
-            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        }
+        std::fs::write(path, out).map_err(BioFormatsError::Io)?;
         self.wrote = true;
         Ok(())
     }
@@ -1903,5 +1909,13 @@ mod targa_tests {
         let data = [0x01u8, 0x10, 0x20, 0x82, 0x30];
         let out = targa_rle_decompress(&data, 5, 8);
         assert_eq!(out, vec![0x10, 0x20, 0x30, 0x30, 0x30]);
+    }
+
+    #[test]
+    fn rle_decompress_0x80_packet_is_java_noop() {
+        // Java TargaRLECodec treats signed -128 (0x80) as neither raw nor run.
+        let data = [0x80u8, 0x00, 0x7f];
+        let out = targa_rle_decompress(&data, 1, 8);
+        assert_eq!(out, vec![0x7f]);
     }
 }

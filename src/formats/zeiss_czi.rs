@@ -2187,7 +2187,7 @@ impl FormatReader for ZeissCziReader {
             size_c: parsed.c_count,
             size_t: parsed.t_count,
             pixel_type: parsed.pixel_type,
-            bits_per_pixel: bps,
+            bits_per_pixel: (bps).into(),
             image_count,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb,
@@ -2219,8 +2219,18 @@ impl FormatReader for ZeissCziReader {
         Ok(())
     }
 
-    fn set_flattened_resolutions(&mut self, flattened: bool) {
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.series.is_empty() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
         self.flattened_resolutions = flattened;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -2589,8 +2599,76 @@ impl FormatReader for ZeissCziReader {
                 }
             }
         }
+        if let Some(meta) = self.meta.as_ref() {
+            let _ = ome.populate_pixels(meta, 0);
+            if let Some(image) = ome.images.first_mut() {
+                if image.planes.is_empty() {
+                    image.planes = czi_default_ome_planes(meta);
+                }
+                if !ome.instruments.is_empty() {
+                    image.instrument_ref = Some(0);
+                }
+            }
+        }
         Some(ome)
     }
+}
+
+fn czi_default_ome_planes(meta: &ImageMetadata) -> Vec<crate::common::ome_metadata::OmePlane> {
+    let size_z = meta.size_z.max(1) as usize;
+    let size_c = meta.size_c.max(1) as usize;
+    let size_t = meta.size_t.max(1) as usize;
+    let mut planes = Vec::with_capacity(meta.image_count as usize);
+    for plane in 0..meta.image_count as usize {
+        let (the_z, the_c, the_t) =
+            czi_zct_coords(meta.dimension_order, size_z, size_c, size_t, plane);
+        planes.push(crate::common::ome_metadata::OmePlane {
+            the_z,
+            the_c,
+            the_t,
+            ..Default::default()
+        });
+    }
+    planes
+}
+
+fn czi_zct_coords(
+    order: DimensionOrder,
+    size_z: usize,
+    size_c: usize,
+    size_t: usize,
+    plane: usize,
+) -> (u32, u32, u32) {
+    let axes: &[char] = match order {
+        DimensionOrder::XYZCT => &['Z', 'C', 'T'],
+        DimensionOrder::XYZTC => &['Z', 'T', 'C'],
+        DimensionOrder::XYCZT => &['C', 'Z', 'T'],
+        DimensionOrder::XYCTZ => &['C', 'T', 'Z'],
+        DimensionOrder::XYTCZ => &['T', 'C', 'Z'],
+        DimensionOrder::XYTZC => &['T', 'Z', 'C'],
+    };
+    let mut rem = plane;
+    let mut z = 0usize;
+    let mut c = 0usize;
+    let mut t = 0usize;
+    for axis in axes.iter().rev() {
+        match axis {
+            'Z' => {
+                z = rem % size_z;
+                rem /= size_z;
+            }
+            'C' => {
+                c = rem % size_c;
+                rem /= size_c;
+            }
+            'T' => {
+                t = rem % size_t;
+                rem /= size_t;
+            }
+            _ => {}
+        }
+    }
+    (z as u32, c as u32, t as u32)
 }
 
 fn swap_bgr_to_rgb(buf: &mut [u8], bytes_per_sample: usize, samples_per_pixel: usize) {
@@ -3201,6 +3279,34 @@ mod tests {
     }
 
     #[test]
+    fn czi_ome_metadata_pads_sparse_xml_channels_like_java() {
+        let entries = vec![
+            (directory_entry(0, 0, 0, 2, 1), vec![1, 2]),
+            (directory_entry(0, 0, 1, 2, 1), vec![3, 4]),
+            (directory_entry(0, 0, 2, 2, 1), vec![5, 6]),
+        ];
+        let xml = r#"<Metadata>
+          <Information><Image><Dimensions><Channels>
+            <Channel Name="DAPI"><EmissionWavelength>461</EmissionWavelength></Channel>
+          </Channels></Dimensions></Image></Information>
+        </Metadata>"#;
+        let path = write_synthetic_czi_with_xml("sparse_channels", entries, xml);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.metadata().size_c, 3);
+        let ome = reader.ome_metadata().unwrap();
+        let channels = &ome.images[0].channels;
+        assert_eq!(channels.len(), 3);
+        assert_eq!(channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(channels[0].emission_wavelength, Some(461.0));
+        assert_eq!(channels[1].samples_per_pixel, 1);
+        assert_eq!(channels[2].samples_per_pixel, 1);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn czi_rgb_ome_metadata_skips_channel_color_like_java() {
         let entries = vec![(directory_entry(3, 0, 0, 1, 1), vec![1, 2, 3])];
         let xml = r#"<Metadata>
@@ -3348,7 +3454,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("pyramid_levels", entries);
         let mut reader = ZeissCziReader::new();
-        reader.set_flattened_resolutions(false);
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3395,7 +3501,7 @@ mod tests {
         // levels reachable via resolution_count()/set_resolution().
         let path = write_synthetic_czi_entries("flatten_toggle_grouped", entries);
         let mut grouped = ZeissCziReader::new();
-        grouped.set_flattened_resolutions(false);
+        grouped.set_flattened_resolutions(false).unwrap();
         grouped.set_id(&path).unwrap();
         assert_eq!(grouped.series_count(), 1);
         assert_eq!(grouped.resolution_count(), 2);
@@ -3419,7 +3525,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("stored_xy_pyramid", entries);
         let mut reader = ZeissCziReader::new();
-        reader.set_flattened_resolutions(false);
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3555,7 +3661,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("rgb_pyramid_sparse_white", entries);
         let mut reader = ZeissCziReader::new();
-        reader.set_flattened_resolutions(false);
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3834,7 +3940,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("r_size_one_pyramid", entries);
         let mut reader = ZeissCziReader::new();
-        reader.set_flattened_resolutions(false);
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();

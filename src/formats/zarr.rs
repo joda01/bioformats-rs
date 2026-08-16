@@ -164,7 +164,7 @@ impl OmeZarrReader {
             size_c: level.size_c,
             size_t: level.size_t,
             pixel_type: level.pixel_type,
-            bits_per_pixel: bps * 8,
+            bits_per_pixel: (bps * 8).into(),
             image_count: level.size_z * level.size_c * level.size_t,
             dimension_order: level.dimension_order,
             is_rgb: false,
@@ -916,8 +916,18 @@ impl FormatReader for OmeZarrReader {
         Ok(())
     }
 
-    fn set_flattened_resolutions(&mut self, flattened: bool) {
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.series.is_empty() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
         self.flattened_resolutions = flattened;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {

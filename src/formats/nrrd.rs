@@ -734,6 +734,9 @@ impl NrrdReader {
 #[cfg(test)]
 mod sidecar_path_tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
 
     fn tmp_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -799,6 +802,29 @@ mod sidecar_path_tests {
         std::fs::remove_file(&path).ok();
         assert!(
             matches!(err, BioFormatsError::Format(message) if message.contains("Unsupported data type"))
+        );
+    }
+
+    #[test]
+    fn gzip_region_nonzero_y_rejects_like_java() {
+        let path = tmp_path("gzip_region_nonzero_y");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&[1, 2, 3, 4, 5, 6]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut bytes =
+            b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 3 2\nencoding: gzip\n\n".to_vec();
+        bytes.extend_from_slice(&compressed);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = NrrdReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 2, 1).unwrap(), vec![2, 3]);
+        let err = reader.open_bytes_region(0, 0, 1, 2, 1).expect_err(
+            "Java NRRD gzip path cannot place non-zero-Y region rows in a region-sized buffer",
+        );
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("non-zero Y"))
         );
     }
 }
@@ -904,7 +930,7 @@ impl FormatReader for NrrdReader {
             size_c: axes.size_c,
             size_t: axes.size_t,
             pixel_type: hdr.pixel_type,
-            bits_per_pixel: bps,
+            bits_per_pixel: (bps).into(),
             image_count,
             // NRRDReader.java fixes dimensionOrder = "XYCZT" (initFile line 277).
             dimension_order: DimensionOrder::XYCZT,
@@ -973,6 +999,16 @@ impl FormatReader for NrrdReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        if self
+            .header
+            .as_ref()
+            .is_some_and(|hdr| matches!(hdr.encoding, Encoding::Gzip))
+            && y > 0
+        {
+            return Err(BioFormatsError::InvalidData(
+                "NRRD gzip region reads with non-zero Y match Java by rejecting the request".into(),
+            ));
+        }
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("NRRD", &full, meta, meta.size_c as usize, x, y, w, h)

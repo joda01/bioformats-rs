@@ -2,7 +2,7 @@ use bioformats::common::metadata::MetadataValue;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::formats::flim2::XlefReader;
 use bioformats::formats::leica_lms::{image_metadata_from_xlif, XlifDocument};
-use bioformats::{FormatReader, OmeAnnotation, OmeShape};
+use bioformats::{FormatReader, ImageReader, OmeShape};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -140,11 +140,9 @@ fn xlef_lms_metadata_only_series_projects_safe_scalars_to_ome() {
     assert_float(&meta.series_metadata, "xlef.lms.physical_size_x", 2.0);
     assert_float(&meta.series_metadata, "xlef.lms.physical_size_y", 2.0);
     assert_float(&meta.series_metadata, "xlef.lms.physical_size_z", 3.0);
-    assert_float(
-        &meta.series_metadata,
-        "xlef.lms.channel.0.excitation_wavelength",
-        405.0,
-    );
+    assert!(!meta
+        .series_metadata
+        .contains_key("xlef.lms.channel.0.excitation_wavelength"));
     assert_float(
         &meta.series_metadata,
         "xlef.lms.channel.1.emission_wavelength",
@@ -227,11 +225,11 @@ fn xlef_lms_metadata_only_series_projects_safe_scalars_to_ome() {
     assert_eq!(image.physical_size_z, Some(3.0));
     assert_eq!(image.channels.len(), 2);
     assert_eq!(image.channels[0].name.as_deref(), Some("DAPI"));
-    assert_eq!(image.channels[0].excitation_wavelength, Some(405.0));
+    assert_eq!(image.channels[0].excitation_wavelength, None);
     assert_eq!(image.channels[0].emission_wavelength, Some(460.0));
     assert_eq!(image.channels[0].color, Some(862362111));
     assert_eq!(image.channels[1].name.as_deref(), Some("FITC"));
-    assert_eq!(image.channels[1].excitation_wavelength, Some(488.0));
+    assert_eq!(image.channels[1].excitation_wavelength, None);
     assert_eq!(image.channels[1].emission_wavelength, Some(525.0));
     assert_eq!(image.channels[1].color, Some(16909311));
     assert_eq!(image.instrument_ref, Some(0));
@@ -303,49 +301,7 @@ fn xlef_lms_metadata_only_series_projects_safe_scalars_to_ome() {
             ..
         }) if (*x, *y, *width, *height) == (1.5, 2.5, 10.0, 11.0)
     ));
-    let annotation = ome
-        .annotations
-        .iter()
-        .find_map(|annotation| match annotation {
-            OmeAnnotation::MapAnnotation {
-                id,
-                namespace,
-                values,
-            } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
-                && namespace.as_deref() == Some("openmicroscopy.org/OriginalMetadata") =>
-            {
-                Some(values)
-            }
-            _ => None,
-        })
-        .expect("LMS original metadata annotation");
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.description" && value == "Bounded LMS metadata"));
-    assert!(annotation.iter().any(|(key, value)| {
-        key == "xlef.lms.channel.0.excitation_wavelength" && value == "405"
-    }));
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.channel.0.ome_color" && value == "862362111"));
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.path" && value.ends_with(".lms")));
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.objective.0.name" && value == "HC PL APO 63x"));
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.detector.0.type" && value == "HyD"));
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.filter.0.cut_out" && value == "550"));
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.roi.0.width" && value == "10"));
-    assert!(annotation
-        .iter()
-        .any(|(key, value)| key == "xlef.lms.graph.roi_count" && value == "1"));
+    assert!(ome.annotations.is_empty());
 
     let err = reader.open_bytes(0).unwrap_err();
     assert!(
@@ -840,7 +796,67 @@ fn xlef_xlif_multiple_frame_files_are_one_java_style_series() {
 }
 
 #[test]
-fn xlef_mixed_project_rejects_unsupported_attribute_leaf_before_partial_open() {
+fn xlef_ome_metadata_contains_one_image_per_java_project_series() {
+    let xlef = temp_path("project_wide_ome.xlef");
+    let xlif_a = xlef.with_file_name("series_a.xlif");
+    let xlif_b = xlef.with_file_name("series_b.xlif");
+    let bmp_a = xlef.with_file_name("series_a.bmp");
+    let bmp_b = xlef.with_file_name("series_b.bmp");
+    write_one_pixel_bmp(&bmp_a, 11, 12, 13);
+    write_one_pixel_bmp(&bmp_b, 21, 22, 23);
+
+    std::fs::write(
+        &xlif_a,
+        r#"<XLIF><Element Name="Series A"><Data><Image Name="Image A">
+<ImageDescription>
+<Channels><ChannelDescription Resolution="8"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="3"/>
+<DimensionDescription DimID="2" NumberOfElements="1" BytesInc="3"/>
+</Dimensions>
+<Frame File="series_a.bmp"/>
+</ImageDescription>
+</Image></Data></Element></XLIF>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &xlif_b,
+        r#"<XLIF><Element Name="Series B"><Data><Image Name="Image B">
+<ImageDescription>
+<Channels><ChannelDescription Resolution="8"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="3"/>
+<DimensionDescription DimID="2" NumberOfElements="1" BytesInc="3"/>
+</Dimensions>
+<Frame File="series_b.bmp"/>
+</ImageDescription>
+</Image></Data></Element></XLIF>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &xlef,
+        r#"<XLEF><Reference File="series_a.xlif"/><Reference File="series_b.xlif"/></XLEF>"#,
+    )
+    .unwrap();
+
+    let mut reader = XlefReader::new();
+    reader.set_id(&xlef).unwrap();
+    assert_eq!(reader.series_count(), 2);
+
+    let ome = reader.ome_metadata().expect("project-wide XLEF OME");
+    assert_eq!(ome.images.len(), 2);
+    assert_eq!(ome.images[0].name.as_deref(), Some("Series A"));
+    assert_eq!(ome.images[1].name.as_deref(), Some("Series B"));
+
+    let _ = std::fs::remove_file(xlef);
+    let _ = std::fs::remove_file(xlif_a);
+    let _ = std::fs::remove_file(xlif_b);
+    let _ = std::fs::remove_file(bmp_a);
+    let _ = std::fs::remove_file(bmp_b);
+}
+
+#[test]
+fn xlef_mixed_project_opens_supported_attribute_leaf_with_unsupported_sibling_like_java() {
     let xlef = temp_path("unsupported_mixed.xlef");
     let bmp = xlef.with_extension("bmp");
     write_one_pixel_bmp(&bmp, 1, 2, 3);
@@ -853,14 +869,48 @@ fn xlef_mixed_project_rejects_unsupported_attribute_leaf_before_partial_open() {
     )
     .unwrap();
 
-    let err = XlefReader::new().set_id(&xlef).unwrap_err();
-    assert!(
-        matches!(err, bioformats::BioFormatsError::UnsupportedFormat(ref message)
-            if message.contains("mixes supported leaves with unsupported files")
-                && message.contains("unsupported.dat")),
-        "unexpected error: {err}"
-    );
+    let mut reader = XlefReader::new();
+    reader.set_id(&xlef).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3]);
 
     let _ = std::fs::remove_file(xlef);
     let _ = std::fs::remove_file(bmp);
+}
+
+#[test]
+fn public_ome_leica_xlef_fixture_opens_when_downloaded() {
+    let Some(root) = std::env::var_os("BIOFORMATS_RS_EXTERNAL_FIXTURES").map(PathBuf::from) else {
+        eprintln!("set BIOFORMATS_RS_EXTERNAL_FIXTURES to run public Leica-XLEF fixture smoke");
+        return;
+    };
+    let path = root.join(
+        "leica-xlef/downloads.openmicroscopy.org/2020_06_23_sample%203%20U2OS/XLEF-LOF%202020_06_23_sample%203%20U2OS/XLEF-LOF%202020_06_23_sample%203%20U2OS.xlef",
+    );
+    if !path.exists() {
+        eprintln!(
+            "skipping missing public Leica-XLEF fixture {}",
+            path.display()
+        );
+        return;
+    }
+
+    let mut reader = ImageReader::open(&path)
+        .unwrap_or_else(|err| panic!("failed to open {}: {err}", path.display()));
+    let meta = reader.metadata().clone();
+    assert!(meta.size_x > 0, "zero width for {}", path.display());
+    assert!(meta.size_y > 0, "zero height for {}", path.display());
+    assert!(
+        meta.image_count > 0,
+        "zero plane count for {}",
+        path.display()
+    );
+    assert!(
+        !reader
+            .open_bytes(0)
+            .expect("read first XLEF plane")
+            .is_empty(),
+        "empty first plane for {}",
+        path.display()
+    );
 }

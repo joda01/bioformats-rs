@@ -816,8 +816,10 @@ impl FormatReader for AviReader {
             image_count: n_frames,
             dimension_order: DimensionOrder::XYTCZ,
             is_rgb: out_is_rgb,
-            // 16-bit is stored non-interleaved per Java (ms0.interleaved = bpp != 16).
-            is_interleaved: out_is_rgb && pixel_type != PixelType::Uint16,
+            // Java AVIReader sets ms0.interleaved = bmpBitsPerPixel != 16
+            // before deriving RGB/channel count, so indexed/grayscale AVI can
+            // still report interleaved=true.
+            is_interleaved: bit_count != 16,
             is_indexed,
             is_little_endian: true,
             resolution_count: 1,

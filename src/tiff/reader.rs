@@ -14,8 +14,8 @@ use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader as _;
 
-use super::compression::{decompress, merge_jpeg_tables, JpegColor};
-use super::ifd::{tag, Compression, Ifd, Photometric};
+use super::compression::{decompress_with_jpeg2000_reduce, merge_jpeg_tables, JpegColor};
+use super::ifd::{tag, Compression, Ifd, IfdValue, Photometric};
 use super::jpeg_restart;
 use super::nikon::NikonCompressionOptions;
 use super::parser::TiffParser;
@@ -58,6 +58,7 @@ struct IfdInfo {
     ycbcr_coefficients: (f32, f32, f32),
     ycbcr_reference_black_white: Option<[f32; 6]>,
     nikon_compression_options: Option<NikonCompressionOptions>,
+    jpeg2000_reduce: u32,
     /// Hamamatsu NDPI restart-marker offsets (relative to the strip start) for a
     /// single-strip JPEG level. Built from tag 65426 (low 32 bits) + 65432 (high
     /// 32 bits). When present, a giant single-strip JPEG (whole-slide level 0,
@@ -138,6 +139,8 @@ pub struct TiffReader {
     series: Vec<TiffSeries>,
     current_series: usize,
     current_resolution: usize,
+    current_public_series: usize,
+    flattened_resolutions: bool,
     current_resolution_metadata: Option<ImageMetadata>,
     /// OME-XML embedded in the first IFD's ImageDescription, if present.
     ome_xml: Option<String>,
@@ -151,6 +154,8 @@ pub struct TiffReader {
     /// BigTIFF") layout instead of standard 32-bit pointers. Enabled by
     /// `NdpiReader` for files >4 GB before `set_id`.
     ndpi_64bit: bool,
+    /// Synthetic JPEG-2000 sub-resolution IFD -> OpenJPEG reduce factor.
+    synthetic_jpeg2000_ifds: HashMap<usize, u32>,
 }
 
 impl TiffReader {
@@ -160,11 +165,14 @@ impl TiffReader {
             series: Vec::new(),
             current_series: 0,
             current_resolution: 0,
+            current_public_series: 0,
+            flattened_resolutions: true,
             current_resolution_metadata: None,
             ome_xml: None,
             path: None,
             companion_readers: HashMap::new(),
             ndpi_64bit: false,
+            synthetic_jpeg2000_ifds: HashMap::new(),
         }
     }
 
@@ -184,6 +192,82 @@ impl TiffReader {
         &mut self.series
     }
 
+    fn resolution_count_for_series(&self, series: usize) -> usize {
+        self.series
+            .get(series)
+            .map(|s| 1 + s.sub_resolutions.len())
+            .unwrap_or(1)
+    }
+
+    fn public_series_count(&self) -> usize {
+        if self.flattened_resolutions {
+            self.series
+                .iter()
+                .map(|s| 1 + s.sub_resolutions.len())
+                .sum()
+        } else {
+            self.series.len()
+        }
+    }
+
+    fn public_series_to_core(&self, public_series: usize) -> Option<(usize, usize)> {
+        if !self.flattened_resolutions {
+            return (public_series < self.series.len()).then_some((public_series, 0));
+        }
+        let mut remaining = public_series;
+        for (series, s) in self.series.iter().enumerate() {
+            let count = 1 + s.sub_resolutions.len();
+            if remaining < count {
+                return Some((series, remaining));
+            }
+            remaining -= count;
+        }
+        None
+    }
+
+    fn core_to_public_series(&self, core_series: usize, resolution: usize) -> usize {
+        if !self.flattened_resolutions {
+            return core_series;
+        }
+        self.series
+            .iter()
+            .take(core_series)
+            .map(|s| 1 + s.sub_resolutions.len())
+            .sum::<usize>()
+            + resolution
+    }
+
+    /// Return metadata for a logical `(series, resolution)` pair without
+    /// changing the current reader position. Vendor wrappers use this to expose
+    /// Java's flattened public series view while preserving the internal
+    /// non-flattened pyramid.
+    pub fn metadata_at(&self, series: usize, resolution: usize) -> Result<ImageMetadata> {
+        let s = self
+            .series
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        if resolution == 0 {
+            return Ok(s.metadata.clone());
+        }
+
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let sub_ifds = s.sub_resolutions.get(resolution - 1).ok_or_else(|| {
+            BioFormatsError::Format(format!("resolution level {resolution} out of range"))
+        })?;
+        let first_ifd = sub_ifds
+            .first()
+            .and_then(|&idx| file.ifds.get(idx))
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("resolution level {resolution} has no planes"))
+            })?;
+
+        let mut meta = s.metadata.clone();
+        meta.size_x = first_ifd.image_width().unwrap_or(meta.size_x);
+        meta.size_y = first_ifd.image_length().unwrap_or(meta.size_y);
+        meta.image_count = sub_ifds.len() as u32;
+        Ok(meta)
+    }
+
     /// Replace the entire series list (used by vendor wrappers such as SVS that
     /// need to regroup the IFD chain into resolution levels of a single series).
     /// Resets the current series/resolution to 0.
@@ -191,6 +275,7 @@ impl TiffReader {
         self.series = series;
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
     }
 
@@ -246,6 +331,7 @@ impl TiffReader {
         self.series = flat;
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         Ok(())
     }
@@ -282,7 +368,7 @@ impl TiffReader {
                 size_c: if is_rgb { u32::from(samples) } else { 1 },
                 size_t: 1,
                 pixel_type: info.pixel_type,
-                bits_per_pixel: info.bits_per_sample as u8,
+                bits_per_pixel: (info.bits_per_sample) as u16,
                 image_count: 1,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb,
@@ -593,6 +679,7 @@ impl TiffReader {
             ycbcr_coefficients: coefficients,
             ycbcr_reference_black_white,
             nikon_compression_options: None,
+            jpeg2000_reduce: 0,
             ndpi_restart_markers,
         })
     }
@@ -687,7 +774,7 @@ impl TiffReader {
                     size_c,
                     size_t: image_count,
                     pixel_type: info.pixel_type,
-                    bits_per_pixel: info.bits_per_sample as u8,
+                    bits_per_pixel: (info.bits_per_sample) as u16,
                     image_count,
                     dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
                     is_rgb,
@@ -913,7 +1000,7 @@ impl TiffReader {
                 size_c: reconciled_size_c,
                 size_t: image.size_t,
                 pixel_type,
-                bits_per_pixel,
+                bits_per_pixel: bits_per_pixel.into(),
                 image_count,
                 dimension_order: image.dimension_order,
                 is_rgb,
@@ -967,6 +1054,18 @@ impl TiffReader {
                 "ImageDescription".into(),
                 crate::common::metadata::MetadataValue::String(xml.to_string()),
             );
+
+            // DEVIATION FROM JAVA BIO-FORMATS (intentional).
+            // LaVision UltraMicroscope writes a self-declaring OME-TIFF whose
+            // OME-XML has no <Plane> and no <StageLabel>, so Java's
+            // OMETiffReader reports no stage position at all. The positions are
+            // in the file, inside the vendor block in <Description>, which Java
+            // treats as opaque text. We parse them out. Gated on LaVision
+            // markers, so every other OME-TIFF is unaffected.
+            // See src/tiff/lavision.rs and README.md.
+            if let Some(stage) = crate::tiff::lavision::parse_lavision_stage(xml) {
+                crate::tiff::lavision::populate_series_metadata(&stage, &mut meta.series_metadata);
+            }
 
             // Only keep the external-plane vector if it actually references a
             // companion file; otherwise leave it empty (pure single-file case).
@@ -1041,6 +1140,111 @@ impl TiffReader {
         Ok(())
     }
 
+    fn synthesize_jpeg2000_sub_ifds(&mut self) -> Result<()> {
+        let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+        for series_index in 0..self.series.len() {
+            if !self.series[series_index].sub_resolutions.is_empty() {
+                continue;
+            }
+            let main_planes: Vec<usize> = if !self.series[series_index].plane_ifd_indices.is_empty()
+            {
+                self.series[series_index]
+                    .plane_ifd_indices
+                    .iter()
+                    .filter_map(|&idx| idx)
+                    .collect()
+            } else {
+                self.series[series_index].ifd_indices.clone()
+            };
+            let Some(&first_ifd_index) = main_planes.first() else {
+                continue;
+            };
+            let Some(first_ifd) = file.ifds.get(first_ifd_index) else {
+                continue;
+            };
+            if first_ifd.compression() != Compression::Jpeg2000 {
+                continue;
+            }
+            let Some(levels) =
+                jpeg2000_resolution_levels_from_tiff_ifd(&mut file.parser.reader, first_ifd)?
+            else {
+                continue;
+            };
+            if levels == 0 {
+                continue;
+            }
+
+            let mut previous_dims: Vec<(u32, u32, u32, u32)> = main_planes
+                .iter()
+                .filter_map(|&idx| {
+                    file.ifds.get(idx).map(|ifd| {
+                        (
+                            ifd.image_width().unwrap_or(1),
+                            ifd.image_length().unwrap_or(1),
+                            ifd.tile_width().or_else(|| ifd.image_width()).unwrap_or(1),
+                            ifd.tile_length()
+                                .or_else(|| ifd.image_length())
+                                .unwrap_or(1),
+                        )
+                    })
+                })
+                .collect();
+            if previous_dims.len() != main_planes.len() {
+                continue;
+            }
+
+            let mut sub_levels = Vec::new();
+            for reduce in 1..=levels {
+                let mut this_level = Vec::new();
+                for (plane, &source_ifd) in main_planes.iter().enumerate() {
+                    let Some(source) = file.ifds.get(source_ifd).cloned() else {
+                        continue;
+                    };
+                    let (prev_w, prev_h, prev_tw, prev_th) = previous_dims[plane];
+                    let width = (prev_w / 2).max(1);
+                    let height = (prev_h / 2).max(1);
+                    let tile_width = (prev_tw / 2).max(1);
+                    let tile_height = (prev_th / 2).max(1);
+                    previous_dims[plane] = (width, height, tile_width, tile_height);
+
+                    let mut synthetic = source;
+                    synthetic
+                        .entries
+                        .insert(tag::IMAGE_WIDTH, IfdValue::Long(vec![width]));
+                    synthetic
+                        .entries
+                        .insert(tag::IMAGE_LENGTH, IfdValue::Long(vec![height]));
+                    if synthetic.is_tiled() {
+                        synthetic
+                            .entries
+                            .insert(tag::TILE_WIDTH, IfdValue::Long(vec![tile_width]));
+                        synthetic
+                            .entries
+                            .insert(tag::TILE_LENGTH, IfdValue::Long(vec![tile_height]));
+                    } else {
+                        synthetic
+                            .entries
+                            .insert(tag::ROWS_PER_STRIP, IfdValue::Long(vec![height]));
+                    }
+                    let synthetic_idx = file.ifds.len();
+                    file.ifds.push(synthetic);
+                    self.synthetic_jpeg2000_ifds
+                        .insert(synthetic_idx, reduce as u32);
+                    this_level.push(synthetic_idx);
+                }
+                if this_level.len() == main_planes.len() {
+                    sub_levels.push(this_level);
+                }
+            }
+            if !sub_levels.is_empty() {
+                let series = &mut self.series[series_index];
+                series.sub_resolutions = sub_levels;
+                series.metadata.resolution_count = 1 + series.sub_resolutions.len() as u32;
+            }
+        }
+        Ok(())
+    }
+
     fn add_nikon_raw_sub_ifd_series(&mut self) -> Result<()> {
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let little_endian = file.parser.little_endian;
@@ -1056,7 +1260,12 @@ impl TiffReader {
                 continue;
             }
             let info = Self::ifd_info(ifd, little_endian)?;
-            raw_series.push(Self::single_ifd_series(ifd_index, &info, little_endian));
+            let mut series = Self::single_ifd_series(ifd_index, &info, little_endian);
+            series.metadata.series_metadata.insert(
+                "NikonRawSubIFD".into(),
+                crate::common::metadata::MetadataValue::Bool(true),
+            );
+            raw_series.push(series);
             assigned_ifds.push(ifd_index);
         }
 
@@ -1094,23 +1303,10 @@ impl TiffReader {
 
         let mut label_index: Option<usize> = None;
         let mut macro_index: Option<usize> = None;
-        let mut skip_positions: Vec<usize> = Vec::new();
-
         for (i, &ifd_idx) in main_ifds.iter().enumerate() {
             let ifd = &file.ifds[ifd_idx];
             let comment = ifd.get_str(tag::IMAGE_DESCRIPTION);
             let subfile_type = ifd.get_u32(tag::NEW_SUBFILE_TYPE).unwrap_or(0);
-            let stripped_thumbnail = subfile_type != 0
-                && ifd.get(tag::STRIP_BYTE_COUNTS).is_some()
-                && ifd.get(tag::TILE_BYTE_COUNTS).is_none()
-                && matches!(
-                    Compression::from(ifd.get_u16(tag::COMPRESSION).unwrap_or(1)),
-                    Compression::Lzw
-                );
-            if stripped_thumbnail {
-                skip_positions.push(i);
-                continue;
-            }
 
             match comment {
                 None => {
@@ -1154,7 +1350,7 @@ impl TiffReader {
         // Resolution images are the main IFDs that are NOT label/macro, in order.
         let extra: Vec<usize> = [label_index, macro_index].into_iter().flatten().collect();
         let resolution_positions: Vec<usize> = (0..main_ifds.len())
-            .filter(|i| !extra.contains(i) && !skip_positions.contains(i))
+            .filter(|i| !extra.contains(i))
             .collect();
         if resolution_positions.is_empty() {
             return Ok(());
@@ -1276,14 +1472,14 @@ impl TiffReader {
                     blue: b.clone(),
                 });
 
-        let mut metadata = crate::common::metadata::ImageMetadata {
+        let metadata = crate::common::metadata::ImageMetadata {
             size_x: info.width,
             size_y: info.height,
             size_z: 1,
             size_c,
             size_t: 1,
             pixel_type: info.pixel_type,
-            bits_per_pixel: info.bits_per_sample as u8,
+            bits_per_pixel: (info.bits_per_sample) as u16,
             image_count: 1,
             dimension_order: crate::common::metadata::DimensionOrder::XYZTC,
             is_rgb,
@@ -1298,10 +1494,6 @@ impl TiffReader {
             modulo_c: None,
             modulo_t: None,
         };
-        metadata.series_metadata.insert(
-            "NikonRawSubIFD".into(),
-            crate::common::metadata::MetadataValue::Bool(true),
-        );
 
         TiffSeries {
             ifd_indices: vec![ifd_index],
@@ -1597,6 +1789,9 @@ impl TiffReader {
             .ok_or_else(|| BioFormatsError::PlaneOutOfRange(ifd_index as u32))?;
         let little_endian = file.parser.little_endian;
         let mut info = Self::ifd_info(ifd, little_endian)?;
+        if let Some(&reduce) = self.synthetic_jpeg2000_ifds.get(&ifd_index) {
+            info.jpeg2000_reduce = reduce;
+        }
         if info.compression == Compression::Nikon {
             info.nikon_compression_options = super::nikon::extract_compression_options(
                 &mut file.parser,
@@ -2150,7 +2345,7 @@ impl TiffReader {
                 get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
             {
                 apply_fill_order(&mut compressed, info.fill_order, info.compression);
-                let mut decoded = decompress(
+                let mut decoded = decompress_with_jpeg2000_reduce(
                     &compressed,
                     info.compression,
                     expected,
@@ -2163,6 +2358,7 @@ impl TiffReader {
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
                     jpeg_color_for(info),
+                    info.jpeg2000_reduce,
                 )?;
                 if info.compression != Compression::Nikon {
                     normalize_decompressed_block(&mut decoded, expected);
@@ -2477,7 +2673,7 @@ impl TiffReader {
                     get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                 {
                     apply_fill_order(&mut compressed, info.fill_order, info.compression);
-                    let mut decoded = decompress(
+                    let mut decoded = decompress_with_jpeg2000_reduce(
                         &compressed,
                         info.compression,
                         expected,
@@ -2490,6 +2686,7 @@ impl TiffReader {
                         info.jpeg_tables.as_deref(),
                         info.nikon_compression_options.as_ref(),
                         jpeg_color_for(info),
+                        info.jpeg2000_reduce,
                     )?;
                     if info.compression != Compression::Nikon {
                         normalize_decompressed_block(&mut decoded, expected);
@@ -2676,7 +2873,7 @@ impl TiffReader {
                     get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                 {
                     apply_fill_order(&mut compressed, info.fill_order, info.compression);
-                    let mut decoded = decompress(
+                    let mut decoded = decompress_with_jpeg2000_reduce(
                         &compressed,
                         info.compression,
                         raw_tile_data_bytes,
@@ -2689,6 +2886,7 @@ impl TiffReader {
                         info.jpeg_tables.as_deref(),
                         info.nikon_compression_options.as_ref(),
                         jpeg_color_for(info),
+                        info.jpeg2000_reduce,
                     )?;
                     normalize_decompressed_block(&mut decoded, raw_tile_data_bytes);
                     decoded
@@ -2804,7 +3002,7 @@ impl TiffReader {
                     continue;
                 };
                 apply_fill_order(&mut compressed, info.fill_order, info.compression);
-                let mut tile_data = decompress(
+                let mut tile_data = decompress_with_jpeg2000_reduce(
                     &compressed,
                     info.compression,
                     tile_data_bytes,
@@ -2817,6 +3015,7 @@ impl TiffReader {
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
                     jpeg_color_for(info),
+                    info.jpeg2000_reduce,
                 )?;
                 normalize_decompressed_block(&mut tile_data, tile_data_bytes);
 
@@ -2915,7 +3114,7 @@ impl TiffReader {
                         get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                     {
                         apply_fill_order(&mut compressed, info.fill_order, info.compression);
-                        let mut decoded = decompress(
+                        let mut decoded = decompress_with_jpeg2000_reduce(
                             &compressed,
                             info.compression,
                             tile_data_bytes,
@@ -2928,6 +3127,7 @@ impl TiffReader {
                             info.jpeg_tables.as_deref(),
                             info.nikon_compression_options.as_ref(),
                             jpeg_color_for(info),
+                            info.jpeg2000_reduce,
                         )?;
                         normalize_decompressed_block(&mut decoded, tile_data_bytes);
                         decoded
@@ -3032,6 +3232,7 @@ impl TiffReader {
         self.file = Some(tf);
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         Ok(())
     }
@@ -3042,10 +3243,22 @@ fn is_interleaved_rgb(info: &IfdInfo) -> bool {
 }
 
 fn tiff_physical_size(ifd: Option<&Ifd>, tag: u16) -> Option<f64> {
-    ifd.and_then(|ifd| ifd.get(tag))
+    let ifd = ifd?;
+    let resolution = ifd
+        .get(tag)
         .and_then(|value| value.as_vec_f64().first().copied())
-        .filter(|value| *value > 0.0)
-        .map(|value| 1.0 / value)
+        .filter(|value| *value > 0.0)?;
+    // Java IFD.getX/YResolution() converts TIFF ResolutionUnit to microns per
+    // pixel before BaseTiffReader passes it to FormatTools.getPhysicalSizeX/Y.
+    match ifd
+        .get(crate::tiff::ifd::tag::RESOLUTION_UNIT)
+        .and_then(|value| value.as_u16())
+        .unwrap_or(2)
+    {
+        2 => Some(25_400.0 / resolution),
+        3 => Some(10_000.0 / resolution),
+        _ => Some(resolution),
+    }
 }
 
 fn should_planarize_chunky_rgb(info: &IfdInfo, _path: Option<&Path>) -> bool {
@@ -3227,6 +3440,91 @@ fn get_tile_bytes_or_zero<R: Read + Seek>(
         .read_exact(&mut buf[..available])
         .map_err(BioFormatsError::Io)?;
     Ok(Some(buf))
+}
+
+fn jpeg2000_resolution_levels_from_tiff_ifd<R: Read + Seek>(
+    reader: &mut R,
+    ifd: &Ifd,
+) -> Result<Option<u8>> {
+    let (offset, byte_count) = if ifd.is_tiled() {
+        let offsets = ifd.get_vec_u64(tag::TILE_OFFSETS);
+        let counts = ifd.get_vec_u64(tag::TILE_BYTE_COUNTS);
+        match (offsets.first(), counts.first()) {
+            (Some(&offset), Some(&count)) => (offset, count as usize),
+            _ => return Ok(None),
+        }
+    } else {
+        let offsets = ifd.get_vec_u64(tag::STRIP_OFFSETS);
+        let counts = ifd.get_vec_u64(tag::STRIP_BYTE_COUNTS);
+        match (offsets.first(), counts.first()) {
+            (Some(&offset), Some(&count)) => (offset, count as usize),
+            _ => return Ok(None),
+        }
+    };
+    let Some(data) = get_tile_bytes_or_zero(reader, offset, byte_count)? else {
+        return Ok(None);
+    };
+    Ok(jpeg2000_resolution_levels_from_bytes(&data))
+}
+
+fn jpeg2000_codestream_offset(data: &[u8]) -> Option<usize> {
+    if data.len() >= 2 && data[..2] == [0xff, 0x4f] {
+        return Some(0);
+    }
+    let mut pos = 0usize;
+    while pos.checked_add(8)? <= data.len() {
+        let len = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        let typ = &data[pos + 4..pos + 8];
+        let (header, box_len) = if len == 1 {
+            if pos.checked_add(16)? > data.len() {
+                return None;
+            }
+            (
+                16usize,
+                u64::from_be_bytes(data[pos + 8..pos + 16].try_into().ok()?) as usize,
+            )
+        } else if len == 0 {
+            (8usize, data.len().saturating_sub(pos))
+        } else {
+            (8usize, len)
+        };
+        if box_len < header || pos.checked_add(box_len)? > data.len() {
+            return None;
+        }
+        if typ == b"jp2c" {
+            return Some(pos + header);
+        }
+        pos += box_len;
+    }
+    None
+}
+
+fn jpeg2000_resolution_levels_from_bytes(data: &[u8]) -> Option<u8> {
+    let mut pos = jpeg2000_codestream_offset(data)?;
+    if data.get(pos..pos + 2)? != &[0xff, 0x4f] {
+        return None;
+    }
+    pos += 2;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xff {
+            return None;
+        }
+        let marker = data[pos + 1];
+        pos += 2;
+        if matches!(marker, 0x90 | 0x93 | 0xd9) {
+            return None;
+        }
+        let len = u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+        if len < 2 || pos + len > data.len() {
+            return None;
+        }
+        let body = &data[pos + 2..pos + len];
+        if marker == 0x52 {
+            return body.get(5).copied();
+        }
+        pos += len;
+    }
+    None
 }
 
 fn normalize_decompressed_block(decoded: &mut Vec<u8>, expected: usize) {
@@ -4861,8 +5159,10 @@ impl crate::common::reader::FormatReader for TiffReader {
                         self.file = Some(tf);
                         self.current_series = 0;
                         self.current_resolution = 0;
+                        self.current_public_series = 0;
                         self.current_resolution_metadata = None;
                         self.parse_sub_ifds()?;
+                        self.synthesize_jpeg2000_sub_ifds()?;
                         self.add_nikon_raw_sub_ifd_series()?;
                         return Ok(());
                     }
@@ -4880,9 +5180,11 @@ impl crate::common::reader::FormatReader for TiffReader {
         self.file = Some(tf);
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         // Parse SubIFD chains for pyramid support
         self.parse_sub_ifds()?;
+        self.synthesize_jpeg2000_sub_ifds()?;
         self.add_nikon_raw_sub_ifd_series()?;
         Ok(())
     }
@@ -4890,29 +5192,38 @@ impl crate::common::reader::FormatReader for TiffReader {
     fn close(&mut self) -> Result<()> {
         self.file = None;
         self.series.clear();
+        self.current_series = 0;
+        self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         self.ome_xml = None;
         self.path = None;
         self.companion_readers.clear();
+        self.synthetic_jpeg2000_ifds.clear();
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        self.series.len()
+        self.public_series_count()
     }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
-        if series >= self.series.len() {
+        let Some((core_series, resolution)) = self.public_series_to_core(series) else {
             return Err(BioFormatsError::SeriesOutOfRange(series));
-        }
-        self.current_series = series;
-        self.current_resolution = 0;
-        self.current_resolution_metadata = None;
+        };
+        self.current_series = core_series;
+        self.current_resolution = resolution;
+        self.current_public_series = series;
+        self.current_resolution_metadata = if resolution == 0 {
+            None
+        } else {
+            Some(self.metadata_at(core_series, resolution)?)
+        };
         Ok(())
     }
 
     fn series(&self) -> usize {
-        self.current_series
+        self.current_public_series
     }
 
     fn metadata(&self) -> &crate::common::metadata::ImageMetadata {
@@ -5046,13 +5357,15 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn resolution_count(&self) -> usize {
-        let s = &self.series[self.current_series];
-        1 + s.sub_resolutions.len()
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.resolution_count_for_series(self.current_series)
+        }
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        let s = &self.series[self.current_series];
-        let max = 1 + s.sub_resolutions.len();
+        let max = self.resolution_count();
         if level >= max {
             return Err(BioFormatsError::Format(format!(
                 "resolution level {} out of range (max {})",
@@ -5061,12 +5374,31 @@ impl crate::common::reader::FormatReader for TiffReader {
             )));
         }
         self.current_resolution = level;
+        self.current_public_series = self.core_to_public_series(self.current_series, level);
         self.current_resolution_metadata = self.resolution_metadata(level)?;
         Ok(())
     }
 
     fn resolution(&self) -> usize {
-        self.current_resolution
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.current_resolution
+        }
+    }
+
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.file.is_some() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        Ok(())
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
@@ -5098,6 +5430,7 @@ impl crate::common::reader::FormatReader for TiffReader {
 mod tests {
     use super::*;
     use crate::common::reader::FormatReader;
+    use crate::common::writer::FormatWriter;
     use std::fs;
 
     fn push_u16_le(data: &mut Vec<u8>, value: u16) {
@@ -5144,6 +5477,28 @@ mod tests {
         push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
         push_u32_le(&mut data, 0);
         data.extend_from_slice(&compressed);
+        data
+    }
+    fn synthetic_jpeg2000_tiff(jp2: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let entry_count = 10u16;
+        let pixel_offset = 8 + 2 + u32::from(entry_count) * 12 + 4;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, width);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, height);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 33003);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 1);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, pixel_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 1);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, height);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, jp2.len() as u32);
+        push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
+        push_u32_le(&mut data, 0);
+        data.extend_from_slice(jp2);
         data
     }
 
@@ -5230,6 +5585,55 @@ mod tests {
         }
 
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn jpeg2000_compressed_tiff_synthesizes_internal_resolutions_like_java() {
+        let jp2_path = std::env::temp_dir().join(format!(
+            "bioformats-rs-tiff-j2k-src-{}.jp2",
+            std::process::id()
+        ));
+        let tiff_path =
+            std::env::temp_dir().join(format!("bioformats-rs-tiff-j2k-{}.tif", std::process::id()));
+
+        let meta = ImageMetadata {
+            size_x: 8,
+            size_y: 8,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        };
+        let plane: Vec<u8> = (0..64).map(|v| v as u8).collect();
+        let mut writer = crate::formats::misc::Jpeg2000Writer::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(&jp2_path).unwrap();
+        writer.save_bytes(0, &plane).unwrap();
+        writer.close().unwrap();
+
+        let jp2 = fs::read(&jp2_path).unwrap();
+        fs::write(&tiff_path, synthetic_jpeg2000_tiff(&jp2, 8, 8)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
+        reader.set_id(&tiff_path).unwrap();
+        assert!(reader.resolution_count() > 1);
+        assert_eq!(
+            reader.metadata().resolution_count as usize,
+            reader.resolution_count()
+        );
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (8, 8));
+        assert_eq!(reader.open_bytes(0).unwrap().len(), 64);
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 4));
+        assert_eq!(reader.open_bytes(0).unwrap().len(), 16);
+
+        let _ = fs::remove_file(jp2_path);
+        let _ = fs::remove_file(tiff_path);
     }
 
     #[test]

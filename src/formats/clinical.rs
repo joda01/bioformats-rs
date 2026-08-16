@@ -732,7 +732,7 @@ impl FormatReader for Ecat7Reader {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count,
             dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
@@ -834,6 +834,14 @@ impl FormatReader for Ecat7Reader {
         let meta = self.meta.as_ref()?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
         let image = &mut ome.images[0];
+        if image.name.is_none() {
+            image.name = self
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
+        }
         image.physical_size_x = self.physical_size_x;
         image.physical_size_y = self.physical_size_y;
         image.physical_size_z = self.physical_size_z;
@@ -1349,7 +1357,7 @@ fn parse_inveon_header(path: &Path) -> Result<InveonHeader> {
         size_z: nz,
         size_t: nt,
         pixel_type,
-        bits_per_pixel: bpp,
+        bits_per_pixel: (bpp).into(),
         little_endian,
         data_file,
         data_offsets,
@@ -1485,7 +1493,7 @@ impl FormatReader for InveonReader {
             size_c: 1,
             size_t: header.size_t,
             pixel_type: header.pixel_type,
-            bits_per_pixel: header.bits_per_pixel,
+            bits_per_pixel: (header.bits_per_pixel).into(),
             image_count: plane_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -1821,7 +1829,7 @@ fn parse_fdf_header(path: &Path) -> Result<FdfHeader> {
         size_z,
         size_t,
         pixel_type,
-        bits_per_pixel: bpp,
+        bits_per_pixel: (bpp).into(),
         little_endian,
         data_offset,
         metadata,
@@ -1994,7 +2002,7 @@ impl FormatReader for VarianFdfReader {
             size_c: 1,
             size_t,
             pixel_type: header.pixel_type,
-            bits_per_pixel: header.bits_per_pixel,
+            bits_per_pixel: (header.bits_per_pixel).into(),
             image_count,
             // Java VarianFDFReader uses dimensionOrder "XYTZC".
             dimension_order: DimensionOrder::XYTZC,

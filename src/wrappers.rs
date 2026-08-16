@@ -1703,7 +1703,7 @@ impl ChannelFiller {
                     adjusted.size_c = meta.size_c.saturating_mul(target_c);
                     adjusted.is_rgb = target_c > 1;
                     adjusted.is_indexed = false;
-                    adjusted.bits_per_pixel = meta.pixel_type.bytes_per_sample() as u8 * 8;
+                    adjusted.bits_per_pixel = (meta.pixel_type.bytes_per_sample()) as u16 * 8;
                     adjusted.lookup_table = None;
                     self.adjusted_meta = Some(adjusted);
                     self.lut_channels = Some(target_c);

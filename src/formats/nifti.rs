@@ -318,7 +318,7 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: hdr.bitpix.max(0) as u8,
+        bits_per_pixel: (hdr.bitpix.max(0)) as u16,
         image_count,
         // Java NiftiReader uses dimensionOrder "XYCZT".
         dimension_order: DimensionOrder::XYCZT,
@@ -426,13 +426,11 @@ impl Default for NiftiReader {
 impl FormatReader for NiftiReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let name = path.to_string_lossy().to_ascii_lowercase();
-        name.ends_with(".nii")
-            || name.ends_with(".nii.gz")
-            || path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("hdr") || e.eq_ignore_ascii_case("img"))
-                .unwrap_or(false)
+        // Java NiftiReader.isThisType(String, open) accepts ".nii" by suffix
+        // alone; ".nii.gz" follows FormatHandler.checkSuffix's compressed
+        // suffix handling. Paired ".hdr"/".img" files require opening/probing
+        // the header, so name-only detection must not claim them.
+        name.ends_with(".nii") || name.ends_with(".nii.gz")
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -735,6 +733,16 @@ mod tests {
         assert!(!reader.is_this_type_by_bytes(&header));
 
         assert!(!reader.is_this_type_by_bytes(&header[..HDR_SIZE - 1]));
+    }
+
+    #[test]
+    fn name_detection_matches_java_nii_suffix_only() {
+        let reader = NiftiReader::new();
+
+        assert!(reader.is_this_type_by_name(Path::new("scan.nii")));
+        assert!(reader.is_this_type_by_name(Path::new("scan.nii.gz")));
+        assert!(!reader.is_this_type_by_name(Path::new("scan.hdr")));
+        assert!(!reader.is_this_type_by_name(Path::new("scan.img")));
     }
 
     #[test]

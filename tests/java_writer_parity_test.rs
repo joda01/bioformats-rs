@@ -552,7 +552,7 @@ fn base_meta(pt: PixelType) -> ImageMetadata {
     m.size_x = W;
     m.size_y = H;
     m.pixel_type = pt;
-    m.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
+    m.bits_per_pixel = (pt.bytes_per_sample() * 8) as u16;
     m.size_z = 1;
     m.size_c = 1;
     m.size_t = 1;

@@ -145,7 +145,7 @@ impl DcimgReader {
     /// the initial file probe.
     fn parse_dcam_version1_header(&mut self, f: &mut File) -> Result<DcamHeader> {
         let header_size = self.header_size;
-        let mut v1 = [0u8; 124];
+        let mut v1 = [0u8; 128];
         f.seek(SeekFrom::Start(header_size))
             .map_err(BioFormatsError::Io)?;
         f.read_exact(&mut v1)
@@ -159,7 +159,7 @@ impl DcimgReader {
         // not use the field as an image row stride.
         let bytes_per_image = r_u32_le(&v1, 84) as u64;
         let data_offset = header_size + r_u64_le(&v1, 96);
-        let frame_footer_size = r_u32_le(&v1, 120) as u64;
+        let frame_footer_size = r_u32_le(&v1, 124) as u64;
 
         self.bytes_per_row = 0;
         self.bytes_per_image = bytes_per_image;
@@ -588,7 +588,7 @@ impl FormatReader for DcimgReader {
             size_c: 1,
             size_t: n_frames,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -762,5 +762,99 @@ impl FormatReader for DcimgReader {
                 .map(|name| name.to_string_lossy().into_owned());
         }
         Some(ome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn put_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn unique_temp_file(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{nanos}.dcimg", std::process::id()))
+    }
+
+    #[test]
+    fn version1_reads_frame_footer_size_at_java_offset_and_applies_four_pixel_correction() {
+        let header_size = 112usize;
+        let data_offset_from_header = 128u64;
+        let data_offset = header_size + data_offset_from_header as usize;
+        let width = 4usize;
+        let height = 4usize;
+        let bytes_per_image = width * height * 2;
+        let frame_footer_size = 32usize;
+        let total_len = data_offset + bytes_per_image + frame_footer_size;
+
+        let mut bytes = vec![0u8; total_len];
+        bytes[..8].copy_from_slice(b"DCIMG\0\0\0");
+        put_u32_le(&mut bytes, 8, DCIMG_VERSION_1);
+        put_u32_le(&mut bytes, 40, header_size as u32);
+        put_u32_le(&mut bytes, 48, total_len as u32);
+        put_u32_le(&mut bytes, 64, total_len as u32);
+
+        let v1 = header_size;
+        put_u32_le(&mut bytes, v1 + 60, 1);
+        put_u32_le(&mut bytes, v1 + 64, DCIMG_PIXELTYPE_MONO16);
+        put_u32_le(&mut bytes, v1 + 72, width as u32);
+        put_u32_le(&mut bytes, v1 + 76, height as u32);
+        put_u32_le(&mut bytes, v1 + 84, bytes_per_image as u32);
+        put_u64_le(&mut bytes, v1 + 96, data_offset_from_header);
+        put_u32_le(&mut bytes, v1 + 124, frame_footer_size as u32);
+
+        let mut sample = 1u16;
+        for row in 0..height {
+            for col in 0..width {
+                let off = data_offset + (row * width + col) * 2;
+                let value = if row == 1 && col < 4 {
+                    match col {
+                        0 => 0,
+                        1 => u16::MAX,
+                        2 => 0,
+                        _ => u16::MAX,
+                    }
+                } else {
+                    sample
+                };
+                bytes[off..off + 2].copy_from_slice(&value.to_le_bytes());
+                sample = sample.wrapping_add(1);
+            }
+        }
+
+        let correction_offset = data_offset + bytes_per_image + 12;
+        for (i, value) in [11u16, 12, 13, 14].iter().enumerate() {
+            let off = correction_offset + i * 2;
+            bytes[off..off + 2].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let path = unique_temp_file("dcimg-v1-footer-correction");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&bytes).unwrap();
+        drop(file);
+
+        let mut reader = DcimgReader::new();
+        reader.set_id(&path).unwrap();
+        let plane = reader.open_bytes(0).unwrap();
+        let corrected_row = height / 2;
+        let row_start = corrected_row * width * 2;
+        let got: Vec<u16> = plane[row_start..row_start + 8]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(got, vec![11, 12, 13, 14]);
+
+        std::fs::remove_file(path).ok();
     }
 }

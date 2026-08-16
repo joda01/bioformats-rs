@@ -26,7 +26,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::tiff::TiffReader;
@@ -158,6 +158,32 @@ fn sanitize_value(value: &str) -> String {
         f = remove_gst(&f);
     }
     f
+}
+
+fn parse_fv1000_double(value: &str) -> Option<f64> {
+    let value = sanitize_value(value);
+    let trimmed = value.trim();
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return Some(v);
+    }
+    if let Some((whole, rest)) = trimmed.split_once(',') {
+        if whole == "0" && rest.ends_with(".0") && rest.len() > 2 {
+            let decimal = format!("0.{}", &rest[..rest.len() - 2]);
+            if let Ok(v) = decimal.parse::<f64>() {
+                return Some(v);
+            }
+        }
+    }
+    if trimmed.contains(',') {
+        if let Ok(v) = trimmed.replace(',', "").parse::<f64>() {
+            return Some(v);
+        }
+        let decimal = trimmed.replace(',', ".");
+        if decimal.matches('.').count() == 1 {
+            return decimal.parse::<f64>().ok();
+        }
+    }
+    None
 }
 
 /// Java removeGST.
@@ -337,8 +363,14 @@ pub struct Fv1000Reader {
     /// Physical pixel sizes (µm) from WidthConvertValue / HeightConvertValue.
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
+    time_increment: Option<f64>,
     /// Active channels in acquisition order.
     channels: Vec<OifChannel>,
+    /// Java FV1000Reader.lutNames: per-channel LUT logical paths.
+    lut_names: Vec<String>,
+    /// Java FV1000Reader.lut: one 16-bit RGB lookup table per channel.
+    luts: Vec<LookupTable>,
 }
 
 impl Fv1000Reader {
@@ -351,7 +383,11 @@ impl Fv1000Reader {
             planes: Vec::new(),
             physical_size_x: None,
             physical_size_y: None,
+            physical_size_z: None,
+            time_increment: None,
             channels: Vec::new(),
+            lut_names: Vec::new(),
+            luts: Vec::new(),
         }
     }
 
@@ -457,6 +493,9 @@ impl Fv1000Reader {
                     if tif.ends_with(".tif") {
                         preview_count += 1;
                     }
+                } else if key.starts_with("LutFileName") {
+                    self.lut_names
+                        .push(sanitize_file(&value, &self.path_prefix));
                 }
             }
         }
@@ -476,6 +515,7 @@ impl Fv1000Reader {
         // ---- Axis N Parameters Common: AxisCode / MaxSize ----
         let mut code = vec![String::new(); NUM_DIMENSIONS];
         let mut size = vec![1u32; NUM_DIMENSIONS];
+        let mut pixel_size = vec![None; NUM_DIMENSIONS];
         for i in 0..NUM_DIMENSIONS {
             if let Some(common) = f.table(&format!("Axis {i} Parameters Common")) {
                 code[i] = common.get("AxisCode").cloned().unwrap_or_default();
@@ -483,6 +523,16 @@ impl Fv1000Reader {
                     .get("MaxSize")
                     .and_then(|s| s.trim().parse::<u32>().ok())
                     .unwrap_or(1);
+                let end = common
+                    .get("EndPosition")
+                    .and_then(|s| parse_fv1000_double(s));
+                let start = common
+                    .get("StartPosition")
+                    .and_then(|s| parse_fv1000_double(s));
+                pixel_size[i] = match (start, end) {
+                    (Some(start), Some(end)) => Some(end - start),
+                    _ => None,
+                };
             }
         }
 
@@ -501,11 +551,11 @@ impl Fv1000Reader {
             }
             self.physical_size_x = rip
                 .get("WidthConvertValue")
-                .and_then(|s| sanitize_value(s).trim().parse::<f64>().ok())
+                .and_then(|s| parse_fv1000_double(s))
                 .filter(|v| *v > 0.0);
             self.physical_size_y = rip
                 .get("HeightConvertValue")
-                .and_then(|s| sanitize_value(s).trim().parse::<f64>().ok())
+                .and_then(|s| parse_fv1000_double(s))
                 .filter(|v| *v > 0.0);
         }
 
@@ -650,7 +700,7 @@ impl Fv1000Reader {
                         }
                         plane.position_z = axis
                             .get("AbsPositionValue")
-                            .and_then(|s| s.trim().parse::<f64>().ok());
+                            .and_then(|s| parse_fv1000_double(s));
                     }
                     4 => {
                         if add_axis && !dimension_order.contains('T') {
@@ -658,7 +708,7 @@ impl Fv1000Reader {
                         }
                         plane.delta_t = axis
                             .get("AbsPositionValue")
-                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .and_then(|s| parse_fv1000_double(s))
                             .map(|v| v / 1000.0);
                     }
                     _ => {}
@@ -706,6 +756,14 @@ impl Fv1000Reader {
                         size_y = ss;
                     } else {
                         size_z = ss;
+                        if ss > 1 {
+                            if let Some(span) = pixel_size[i] {
+                                let z = ((span / (ss - 1) as f64) / 1000.0).abs();
+                                if z.is_finite() && z > 0.0 {
+                                    self.physical_size_z = Some(z);
+                                }
+                            }
+                        }
                     }
                 }
                 "T" => {
@@ -713,6 +771,14 @@ impl Fv1000Reader {
                         size_y = ss;
                     } else {
                         size_t = ss;
+                        if ss > 1 {
+                            if let Some(span) = pixel_size[i] {
+                                let t = ((span / (ss - 1) as f64) / 1000.0).abs();
+                                if t.is_finite() && t > 0.0 {
+                                    self.time_increment = Some(t);
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -790,9 +856,9 @@ impl Fv1000Reader {
             }
         };
         let mut bits = if valid_bits > 0 {
-            valid_bits as u8
+            valid_bits as u16
         } else {
-            (image_depth * 8).max(8) as u8
+            (image_depth * 8).max(8) as u16
         };
         let mut is_little_endian = true;
         let mut is_rgb = false;
@@ -849,6 +915,9 @@ impl Fv1000Reader {
             "format".into(),
             MetadataValue::String("Olympus FV1000".into()),
         );
+        let luts = self.load_luts(size_c as usize);
+        self.luts = luts.unwrap_or_default();
+        let first_lut = self.luts.first().cloned();
 
         self.meta = Some(ImageMetadata {
             size_x,
@@ -857,17 +926,17 @@ impl Fv1000Reader {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel: bits,
+            bits_per_pixel: (bits).into(),
             image_count: image_count as u32,
             dimension_order,
             is_rgb,
             is_interleaved: false,
-            is_indexed: false,
+            is_indexed: !self.luts.is_empty(),
             is_little_endian,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: meta_map,
-            lookup_table: None,
+            lookup_table: first_lut,
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
@@ -875,6 +944,32 @@ impl Fv1000Reader {
         self.tiffs = tiffs;
         self.planes = planes;
         Ok(())
+    }
+
+    fn load_luts(&self, size_c: usize) -> Option<Vec<LookupTable>> {
+        const LUT_BYTES: usize = 65_536 * 4;
+        let count = size_c.min(self.lut_names.len());
+        let mut luts = vec![fv1000_empty_lut(); size_c];
+        for c in 0..count {
+            let bytes = self.source.read_bytes(&self.lut_names[c]).ok()?;
+            if bytes.len() < LUT_BYTES {
+                return None;
+            }
+            let start = bytes.len() - LUT_BYTES;
+            let buffer = &bytes[start..];
+            let mut lut = LookupTable {
+                red: Vec::with_capacity(65_536),
+                green: Vec::with_capacity(65_536),
+                blue: Vec::with_capacity(65_536),
+            };
+            for entry in buffer.chunks_exact(4) {
+                lut.red.push((entry[2] as u16) * 257);
+                lut.green.push((entry[1] as u16) * 257);
+                lut.blue.push((entry[0] as u16) * 257);
+            }
+            luts[c] = lut;
+        }
+        Some(luts)
     }
 
     /// Read a plane's bytes from its resolved TIFF (disk or OLE2 stream).
@@ -1082,7 +1177,7 @@ fn find_oif_for_entry(path: &Path) -> Option<PathBuf> {
 }
 
 /// Probe a TIFF held in memory: returns (pixel_type, little_endian, rgb, bits).
-fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8)> {
+fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u16)> {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("bioformats_oib_probe_{}.tif", rand_suffix(bytes)));
     std::fs::write(&tmp, bytes).ok()?;
@@ -1101,7 +1196,7 @@ fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8)> {
 }
 
 /// Probe a TIFF for dimensions only: (pt, le, rgb, bits, width, height).
-fn probe_tiff_dims(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8, u32, u32)> {
+fn probe_tiff_dims(bytes: &[u8]) -> Option<(PixelType, bool, bool, u16, u32, u32)> {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("bioformats_oib_dims_{}.tif", rand_suffix(bytes)));
     std::fs::write(&tmp, bytes).ok()?;
@@ -1130,6 +1225,72 @@ fn rand_suffix(bytes: &[u8]) -> u64 {
         .take(16)
         .fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
     pid ^ (len << 16) ^ h
+}
+
+fn fv1000_plane_channel(meta: &ImageMetadata, plane_index: u32) -> u32 {
+    fv1000_zct_coords(meta, plane_index).1
+}
+
+fn fv1000_zct_coords(meta: &ImageMetadata, plane_index: u32) -> (u32, u32, u32) {
+    let size_z = meta.size_z.max(1);
+    let size_c = meta.size_c.max(1);
+    let size_t = meta.size_t.max(1);
+    let axes: &[char] = match meta.dimension_order {
+        DimensionOrder::XYZCT => &['Z', 'C', 'T'],
+        DimensionOrder::XYZTC => &['Z', 'T', 'C'],
+        DimensionOrder::XYCZT => &['C', 'Z', 'T'],
+        DimensionOrder::XYCTZ => &['C', 'T', 'Z'],
+        DimensionOrder::XYTCZ => &['T', 'C', 'Z'],
+        DimensionOrder::XYTZC => &['T', 'Z', 'C'],
+    };
+    let mut rem = plane_index;
+    let mut z = 0;
+    let mut c = 0;
+    let mut t = 0;
+    for axis in axes.iter().rev() {
+        match axis {
+            'Z' => {
+                z = rem % size_z;
+                rem /= size_z;
+            }
+            'C' => {
+                c = rem % size_c;
+                rem /= size_c;
+            }
+            'T' => {
+                t = rem % size_t;
+                rem /= size_t;
+            }
+            _ => {}
+        }
+    }
+    (z, c, t)
+}
+
+fn fv1000_default_ome_planes(
+    meta: &ImageMetadata,
+    delta_t_step: f64,
+) -> Vec<crate::common::ome_metadata::OmePlane> {
+    let mut planes = Vec::with_capacity(meta.image_count as usize);
+    for plane in 0..meta.image_count {
+        let (the_z, the_c, the_t) = fv1000_zct_coords(meta, plane);
+        planes.push(crate::common::ome_metadata::OmePlane {
+            the_z,
+            the_c,
+            the_t,
+            delta_t: Some(delta_t_step * plane as f64),
+            ..Default::default()
+        });
+    }
+    planes
+}
+
+fn fv1000_empty_lut() -> LookupTable {
+    LookupTable {
+        red: vec![0; 65_536],
+        green: vec![0; 65_536],
+        blue: vec![0; 65_536],
+    }
 }
 
 impl FormatReader for Fv1000Reader {
@@ -1188,7 +1349,11 @@ impl FormatReader for Fv1000Reader {
         self.planes.clear();
         self.physical_size_x = None;
         self.physical_size_y = None;
+        self.physical_size_z = None;
+        self.time_increment = None;
         self.channels.clear();
+        self.lut_names.clear();
+        self.luts.clear();
         Ok(())
     }
 
@@ -1240,8 +1405,27 @@ impl FormatReader for Fv1000Reader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
+    fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if !meta.is_indexed || self.luts.is_empty() {
+            return Ok(None);
+        }
+        let channel = fv1000_plane_channel(meta, plane_index) as usize;
+        Ok(self
+            .luts
+            .get(channel)
+            .cloned()
+            .or_else(|| self.luts.first().cloned()))
+    }
+
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::ome_metadata::OmeMetadata;
+        use crate::common::ome_metadata::{
+            create_lsid, OmeDetector, OmeDichroic, OmeFilter, OmeInstrument, OmeLightSource,
+            OmeMetadata, OmeObjective,
+        };
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let img = ome.images.get_mut(0)?;
@@ -1256,8 +1440,18 @@ impl FormatReader for Fv1000Reader {
         if let Some(y) = self.physical_size_y {
             img.physical_size_y = Some(y);
         }
-        // Z size defaults to 1.0 µm (FV1000Reader ~1022-1036).
-        img.physical_size_z = Some(1.0);
+        // Z/T sizes default to 1.0 when absent, infinite, or singleton
+        // (FV1000Reader ~1022-1036).
+        img.physical_size_z = Some(self.physical_size_z.unwrap_or(1.0));
+        // Java FV1000Reader defaults the time increment to 1 second when the
+        // acquisition metadata is absent or sizeT == 1.
+        let time_increment = self.time_increment.unwrap_or(1.0);
+        img.time_increment = Some(time_increment);
+        if img.planes.is_empty() {
+            img.planes = fv1000_default_ome_planes(meta, time_increment);
+        }
+        img.instrument_ref = Some(0);
+        img.objective_ref = Some(0);
 
         // Active channels in acquisition order map to channelIndex 0..sizeC.
         for (c, channel) in img.channels.iter_mut().enumerate() {
@@ -1267,6 +1461,58 @@ impl FormatReader for Fv1000Reader {
                 channel.excitation_wavelength = src.excitation;
             }
         }
+
+        let graph_channels = self.channels.len().min(meta.size_c as usize);
+        let mut instrument = OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            objectives: vec![OmeObjective {
+                id: Some(create_lsid("Objective", &[0, 0])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for c in 0..graph_channels {
+            let detector_id = create_lsid("Detector", &[0, c]);
+            let light_source_id = create_lsid("LightSource", &[0, c]);
+            let filter_id = create_lsid("Filter", &[0, c]);
+            let em_dichroic_id = create_lsid("Dichroic", &[0, c * 2]);
+            let ex_dichroic_id = create_lsid("Dichroic", &[0, c * 2 + 1]);
+
+            instrument.detectors.push(OmeDetector {
+                id: Some(detector_id.clone()),
+                detector_type: Some("PMT".into()),
+                ..Default::default()
+            });
+            instrument.light_sources.push(OmeLightSource {
+                id: Some(light_source_id.clone()),
+                light_source_type: Some("Laser".into()),
+                wavelength: self.channels.get(c).and_then(|ch| ch.excitation),
+                ..Default::default()
+            });
+            instrument.filters.push(OmeFilter {
+                id: Some(filter_id.clone()),
+                ..Default::default()
+            });
+            instrument.dichroics.push(OmeDichroic {
+                id: Some(em_dichroic_id),
+                ..Default::default()
+            });
+            instrument.dichroics.push(OmeDichroic {
+                id: Some(ex_dichroic_id.clone()),
+                ..Default::default()
+            });
+
+            if let Some(channel) = img.channels.get_mut(c) {
+                channel.detector_ref = Some(detector_id);
+                channel.light_source_settings_id = Some(light_source_id);
+            }
+            if img.light_paths.len() <= c {
+                img.light_paths.resize_with(c + 1, Default::default);
+            }
+            img.light_paths[c].dichroic_id = Some(ex_dichroic_id);
+            img.light_paths[c].emission_filter_ids.push(filter_id);
+        }
+        ome.instruments = vec![instrument];
 
         Some(ome)
     }
@@ -2130,6 +2376,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_fv1000_double_accepts_java_legacy_decimal_text() {
+        assert_eq!(parse_fv1000_double("0,207.0"), Some(0.207));
+        assert_eq!(parse_fv1000_double("211,761.0"), Some(211761.0));
+    }
+
+    #[test]
     fn replace_extension_swaps_pty_for_tif() {
         assert_eq!(replace_extension("s_C001.pty", "pty", "tif"), "s_C001.tif");
         assert_eq!(replace_extension("foo.bar", "pty", "tif"), "foo.bar");
@@ -2256,11 +2508,11 @@ mod tests {
         let tiff = companion.join("plane0.tif");
         let mut tiff_meta = ImageMetadata::default();
         tiff_meta.size_x = 1;
-        tiff_meta.size_y = 1;
+        tiff_meta.size_y = 2;
         tiff_meta.pixel_type = PixelType::Uint16;
         tiff_meta.bits_per_pixel = 16;
         tiff_meta.image_count = 1;
-        ImageWriter::save(&tiff, &tiff_meta, &[vec![0, 0]]).unwrap();
+        ImageWriter::save(&tiff, &tiff_meta, &[vec![0, 0, 0, 0]]).unwrap();
 
         std::fs::write(
             companion.join("plane0.pty"),
@@ -2269,13 +2521,60 @@ mod tests {
         .unwrap();
         std::fs::write(
             &root,
-            "[ProfileSaveInfo]\nIniFileName0=plane0.pty\n[Axis 0 Parameters Common]\nAxisCode=X\nMaxSize=1\n[Axis 1 Parameters Common]\nAxisCode=Y\nMaxSize=1\n[Reference Image Parameter]\nImageDepth=2\nValidBitCounts=12\n",
+            "[ProfileSaveInfo]\nIniFileName0=plane0.pty\n[Axis 0 Parameters Common]\nAxisCode=X\nMaxSize=1\n[Axis 1 Parameters Common]\nAxisCode=Y\nMaxSize=2\n[Reference Image Parameter]\nImageDepth=2\nValidBitCounts=12\n",
         )
         .unwrap();
 
         let mut reader = Fv1000Reader::new();
         reader.set_id(&root).unwrap();
         assert_eq!(reader.metadata().bits_per_pixel, 10);
+
+        let _ = std::fs::remove_file(root);
+        let _ = std::fs::remove_dir_all(companion);
+    }
+
+    #[test]
+    fn fv1000_lut_sets_indexed_and_maps_java_bgr_entries() {
+        let root = temp_path("lut_indexed.oif");
+        let companion = root.with_file_name(format!(
+            "{}.files",
+            root.file_stem().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&companion).unwrap();
+
+        let tiff = companion.join("plane0.tif");
+        let mut tiff_meta = ImageMetadata::default();
+        tiff_meta.size_x = 1;
+        tiff_meta.size_y = 1;
+        tiff_meta.pixel_type = PixelType::Uint16;
+        tiff_meta.bits_per_pixel = 16;
+        tiff_meta.image_count = 1;
+        ImageWriter::save(&tiff, &tiff_meta, &[vec![0, 0]]).unwrap();
+
+        std::fs::write(
+            companion.join("plane0.pty"),
+            "[File Info]\nDataName=plane0.tif\n",
+        )
+        .unwrap();
+        let mut lut = vec![0u8; 65_536 * 4];
+        let q = 7 * 4;
+        lut[q] = 1;
+        lut[q + 1] = 2;
+        lut[q + 2] = 3;
+        std::fs::write(companion.join("palette.lut"), lut).unwrap();
+        std::fs::write(
+            &root,
+            "[ProfileSaveInfo]\nIniFileName0=plane0.pty\nLutFileName0=palette.lut\n[Axis 0 Parameters Common]\nAxisCode=X\nMaxSize=1\n[Axis 1 Parameters Common]\nAxisCode=Y\nMaxSize=1\n[Reference Image Parameter]\nImageDepth=2\nValidBitCounts=16\n",
+        )
+        .unwrap();
+
+        let mut reader = Fv1000Reader::new();
+        reader.set_id(&root).unwrap();
+        assert!(reader.metadata().is_indexed);
+        let table = reader.lookup_table(0).unwrap().unwrap();
+        assert_eq!(table.red[7], 3 * 257);
+        assert_eq!(table.green[7], 2 * 257);
+        assert_eq!(table.blue[7], 257);
 
         let _ = std::fs::remove_file(root);
         let _ = std::fs::remove_dir_all(companion);

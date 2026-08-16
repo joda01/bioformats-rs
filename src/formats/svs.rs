@@ -8,14 +8,15 @@
 use std::path::Path;
 
 use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
-use crate::common::error::Result;
+use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, MetadataValue};
 use crate::common::reader::FormatReader;
 
 pub struct SvsReader {
     inner: crate::tiff::TiffReader,
-    /// Java `setFlattenedResolutions`; defaults to `true` (Java's library-wide
-    /// default), matching this reader's prior unconditional behavior.
+    public_series: Vec<(usize, usize)>,
+    current_public_series: usize,
+    current_public_metadata: Option<ImageMetadata>,
     flattened_resolutions: bool,
 }
 
@@ -23,8 +24,49 @@ impl SvsReader {
     pub fn new() -> Self {
         SvsReader {
             inner: crate::tiff::TiffReader::new(),
+            public_series: Vec::new(),
+            current_public_series: 0,
+            current_public_metadata: None,
             flattened_resolutions: true,
         }
+    }
+
+    fn rebuild_public_series(&mut self) -> Result<()> {
+        self.public_series.clear();
+        for (series_index, series) in self.inner.series_list().iter().enumerate() {
+            let resolution_count = series.metadata.resolution_count.max(1) as usize;
+            if self.flattened_resolutions {
+                for resolution in 0..resolution_count {
+                    self.public_series.push((series_index, resolution));
+                }
+            } else {
+                self.public_series.push((series_index, 0));
+            }
+        }
+        self.set_public_series(0)
+    }
+
+    fn set_public_series(&mut self, series: usize) -> Result<()> {
+        let &(logical_series, resolution) = self
+            .public_series
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        self.inner.set_series(logical_series)?;
+        self.inner.set_resolution(resolution)?;
+        let mut meta = self.inner.metadata_at(logical_series, resolution)?;
+        if self.flattened_resolutions {
+            meta.resolution_count = 1;
+        }
+        self.current_public_series = series;
+        self.current_public_metadata = Some(meta);
+        Ok(())
+    }
+
+    fn current_inner_resolution(&self) -> usize {
+        self.public_series
+            .get(self.current_public_series)
+            .map(|&(_, resolution)| resolution)
+            .unwrap_or(0)
     }
 
     /// Mirror Java `SVSReader.isThisType(String, true)`: when suffix detection
@@ -74,12 +116,17 @@ impl SvsReader {
             return;
         }
 
-        // Parse |key=value pairs
+        // Parse |key=value pairs. Java appends repeated Dye values to
+        // dyeNames, so keep those separately from the one-value metadata map.
         let mut vendor_meta = std::collections::HashMap::new();
+        let mut dye_names = Vec::new();
         for part in desc.split('|').skip(1) {
             if let Some((key, val)) = part.split_once('=') {
                 let key = key.trim().to_string();
                 let val = val.trim().to_string();
+                if key == "Dye" {
+                    dye_names.push(val.clone());
+                }
                 vendor_meta.insert(key, MetadataValue::String(val));
             }
         }
@@ -107,6 +154,38 @@ impl SvsReader {
                 s.metadata
                     .series_metadata
                     .insert(format!("aperio.{}", k), v);
+            }
+            for (i, name) in dye_names.iter().enumerate() {
+                s.metadata.series_metadata.insert(
+                    format!("aperio.Dye.{i}"),
+                    MetadataValue::String(name.clone()),
+                );
+                s.metadata.series_metadata.insert(
+                    format!("channel.{i}.name"),
+                    MetadataValue::String(name.clone()),
+                );
+            }
+            if let Some(MetadataValue::String(value)) =
+                s.metadata.series_metadata.get("aperio.Emission Wavelength")
+            {
+                if let Ok(wave) = value.parse::<f64>() {
+                    s.metadata.series_metadata.insert(
+                        "channel.0.emission_wavelength".into(),
+                        MetadataValue::Float(wave),
+                    );
+                }
+            }
+            if let Some(MetadataValue::String(value)) = s
+                .metadata
+                .series_metadata
+                .get("aperio.Excitation Wavelength")
+            {
+                if let Ok(wave) = value.parse::<f64>() {
+                    s.metadata.series_metadata.insert(
+                        "channel.0.excitation_wavelength".into(),
+                        MetadataValue::Float(wave),
+                    );
+                }
             }
             // Store magnification
             if let Some(m) = mag {
@@ -236,6 +315,7 @@ impl FormatReader for PyramidTiffReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
+        self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path)?;
         self.init_standard_metadata();
         Ok(())
@@ -342,6 +422,7 @@ impl FormatReader for SvsReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
+        self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path)?;
         // Aperio SVS stores its pyramid as the main IFD chain (differently
         // sized IFDs). TiffReader splits these into separate series by default;
@@ -354,36 +435,31 @@ impl FormatReader for SvsReader {
             .unwrap_or(false);
         if is_svs {
             self.inner.regroup_as_svs_pyramid()?;
-            // Java's default ImageReader exposes each SVS pyramid resolution as
-            // its own top-level series, followed by label/macro extras; callers
-            // that requested setFlattenedResolutions(false) keep one series per
-            // image instead, with levels reachable via resolution_count().
-            if self.flattened_resolutions {
-                let _ = self.inner.flatten_resolutions_into_series();
-            }
         }
         self.parse_aperio_metadata();
-        Ok(())
-    }
-
-    fn set_flattened_resolutions(&mut self, flattened: bool) {
-        self.flattened_resolutions = flattened;
+        self.rebuild_public_series()
     }
 
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.inner.close()?;
+        self.public_series.clear();
+        self.current_public_series = 0;
+        self.current_public_metadata = None;
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.public_series.len()
     }
     fn set_series(&mut self, series: usize) -> Result<()> {
-        self.inner.set_series(series)
+        self.set_public_series(series)
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_public_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.current_public_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner.open_bytes(plane_index)
@@ -406,7 +482,13 @@ impl FormatReader for SvsReader {
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
-        self.inner.compressed_level_info(plane_index, level)
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "SVS flattened public series expose one resolution level".into(),
+            });
+        }
+        self.inner
+            .compressed_level_info(plane_index, self.current_inner_resolution() as u32)
     }
     fn read_compressed_tile(
         &mut self,
@@ -416,17 +498,63 @@ impl FormatReader for SvsReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        self.inner
-            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
+        if level != 0 {
+            return Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range (max 0)"
+            )));
+        }
+        self.inner.read_compressed_tile(
+            plane_index,
+            self.current_inner_resolution() as u32,
+            col,
+            row,
+            preferred_modes,
+        )
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.inner.resolution_count()
+        }
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        if self.flattened_resolutions {
+            if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::Format(format!(
+                    "resolution level {level} out of range (max 0)"
+                )))
+            }
+        } else {
+            self.inner.set_resolution(level)?;
+            let &(logical_series, _) = self.public_series.get(self.current_public_series).ok_or(
+                BioFormatsError::SeriesOutOfRange(self.current_public_series),
+            )?;
+            self.current_public_metadata = Some(self.inner.metadata_at(logical_series, level)?);
+            Ok(())
+        }
     }
     fn resolution(&self) -> usize {
-        self.inner.resolution()
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.inner.resolution()
+        }
+    }
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.public_series.is_empty() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        self.inner.set_flattened_resolutions(flattened)?;
+        Ok(())
     }
 
     /// One OME image per series, named like Java `SVSReader.initMetadataStore`:
@@ -437,13 +565,14 @@ impl FormatReader for SvsReader {
     /// calibration. Each image has a single RGB channel (SamplesPerPixel =
     /// channel count).
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
-        let series = self.inner.series_list();
-        if series.is_empty() {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeChannel, OmeImage, OmeInstrument, OmeMetadata, OmeObjective, OmePlane,
+        };
+        if self.public_series.is_empty() {
             return None;
         }
         // Aperio MPP (micrometres per pixel) lives on the first series.
-        let mpp = series.first().and_then(|s| {
+        let mpp = self.inner.series_list().first().and_then(|s| {
             s.metadata
                 .series_metadata
                 .get("pixel.size.um")
@@ -453,36 +582,72 @@ impl FormatReader for SvsReader {
                     _ => None,
                 })
         });
-        let images = series
+        let images = self
+            .public_series
             .iter()
             .enumerate()
-            .map(|(i, s)| {
-                let m = &s.metadata;
+            .map(|(i, &(logical_series, resolution))| {
+                let mut owned_meta = self
+                    .inner
+                    .metadata_at(logical_series, resolution)
+                    .unwrap_or_else(|_| self.inner.series_list()[logical_series].metadata.clone());
+                owned_meta.resolution_count = 1;
+                let m = &owned_meta;
                 let (px, py) = if i == 0 { (mpp, mpp) } else { (None, None) };
-                let name = match m.series_metadata.get("svs.image_type") {
-                    Some(MetadataValue::String(kind)) if kind == "label" => {
-                        Some("label image".to_string())
-                    }
-                    Some(MetadataValue::String(kind)) if kind == "macro" => {
-                        Some("macro image".to_string())
-                    }
-                    _ if i == 0 => Some(String::new()),
-                    _ => Some(format!("Series {}", i + 1)),
+                let name = Some(format!("Series {}", i + 1));
+                let mut channel = OmeChannel {
+                    samples_per_pixel: m.size_c.max(1),
+                    ..Default::default()
                 };
+                let prefix = "channel.0";
+                if let Some(MetadataValue::String(name)) =
+                    m.series_metadata.get(&format!("{prefix}.name"))
+                {
+                    channel.name = Some(name.clone());
+                }
+                if let Some(MetadataValue::Float(wave)) = m
+                    .series_metadata
+                    .get(&format!("{prefix}.emission_wavelength"))
+                {
+                    if *wave > 0.0 {
+                        channel.emission_wavelength = Some(*wave);
+                    }
+                }
+                if let Some(MetadataValue::Float(wave)) = m
+                    .series_metadata
+                    .get(&format!("{prefix}.excitation_wavelength"))
+                {
+                    if *wave > 0.0 {
+                        channel.excitation_wavelength = Some(*wave);
+                    }
+                }
                 OmeImage {
                     name,
                     physical_size_x: px,
                     physical_size_y: py,
-                    channels: vec![OmeChannel {
-                        samples_per_pixel: m.size_c.max(1),
+                    channels: vec![channel],
+                    planes: vec![OmePlane {
+                        the_z: 0,
+                        the_c: 0,
+                        the_t: 0,
                         ..Default::default()
                     }],
+                    instrument_ref: Some(0),
+                    objective_ref: Some(0),
                     ..Default::default()
                 }
             })
             .collect();
         Some(OmeMetadata {
             images,
+            instruments: vec![OmeInstrument {
+                id: Some(create_lsid("Instrument", &[0])),
+                objectives: vec![OmeObjective {
+                    id: Some(create_lsid("Objective", &[0, 0])),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
             ..Default::default()
         })
     }
@@ -669,9 +834,80 @@ mod pyramid_tiff_tests {
         d
     }
 
+    fn build_svs_pyramid_tiff() -> Vec<u8> {
+        let ifds = [
+            (4u32, 4u32, "Aperio Image|MPP=0.25", vec![0x11u8; 16]),
+            (2u32, 2u32, "Aperio Image", vec![0x22u8; 4]),
+            (1u32, 1u32, "label image", vec![0x33u8]),
+            (1u32, 1u32, "macro image", vec![0x44u8]),
+        ];
+        let ifd_size = 2 + 10 * 12 + 4;
+        let ifd0_off: u32 = 8;
+        let desc0_off: u32 = ifd0_off + (ifd_size * ifds.len()) as u32;
+        let desc1_off: u32 = desc0_off + ifds[0].2.len() as u32 + 1;
+        let desc2_off: u32 = desc1_off + ifds[1].2.len() as u32 + 1;
+        let desc3_off: u32 = desc2_off + ifds[2].2.len() as u32 + 1;
+        let px0_off: u32 = desc3_off + ifds[3].2.len() as u32 + 1;
+        let px1_off: u32 = px0_off + ifds[0].3.len() as u32;
+        let px2_off: u32 = px1_off + ifds[1].3.len() as u32;
+        let px3_off: u32 = px2_off + ifds[2].3.len() as u32;
+
+        let mut d: Vec<u8> = Vec::new();
+        d.extend_from_slice(b"II");
+        push_u16(&mut d, 42);
+        push_u32(&mut d, ifd0_off);
+
+        for (i, (w, h, desc, pixels)) in ifds.iter().enumerate() {
+            let next = if i + 1 < ifds.len() {
+                ifd0_off + ((i + 1) * ifd_size) as u32
+            } else {
+                0
+            };
+            let desc_off = match i {
+                0 => desc0_off,
+                1 => desc1_off,
+                2 => desc2_off,
+                _ => desc3_off,
+            };
+            let px_off = match i {
+                0 => px0_off,
+                1 => px1_off,
+                2 => px2_off,
+                _ => px3_off,
+            };
+
+            push_u16(&mut d, 10);
+            push_long(&mut d, tag::IMAGE_WIDTH, *w);
+            push_long(&mut d, tag::IMAGE_LENGTH, *h);
+            push_short(&mut d, tag::BITS_PER_SAMPLE, 8);
+            push_short(&mut d, tag::COMPRESSION, 1);
+            push_short(&mut d, tag::PHOTOMETRIC_INTERPRETATION, 1);
+            push_ascii_at_offset(&mut d, tag::IMAGE_DESCRIPTION, desc, desc_off);
+            push_long(&mut d, tag::TILE_WIDTH, *w);
+            push_long(&mut d, tag::TILE_LENGTH, *h);
+            push_long(&mut d, tag::TILE_OFFSETS, px_off);
+            push_long(&mut d, tag::TILE_BYTE_COUNTS, pixels.len() as u32);
+            push_u32(&mut d, next);
+        }
+
+        for (_, _, desc, _) in &ifds {
+            d.extend_from_slice(desc.as_bytes());
+            d.push(0);
+        }
+        for (_, _, _, pixels) in &ifds {
+            d.extend_from_slice(pixels);
+        }
+        d
+    }
+
     fn build_svs_with_label_macro_tiff() -> Vec<u8> {
         let ifds = [
-            (2u32, 2u32, "Aperio Image|MPP=0.25", vec![1u8, 2, 3, 4]),
+            (
+                2u32,
+                2u32,
+                "Aperio Image|MPP=0.25|Dye=DAPI|Emission Wavelength=461|Excitation Wavelength=358",
+                vec![1u8, 2, 3, 4],
+            ),
             (1u32, 1u32, "label image", vec![5u8]),
             (1u32, 1u32, "macro image", vec![6u8]),
         ];
@@ -821,6 +1057,43 @@ mod pyramid_tiff_tests {
     }
 
     #[test]
+    fn svs_pyramid_exposes_flattened_resolution_series_like_java_default() {
+        let svs = build_svs_pyramid_tiff();
+        let path = std::env::temp_dir().join(format!("aperio_pyramid_{}.svs", std::process::id()));
+        std::fs::write(&path, &svs).unwrap();
+
+        let mut reader = SvsReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(
+            reader.series_count(),
+            4,
+            "full resolution, sub-resolution, label, and macro public series"
+        );
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 4));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x11; 16]);
+
+        assert!(reader.set_resolution(1).is_err());
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x22; 4]);
+
+        reader.set_series(2).unwrap();
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x33]);
+
+        reader.set_series(3).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x44]);
+
+        reader.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn svs_rgb_pixels_are_not_channel_separated_twice() {
         let svs = build_svs_rgb_tiff();
         let path = std::env::temp_dir().join(format!("aperio_rgb_{}.svs", std::process::id()));
@@ -935,7 +1208,7 @@ mod pyramid_tiff_tests {
         // levels reachable via resolution_count()/set_resolution(); label and
         // macro remain their own series either way.
         let mut grouped = SvsReader::new();
-        grouped.set_flattened_resolutions(false);
+        grouped.set_flattened_resolutions(false).unwrap();
         grouped.set_id(&path).unwrap();
         assert_eq!(grouped.series_count(), 3);
         assert_eq!(grouped.resolution_count(), 2);
@@ -947,7 +1220,7 @@ mod pyramid_tiff_tests {
     }
 
     #[test]
-    fn svs_ome_names_match_java_label_macro_names() {
+    fn svs_ome_names_match_java_flattened_default_series_names() {
         let svs = build_svs_with_label_macro_tiff();
         let path =
             std::env::temp_dir().join(format!("aperio_label_macro_{}.svs", std::process::id()));
@@ -964,8 +1237,37 @@ mod pyramid_tiff_tests {
             .collect();
         assert_eq!(
             names,
-            vec![Some(""), Some("label image"), Some("macro image")]
+            vec![Some("Series 1"), Some("Series 2"), Some("Series 3")]
         );
+        let channel = &ome.images[0].channels[0];
+        assert_eq!(channel.name.as_deref(), Some("DAPI"));
+        assert_eq!(channel.emission_wavelength, Some(461.0));
+        assert_eq!(channel.excitation_wavelength, Some(358.0));
+
+        reader.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn svs_regrouped_series_do_not_inherit_nikon_raw_marker() {
+        let svs = build_svs_with_label_macro_tiff();
+        let path =
+            std::env::temp_dir().join(format!("aperio_no_nikon_marker_{}.svs", std::process::id()));
+        std::fs::write(&path, &svs).unwrap();
+
+        let mut reader = SvsReader::new();
+        reader.set_id(&path).unwrap();
+
+        for s in 0..reader.series_count() {
+            reader.set_series(s).unwrap();
+            assert!(
+                !reader
+                    .metadata()
+                    .series_metadata
+                    .contains_key("NikonRawSubIFD"),
+                "SVS series {s} must not carry Nikon-only SubIFD metadata"
+            );
+        }
 
         reader.close().unwrap();
         let _ = std::fs::remove_file(&path);

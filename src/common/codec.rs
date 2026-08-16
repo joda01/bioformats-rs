@@ -248,29 +248,86 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
 /// order. TIFF callers pass the IFD endianness; standalone callers keep the
 /// historical little-endian output through [`decompress_jpeg2000`].
 pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> Result<Vec<u8>> {
-    use jpeg2k::Image as J2kImage;
-    let image = J2kImage::from_bytes(data)
-        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
-    let components = image.components();
+    decompress_jpeg2000_with_endianness_and_reduce(data, little_endian, 0)
+}
+
+/// Decompress JPEG 2000 data at a reduced wavelet resolution. `reduce == 0`
+/// decodes full resolution; `reduce == 1` decodes dimensions divided by 2, etc.
+pub fn decompress_jpeg2000_with_endianness_and_reduce(
+    data: &[u8],
+    little_endian: bool,
+    reduce: u32,
+) -> Result<Vec<u8>> {
+    let format = openjp2::Format::detect(data).unwrap_or(openjp2::Format::J2k);
+    let image = openjp2::Decoder::new(format)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?
+        .decode_slice(data)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?;
+    pack_jpeg2000_image(&image, little_endian, reduce)
+}
+
+/// Decompress a rectangular JPEG 2000 region. The rectangle is expressed in
+/// full-resolution codestream coordinates; callers are responsible for mapping
+/// format-level tile/plane coordinates into that space.
+pub fn decompress_jpeg2000_region_with_endianness(
+    data: &[u8],
+    little_endian: bool,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::Codec(
+            "JPEG 2000 region: zero-sized region".into(),
+        ));
+    }
+    let format = openjp2::Format::detect(data).unwrap_or(openjp2::Format::J2k);
+    if let Ok(image) = openjp2::Decoder::new(format)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 region: {e:?}")))?
+        .decode_region_slice(data, x, y, width, height)
+    {
+        if image.width == width && image.height == height {
+            return pack_jpeg2000_image(&image, little_endian, 0);
+        }
+    }
+
+    let full = openjp2::Decoder::new(format)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 region fallback: {e:?}")))?
+        .decode_slice(data)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 region fallback: {e:?}")))?;
+    let packed = pack_jpeg2000_image(&full, little_endian, 0)?;
+    crop_packed_jpeg2000_region(&packed, &full, x, y, width, height)
+}
+
+fn pack_jpeg2000_image(
+    image: &openjp2::Image,
+    little_endian: bool,
+    reduce: u32,
+) -> Result<Vec<u8>> {
+    let components = &image.components;
     if components.is_empty() {
         return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
     }
-    let width = components[0].width() as usize;
-    let height = components[0].height() as usize;
+    let full_width = components[0].width as usize;
+    let full_height = components[0].height as usize;
+    let divisor = 1usize.checked_shl(reduce).unwrap_or(usize::MAX).max(1);
+    let width = (full_width / divisor).max(1);
+    let height = (full_height / divisor).max(1);
     let n_components = components.len();
-    let first_precision = components[0].precision();
+    let first_precision = components[0].precision;
     let component_pixels = width.checked_mul(height).ok_or_else(|| {
         BioFormatsError::Codec("JPEG 2000: component dimensions are too large".into())
     })?;
 
     for (idx, component) in components.iter().enumerate() {
-        if component.precision() != first_precision {
+        if component.precision != first_precision {
             return Err(BioFormatsError::Codec(format!(
                 "JPEG 2000: unsupported component precision mismatch at component {idx}"
             )));
         }
-        let component_width = component.width() as usize;
-        let component_height = component.height() as usize;
+        let component_width = component.width as usize;
+        let component_height = component.height as usize;
         if component_width == 0 || component_height == 0 {
             return Err(BioFormatsError::Codec(format!(
                 "JPEG 2000: component {idx} has zero geometry"
@@ -281,7 +338,7 @@ pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> 
             .ok_or_else(|| {
                 BioFormatsError::Codec(format!("JPEG 2000: component {idx} geometry is too large"))
             })?;
-        if component.data().len() < own_pixels {
+        if component.data.len() < own_pixels {
             return Err(BioFormatsError::Codec(format!(
                 "JPEG 2000: component {idx} data is shorter than its geometry"
             )));
@@ -289,10 +346,10 @@ pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> 
     }
 
     // Determine bytes per sample from the first component's precision.
-    // jpeg2k component samples are i32; narrow by taking the low `bps` bytes of
-    // the two's-complement representation (preserving sign bits for signed data),
-    // rather than casting i32 -> u16 which would silently drop bits for any
-    // precision > 16 that happened to fall into the 2-byte path.
+    // openjpeg2-pure-rs component samples are i32; narrow by taking the low
+    // `bps` bytes of the two's-complement representation (preserving sign bits
+    // for signed data), rather than casting i32 -> u16 which would silently
+    // drop bits for any precision > 16 that happened to fall into the 2-byte path.
     let prec = first_precision as usize;
     let bps = if prec <= 8 {
         1
@@ -312,11 +369,13 @@ pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> 
         for x in 0..width {
             for c in 0..n_components {
                 let component = &components[c];
-                let cw = component.width() as usize;
-                let ch = component.height() as usize;
-                let cx = x * cw / width;
-                let cy = y * ch / height;
-                let val = component.data()[cy * cw + cx];
+                let cw = component.width as usize;
+                let ch = component.height as usize;
+                let target_cw = (cw / divisor).max(1);
+                let target_ch = (ch / divisor).max(1);
+                let cx = (x * cw / target_cw).min(cw - 1);
+                let cy = (y * ch / target_ch).min(ch - 1);
+                let val = component.data[cy * cw + cx];
                 if little_endian {
                     let bytes = val.to_le_bytes();
                     out.extend_from_slice(&bytes[..bps]);
@@ -330,16 +389,70 @@ pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> 
     Ok(out)
 }
 
+fn crop_packed_jpeg2000_region(
+    packed: &[u8],
+    image: &openjp2::Image,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let components = &image.components;
+    if components.is_empty() {
+        return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
+    }
+    let image_width = components[0].width;
+    let image_height = components[0].height;
+    let x2 = x
+        .checked_add(width)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: width overflows".into()))?;
+    let y2 = y
+        .checked_add(height)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: height overflows".into()))?;
+    if x2 > image_width || y2 > image_height {
+        return Err(BioFormatsError::Codec(
+            "JPEG 2000 region: outside image bounds".into(),
+        ));
+    }
+    let precision = components[0].precision as usize;
+    let bytes_per_sample = if precision <= 8 {
+        1
+    } else if precision <= 16 {
+        2
+    } else {
+        4
+    };
+    let bytes_per_pixel = components
+        .len()
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: pixel size overflows".into()))?;
+    let row_bytes = image_width as usize * bytes_per_pixel;
+    let crop_row_bytes = width as usize * bytes_per_pixel;
+    let expected_full = row_bytes
+        .checked_mul(image_height as usize)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000 region: image size overflows".into()))?;
+    if packed.len() < expected_full {
+        return Err(BioFormatsError::Codec(
+            "JPEG 2000 region: decoded full image is shorter than expected".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity(crop_row_bytes * height as usize);
+    for row in y as usize..y2 as usize {
+        let start = row * row_bytes + x as usize * bytes_per_pixel;
+        out.extend_from_slice(&packed[start..start + crop_row_bytes]);
+    }
+    Ok(out)
+}
+
 /// Compress an interleaved pixel plane to a lossless JPEG 2000 (`.jp2`) file.
 ///
-/// Requires the `jpeg2000-write` feature (default-on). Uses the pure-Rust
-/// `openjp2` encoder (OpenJPEG port). Mirrors the lossless output semantics of
-/// Java `JPEG2000Writer` (`irreversible = 0`, single quality layer, rate 0).
+/// Uses the pure-Rust `openjp2` encoder (OpenJPEG translation). Mirrors the
+/// lossless output semantics of Java `JPEG2000Writer` (`irreversible = 0`,
+/// single quality layer, rate 0).
 ///
 /// `pixels` is component-interleaved (e.g. `RGBRGB…` for 3 components), little-
 /// endian, with `precision` bits per sample stored in `(precision+7)/8` bytes.
-/// The result is written directly to `path` (the openjp2 file stream).
-#[cfg(feature = "jpeg2000-write")]
+/// The result is written directly to `path`.
 pub fn compress_jpeg2000(
     pixels: &[u8],
     width: u32,
@@ -349,10 +462,6 @@ pub fn compress_jpeg2000(
     signed: bool,
     path: &std::path::Path,
 ) -> Result<()> {
-    use openjp2::image::opj_image_cmptparm_t;
-    use openjp2::openjpeg::*;
-    use std::ffi::CString;
-
     if width == 0 || height == 0 || components == 0 {
         return Err(BioFormatsError::Codec(
             "JPEG 2000 encode: zero-sized image".into(),
@@ -411,124 +520,36 @@ pub fn compress_jpeg2000(
         }
     }
 
-    let color_space = if nc == 1 {
-        OPJ_CLRSPC_GRAY
-    } else {
-        OPJ_CLRSPC_SRGB
-    };
-    let sgnd = if signed { 1u32 } else { 0u32 };
-
-    // SAFETY: every successfully created openjpeg resource is destroyed before
-    // returning on every path (success or error) below.
-    unsafe {
-        let mut cmptparms = vec![
-            opj_image_cmptparm_t {
-                dx: 1,
-                dy: 1,
-                w: width,
-                h: height,
-                x0: 0,
-                y0: 0,
-                prec: precision,
-                bpp: precision,
-                sgnd,
-            };
-            nc
-        ];
-
-        let image = opj_image_create(components, cmptparms.as_mut_ptr(), color_space);
-        if image.is_null() {
-            return Err(BioFormatsError::Codec(
-                "JPEG 2000 encode: opj_image_create failed".into(),
-            ));
-        }
-
-        let cleanup_image = |image: *mut opj_image_t| opj_image_destroy(image);
-
-        (*image).x0 = 0;
-        (*image).y0 = 0;
-        (*image).x1 = width;
-        (*image).y1 = height;
-
-        // Copy the de-interleaved samples into each component's data buffer.
-        let comps = std::slice::from_raw_parts_mut((*image).comps, nc);
-        for c in 0..nc {
-            let dst = comps[c].data;
-            if dst.is_null() {
-                cleanup_image(image);
-                return Err(BioFormatsError::Codec(
-                    "JPEG 2000 encode: component data buffer is null".into(),
-                ));
-            }
-            std::ptr::copy_nonoverlapping(planes[c].as_ptr(), dst, npix);
-        }
-
-        let mut params: opj_cparameters_t = std::mem::zeroed();
-        opj_set_default_encoder_parameters(&mut params);
-        // Lossless: rate-distortion allocation with a single layer at rate 0.
-        params.tcp_numlayers = 1;
-        params.tcp_rates[0] = 0.0;
-        params.cp_disto_alloc = 1;
-        params.irreversible = 0;
-        params.cod_format = 1; // JP2
-                               // Number of resolution levels must satisfy 2^(numres-1) <= min(w, h).
-        let min_dim = w.min(h) as i32;
-        let mut numres = params.numresolution;
-        while numres > 1 && (1i32 << (numres - 1)) > min_dim {
-            numres -= 1;
-        }
-        params.numresolution = numres;
-
-        let codec = opj_create_compress(OPJ_CODEC_JP2);
-        if codec.is_null() {
-            cleanup_image(image);
-            return Err(BioFormatsError::Codec(
-                "JPEG 2000 encode: opj_create_compress failed".into(),
-            ));
-        }
-
-        if opj_setup_encoder(codec, &mut params, image) == 0 {
-            opj_destroy_codec(codec);
-            cleanup_image(image);
-            return Err(BioFormatsError::Codec(
-                "JPEG 2000 encode: opj_setup_encoder failed".into(),
-            ));
-        }
-
-        let path_str = path.to_str().ok_or_else(|| {
-            opj_destroy_codec(codec);
-            cleanup_image(image);
-            BioFormatsError::Codec("JPEG 2000 encode: non-UTF-8 output path".into())
-        })?;
-        let c_path = CString::new(path_str).map_err(|_| {
-            opj_destroy_codec(codec);
-            cleanup_image(image);
-            BioFormatsError::Codec("JPEG 2000 encode: path contains NUL".into())
-        })?;
-
-        let stream = opj_stream_create_default_file_stream(c_path.as_ptr(), 0);
-        if stream.is_null() {
-            opj_destroy_codec(codec);
-            cleanup_image(image);
-            return Err(BioFormatsError::Codec(
-                "JPEG 2000 encode: could not open output stream".into(),
-            ));
-        }
-
-        let mut ok = opj_start_compress(codec, image, stream) != 0;
-        ok = ok && opj_encode(codec, stream) != 0;
-        ok = ok && opj_end_compress(codec, stream) != 0;
-
-        opj_stream_destroy(stream);
-        opj_destroy_codec(codec);
-        cleanup_image(image);
-
-        if !ok {
-            return Err(BioFormatsError::Codec(
-                "JPEG 2000 encode: openjp2 compression failed".into(),
-            ));
-        }
-    }
+    let components = planes
+        .into_iter()
+        .map(|plane| {
+            openjp2::ImageComponent::new(width, height, precision as u8, signed, plane)
+                .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 encode: {e:?}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let image = openjp2::Image::new(
+        width,
+        height,
+        if nc == 1 {
+            openjp2::ColorSpace::Greyscale
+        } else {
+            openjp2::ColorSpace::Srgb
+        },
+        components,
+    )
+    .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 encode: {e:?}")))?;
+    let bytes = openjp2::Encoder::encode(
+        &image,
+        &openjp2::EncodeOptions {
+            format: openjp2::Format::Jp2,
+            irreversible: false,
+            use_mct: false,
+            rates: vec![0.0],
+            ..Default::default()
+        },
+    )
+    .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000 encode: {e:?}")))?;
+    std::fs::write(path, bytes).map_err(BioFormatsError::Io)?;
 
     Ok(())
 }
@@ -3396,8 +3417,6 @@ mod tests {
         let err = decompress_png(&[0u8; 16]).expect_err("garbage must fail");
         assert!(matches!(err, BioFormatsError::Codec(_)));
     }
-
-    #[cfg(feature = "jpeg2000-write")]
     #[test]
     fn jpeg2000_roundtrip_gray8_is_lossless() {
         let w = 16u32;
@@ -3412,8 +3431,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(decoded, pixels, "lossless grayscale JP2 must round-trip");
     }
-
-    #[cfg(feature = "jpeg2000-write")]
     #[test]
     fn jpeg2000_roundtrip_rgb8_is_lossless() {
         let w = 10u32;
@@ -3434,7 +3451,74 @@ mod tests {
         assert_eq!(decoded, pixels, "lossless RGB JP2 must round-trip");
     }
 
-    #[cfg(feature = "jpeg2000-write")]
+    fn crop_interleaved(
+        pixels: &[u8],
+        width: u32,
+        channels: usize,
+        bytes_per_sample: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let bytes_per_pixel = channels * bytes_per_sample;
+        let row_bytes = width as usize * bytes_per_pixel;
+        let crop_row_bytes = w as usize * bytes_per_pixel;
+        let mut out = Vec::with_capacity(crop_row_bytes * h as usize);
+        for row in y as usize..(y + h) as usize {
+            let start = row * row_bytes + x as usize * bytes_per_pixel;
+            out.extend_from_slice(&pixels[start..start + crop_row_bytes]);
+        }
+        out
+    }
+
+    #[test]
+    fn jpeg2000_region_decode_matches_full_decode_crop_gray8() {
+        let width = 16u32;
+        let height = 12u32;
+        let pixels: Vec<u8> = (0..(width * height)).map(|i| (i % 251) as u8).collect();
+        let path =
+            std::env::temp_dir().join(format!("bf_jp2_region_gray_{}.jp2", std::process::id()));
+        compress_jpeg2000(&pixels, width, height, 1, 8, false, &path).expect("encode gray JP2");
+        let bytes = std::fs::read(&path).expect("read JP2 back");
+        let full = decompress_jpeg2000(&bytes).expect("decode full JP2");
+        let region =
+            decompress_jpeg2000_region_with_endianness(&bytes, true, 3, 2, 7, 5).expect("region");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            region,
+            crop_interleaved(&full, width, 1, 1, 3, 2, 7, 5),
+            "region decode must match full decode plus crop"
+        );
+    }
+
+    #[test]
+    fn jpeg2000_region_decode_matches_full_decode_crop_rgb8() {
+        let width = 10u32;
+        let height = 8u32;
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for i in 0..(width * height) {
+            pixels.push((i % 256) as u8);
+            pixels.push(((i * 3) % 256) as u8);
+            pixels.push(((i * 7) % 256) as u8);
+        }
+        let path =
+            std::env::temp_dir().join(format!("bf_jp2_region_rgb_{}.jp2", std::process::id()));
+        compress_jpeg2000(&pixels, width, height, 3, 8, false, &path).expect("encode RGB JP2");
+        let bytes = std::fs::read(&path).expect("read JP2 back");
+        let full = decompress_jpeg2000(&bytes).expect("decode full JP2");
+        let region =
+            decompress_jpeg2000_region_with_endianness(&bytes, true, 1, 1, 6, 4).expect("region");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            region,
+            crop_interleaved(&full, width, 3, 1, 1, 1, 6, 4),
+            "RGB region decode must match full decode plus crop"
+        );
+    }
+
     #[test]
     fn jpeg2000_roundtrip_gray16_is_lossless() {
         let w = 8u32;
@@ -3455,8 +3539,6 @@ mod tests {
             "lossless 16-bit grayscale JP2 must round-trip"
         );
     }
-
-    #[cfg(feature = "jpeg2000-write")]
     #[test]
     fn jpeg2000_decode_can_emit_big_endian_samples() {
         let w = 4u32;

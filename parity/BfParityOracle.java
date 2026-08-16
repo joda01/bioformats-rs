@@ -19,10 +19,14 @@
 ///
 /// Memory: whole-plane reads are ONLY done for planes whose full size is
 /// <= FULL_PLANE_MAX (4 MiB), so peak RAM stays bounded even for deep stacks or
-/// gigapixel whole-slide levels (those only get the bounded 256² crops).
+/// gigapixel whole-slide levels (those only get the bounded 256² crops). Large
+/// whole planes emit CRC/length only; raw base64 is capped so deep stacks do not
+/// build multi-GB JSON lines.
 ///
 /// Usage: java -cp bioformats_package.jar:<dir> BfParityOracle <path> [maxPlanes] [region]
 ///   maxPlanes default 8, region (square edge) default 256.
+///   BIOFORMATS_RS_JAVA_PARITY_FULL_B64_MAX can raise/lower the raw full-plane
+///   base64 cap for focused tolerant comparisons. The default stays small.
 
 import loci.formats.ImageReader;
 import loci.formats.FormatTools;
@@ -37,6 +41,10 @@ public class BfParityOracle {
     /// Keeps peak RAM and JSON-line size bounded; larger planes get only the
     /// bounded 256² crops.
     static final long FULL_PLANE_MAX = 4L << 20; // 4 MiB
+    /// Max full-plane size for embedding raw bytes in JSON for tolerant
+    /// comparison. Larger planes still get an exact whole-plane CRC.
+    static final long FULL_PLANE_B64_MAX =
+        envLong("BIOFORMATS_RS_JAVA_PARITY_FULL_B64_MAX", 256L << 10); // 256 KiB
 
     public static void main(String[] args) {
         DebugTools.setRootLevel("ERROR");
@@ -123,10 +131,12 @@ public class BfParityOracle {
                             byte[] full = reader.openBytes(p);
                             CRC32 fcrc = new CRC32();
                             fcrc.update(full);
-                            String fb64 = java.util.Base64.getEncoder().encodeToString(full);
                             entry.append(",\"fullLen\":").append(full.length)
-                                 .append(",\"fullCrc\":").append(fcrc.getValue())
-                                 .append(",\"fullB64\":\"").append(fb64).append("\"");
+                                 .append(",\"fullCrc\":").append(fcrc.getValue());
+                            if (full.length <= FULL_PLANE_B64_MAX) {
+                                String fb64 = java.util.Base64.getEncoder().encodeToString(full);
+                                entry.append(",\"fullB64\":\"").append(fb64).append("\"");
+                            }
                         } catch (Throwable t) {
                             entry.append(",\"fullError\":").append(jstr(t.toString()));
                         }
@@ -203,6 +213,19 @@ public class BfParityOracle {
         }
         sb.append("],\"summary\":");
         sb.append(omeSummaryJson(ome));
+        sb.append(",\"instruments\":[");
+        int instrumentCount = intValRaw(() -> ome.getInstrumentCount());
+        for (int i = 0; i < instrumentCount; i++) {
+            final int ii = i;
+            if (i > 0) sb.append(",");
+            sb.append("{\"objectiveCount\":").append(intValRaw(() -> ome.getObjectiveCount(ii)));
+            sb.append(",\"detectorCount\":").append(intValRaw(() -> ome.getDetectorCount(ii)));
+            sb.append(",\"lightSourceCount\":").append(intValRaw(() -> ome.getLightSourceCount(ii)));
+            sb.append(",\"filterCount\":").append(intValRaw(() -> ome.getFilterCount(ii)));
+            sb.append(",\"dichroicCount\":").append(intValRaw(() -> ome.getDichroicCount(ii)));
+            sb.append("}");
+        }
+        sb.append("]");
         sb.append("}");
         return sb.toString();
     }
@@ -317,5 +340,16 @@ public class BfParityOracle {
             }
         }
         return b.append("\"").toString();
+    }
+
+    private static long envLong(String name, long fallback) {
+        String value = System.getenv(name);
+        if (value == null || value.isEmpty()) return fallback;
+        try {
+            long parsed = Long.parseLong(value);
+            return parsed >= 0 ? parsed : fallback;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 }

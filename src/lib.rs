@@ -69,5 +69,5 @@ pub use metadata::{
 };
 pub use pixel::PixelType;
 pub use reader::FormatReader;
-pub use registry::ImageReader;
+pub use registry::{ImageReader, ImageReaderOptions};
 pub use writer_registry::ImageWriter;

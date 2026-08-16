@@ -471,7 +471,7 @@ fn build_metadata(p: &mut SeriesParse, parsed_proc_file: bool) -> Result<ImageMe
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
         image_count: size_z * size_c * size_t,
         dimension_order: DimensionOrder::XYCTZ,
         is_rgb: false,
@@ -954,7 +954,7 @@ impl MicroCtVffReader {
         self.meta.is_interleaved = false;
         // VFF pixel data is big-endian.
         self.meta.is_little_endian = false;
-        self.meta.bits_per_pixel = (self.meta.pixel_type.bytes_per_sample() * 8) as u8;
+        self.meta.bits_per_pixel = (self.meta.pixel_type.bytes_per_sample() * 8) as u16;
         self.meta.resolution_count = 1;
 
         // Parse extra values from metadata files.

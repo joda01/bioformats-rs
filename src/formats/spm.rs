@@ -1993,7 +1993,7 @@ impl FormatReader for PicoQuantReader {
             size_c,
             size_t: frames,
             pixel_type,
-            bits_per_pixel,
+            bits_per_pixel: bits_per_pixel.max(0) as u16,
             image_count,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb: false,
@@ -2236,7 +2236,7 @@ fn parse_strict_spm_raw(
             size_c: 1,
             size_t: planes,
             pixel_type,
-            bits_per_pixel,
+            bits_per_pixel: bits_per_pixel.max(0) as u16,
             image_count: planes,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb: false,
@@ -2515,7 +2515,7 @@ impl FormatReader for RhkReader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel,
+            bits_per_pixel: bits_per_pixel.into(),
             image_count: 1,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -2888,9 +2888,6 @@ impl FormatReader for QuesantReader {
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
         _header.starts_with(Self::STRICT_RAW_MAGIC)
-            || _header[.._header.len().min(Self::MAX_HEADER_SIZE)]
-                .windows(8)
-                .any(|w| &w[..4] == b"IMAG")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -3004,6 +3001,29 @@ impl FormatReader for QuesantReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let image = ome.images.get_mut(0)?;
+        if let Some(MetadataValue::String(comment)) =
+            meta.series_metadata.get("Quesant description")
+        {
+            image.description = Some(comment.clone());
+        }
+        if let Some(MetadataValue::String(date)) =
+            meta.series_metadata.get("Quesant acquisition date")
+        {
+            image.acquisition_date = Some(date.clone());
+        }
+        if let Some(MetadataValue::Float(scan_size)) = meta.series_metadata.get("Scan size") {
+            if scan_size.is_finite() && *scan_size > 0.0 {
+                image.physical_size_x = Some(*scan_size / meta.size_x.max(1) as f64);
+                image.physical_size_y = Some(*scan_size / meta.size_y.max(1) as f64);
+            }
+        }
+        Some(ome)
     }
 
     fn resolution_count(&self) -> usize {
@@ -3626,7 +3646,7 @@ impl FormatReader for VgSamReader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel,
+            bits_per_pixel: bits_per_pixel.into(),
             image_count: 1,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -4171,6 +4191,26 @@ impl FormatReader for SeikoReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let image = ome.images.get_mut(0)?;
+        if let Some(MetadataValue::String(comment)) = meta.series_metadata.get("Comment") {
+            image.description = Some(comment.clone());
+        }
+        if let Some(MetadataValue::Float(x_size)) = meta.series_metadata.get("X size") {
+            if x_size.is_finite() && *x_size > 0.0 {
+                image.physical_size_x = Some(*x_size);
+            }
+        }
+        if let Some(MetadataValue::Float(y_size)) = meta.series_metadata.get("Y size") {
+            if y_size.is_finite() && *y_size > 0.0 {
+                image.physical_size_y = Some(*y_size);
+            }
+        }
+        Some(ome)
+    }
+
     fn resolution_count(&self) -> usize {
         1
     }
@@ -4190,6 +4230,101 @@ impl FormatReader for SeikoReader {
 // ===========================================================================
 // Binary reader — PicoQuant Bin (.bin FLIM histogram cube)
 // ===========================================================================
+
+#[cfg(test)]
+mod native_spm_parity_tests {
+    use super::*;
+
+    fn temp_path(name: &str, ext: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bioformats_spm_{}_{}.{}",
+            std::process::id(),
+            name,
+            ext
+        ))
+    }
+
+    fn put_c_string(data: &mut [u8], offset: usize, value: &str) {
+        let bytes = value.as_bytes();
+        data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        data[offset + bytes.len()] = 0;
+    }
+
+    fn write_quesant_var(data: &mut [u8], slot: usize, code: &[u8; 4], offset: usize) {
+        let pos = slot * 8;
+        data[pos..pos + 4].copy_from_slice(code);
+        data[pos + 4..pos + 8].copy_from_slice(&(offset as u32).to_le_bytes());
+    }
+
+    #[test]
+    fn quesant_ome_projection_matches_java_metadata_store_fields() {
+        let path = temp_path("quesant_ome", "afm");
+        let mut data = vec![0u8; 256];
+        write_quesant_var(&mut data, 0, b"IMAG", 128);
+        write_quesant_var(&mut data, 1, b"SDES", 180);
+        write_quesant_var(&mut data, 2, b"DESC", 200);
+        write_quesant_var(&mut data, 3, b"DATE", 220);
+        write_quesant_var(&mut data, 4, b"HARD", 64);
+        data[64..68].copy_from_slice(&(8.0f32).to_le_bytes());
+        put_c_string(&mut data, 180, "first");
+        data[200..202].copy_from_slice(&(6u16).to_le_bytes());
+        data[202..208].copy_from_slice(b"second");
+        put_c_string(&mut data, 220, "Jan 02 2024 03:04:05");
+        data[128..130].copy_from_slice(&(4u16).to_le_bytes());
+        for i in 0..16u16 {
+            let pos = 130 + (i as usize) * 2;
+            data[pos..pos + 2].copy_from_slice(&i.to_le_bytes());
+        }
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = QuesantReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.description.as_deref(), Some("first second"));
+        assert_eq!(
+            image.acquisition_date.as_deref(),
+            Some("Jan 02 2024 03:04:05")
+        );
+        assert_eq!(image.physical_size_x, Some(2.0));
+        assert_eq!(image.physical_size_y, Some(2.0));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn quesant_byte_probe_does_not_overclaim_stray_imag_bytes() {
+        let reader = QuesantReader::new();
+        assert!(reader.is_this_type_by_bytes(QuesantReader::STRICT_RAW_MAGIC));
+        assert!(!reader.is_this_type_by_bytes(b"not-a-quesant-IMAG-header"));
+    }
+
+    #[test]
+    fn seiko_ome_projection_matches_java_metadata_store_fields() {
+        let path = temp_path("seiko_ome", "xqd");
+        let mut data = vec![0u8; SeikoReader::HEADER_SIZE + 8];
+        put_c_string(&mut data, 40, "seiko scan");
+        data[156..160].copy_from_slice(&(0.25f32).to_le_bytes());
+        data[164..168].copy_from_slice(&(0.5f32).to_le_bytes());
+        data[1402..1404].copy_from_slice(&(2i16).to_le_bytes());
+        data[1404..1406].copy_from_slice(&(2i16).to_le_bytes());
+        for (i, value) in [1u16, 2, 3, 4].iter().enumerate() {
+            let pos = SeikoReader::HEADER_SIZE + i * 2;
+            data[pos..pos + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = SeikoReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.description.as_deref(), Some("seiko scan"));
+        assert_eq!(image.physical_size_x, Some(0.25));
+        assert_eq!(image.physical_size_y, Some(0.5));
+
+        std::fs::remove_file(path).ok();
+    }
+}
 
 /// PicoQuant `.bin` FLIM reader.
 ///

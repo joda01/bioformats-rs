@@ -26,6 +26,954 @@ use crate::common::region::crop_full_plane;
 
 const HEADER_SIZE: u64 = 4100;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpeHeaderType {
+    Long,
+    Int,
+    Short,
+    Byte,
+    String,
+    LongArray,
+    IntArray,
+    ShortArray,
+    RoiArray,
+}
+
+#[derive(Clone, Copy)]
+struct SpeHeaderEntry {
+    name: &'static str,
+    offset: usize,
+    kind: SpeHeaderType,
+}
+
+const SPE_HEADER_ENTRIES: &[SpeHeaderEntry] = &[
+    SpeHeaderEntry {
+        name: "CONTROLLER_VER",
+        offset: 0,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "LOGIC_OUTPUT",
+        offset: 2,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "AMP_MODE",
+        offset: 4,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "X_DIMENSION",
+        offset: 6,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "MODE",
+        offset: 8,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "EXPOSURE",
+        offset: 10,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "VIRTUAL_XDIM",
+        offset: 14,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "VIRTUAL_YDIM",
+        offset: 16,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "Y_DIMENSION",
+        offset: 18,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "DATE",
+        offset: 20,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "VIRTUAL_CHIP",
+        offset: 30,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "NOSCAN",
+        offset: 34,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "DETECTOR_TEMP",
+        offset: 36,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "DETECTOR_TYPE",
+        offset: 40,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "WIDTH",
+        offset: 42,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "TRIGGER_DIODE",
+        offset: 44,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "DELAY_TIME",
+        offset: 46,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "SHUTTER_CTRL",
+        offset: 50,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ABSORB_LIVE",
+        offset: 52,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ABSORB_MODE",
+        offset: 54,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "CAN_VRTL_CHIP",
+        offset: 56,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "THRESHOLD_MIN_LIVE",
+        offset: 58,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "THRESHOLD_MIN_VAL",
+        offset: 60,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "THRESHOLD_MAX_LIVE",
+        offset: 64,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "THRESHOLD_MAX_VAL",
+        offset: 66,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "AUTO_SPECTRO",
+        offset: 70,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_CENTER_WAVELEN",
+        offset: 72,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_GLUE_FLAG",
+        offset: 76,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_GLUE_START",
+        offset: 78,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_GLUE_END",
+        offset: 82,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_GLUE_MIN_OVRLP",
+        offset: 86,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_GLUE_FINAL_RES",
+        offset: 90,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSAR_TYPE",
+        offset: 94,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "CHIP_FLAG",
+        offset: 96,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "X_PRE_PIXELS",
+        offset: 98,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "X_POST_PIXELS",
+        offset: 100,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "Y_PRE_PIXELS",
+        offset: 102,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "Y_POST_PIXELS",
+        offset: 104,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ASYNCH",
+        offset: 106,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "DATATYPE",
+        offset: 108,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "PULSER_MODE",
+        offset: 110,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "PULSER_CHIP_ACCUMS",
+        offset: 112,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_REP_EXP",
+        offset: 114,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_REP_WIDTH",
+        offset: 118,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_REP_DELAY",
+        offset: 122,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_START_WIDTH",
+        offset: 126,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_END_WIDTH",
+        offset: 130,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_START_DELAY",
+        offset: 134,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_END_DELAY",
+        offset: 138,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_INC_MODE",
+        offset: 142,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "PI_MAX_USED",
+        offset: 144,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "PI_MAX_MODE",
+        offset: 146,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "PI_MAX_GAIN",
+        offset: 148,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "BCKGRND_SUB",
+        offset: 150,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "PI_MAX_2NS_BRD",
+        offset: 152,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "MIN_BLK",
+        offset: 154,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "NUM_IN_BLK",
+        offset: 156,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_MIRR_LOC",
+        offset: 158,
+        kind: SpeHeaderType::ShortArray,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_SLIT_LOC",
+        offset: 162,
+        kind: SpeHeaderType::ShortArray,
+    },
+    SpeHeaderEntry {
+        name: "CUS_TIMING_FLAG",
+        offset: 170,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "EXP_TIME_LOCAL",
+        offset: 172,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "EXP_TIME_UTC",
+        offset: 179,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "EXPOSURE_UNITS",
+        offset: 186,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ADC_OFFSET",
+        offset: 188,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ADC_RATE",
+        offset: 190,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ADC_TYPE",
+        offset: 192,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ADC_RESOLUTION",
+        offset: 194,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ADC_BIT_ADJUST",
+        offset: 196,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "GAIN",
+        offset: 198,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "COMMENTS",
+        offset: 200,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "GEOMETRIC",
+        offset: 600,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "X_LABEL",
+        offset: 602,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "CLEANS",
+        offset: 618,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "LFLOAT",
+        offset: 620,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_MIRROR_POS",
+        offset: 622,
+        kind: SpeHeaderType::ShortArray,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_SLIT_POS",
+        offset: 626,
+        kind: SpeHeaderType::IntArray,
+    },
+    SpeHeaderEntry {
+        name: "AUTO_CLEAN",
+        offset: 642,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "CONT_CLEAN",
+        offset: 644,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ABSORB_STRIP_NUM",
+        offset: 646,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_SLIT_POS_UNITS",
+        offset: 648,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_GROOVES",
+        offset: 650,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "SOURCE_COMP",
+        offset: 654,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "HEIGHT",
+        offset: 656,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SCRAMBLE",
+        offset: 658,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "LEXPOS",
+        offset: 660,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "EXT_TRIGGER",
+        offset: 662,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "LNOSCAN",
+        offset: 664,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "ACCUMULATIONS",
+        offset: 668,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "READOUT_TIME",
+        offset: 672,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "TRIGGER_MODE",
+        offset: 676,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "XML_OFFSET",
+        offset: 678,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "VERSION",
+        offset: 688,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "TYPE",
+        offset: 704,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "FLAT_FIELD",
+        offset: 706,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "KINETIC_TRIGGER",
+        offset: 724,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "DATA_LABEL",
+        offset: 726,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "SPARE4",
+        offset: 742,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_FILENAME",
+        offset: 1178,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "ABSORB_FILENAME",
+        offset: 1298,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "EXP_REPEATS",
+        offset: 1418,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "EXP_ACCUMS",
+        offset: 1422,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "YT_FLAG",
+        offset: 1426,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "VERT_CLOCK_SPEED",
+        offset: 1428,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "HW_ACCUM",
+        offset: 1432,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "STORE_SYNC",
+        offset: 1434,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "BLEMISH_APPLIED",
+        offset: 1436,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "COSMIC_APPLIED",
+        offset: 1438,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "COSMIC_TYPE",
+        offset: 1440,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "COSMIC_THRESHOLD",
+        offset: 1442,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "NUM_FRAMES",
+        offset: 1446,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "MAX_INTENSITY",
+        offset: 1450,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "MIN_INTENSITY",
+        offset: 1454,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "Y_LABEL",
+        offset: 1458,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "SHUTTER_TYPE",
+        offset: 1474,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SHUTTER_COMP",
+        offset: 1476,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "READOUT_MODE",
+        offset: 1480,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "WINDOW_SIZE",
+        offset: 1482,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "CLOCK_SPEED",
+        offset: 1484,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "INTERFACE_TYPE",
+        offset: 1486,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "NUM_EXP_ROIS",
+        offset: 1488,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "CONTROLLER_NUM",
+        offset: 1506,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "SOFTWARE",
+        offset: 1508,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "NUM_ROIS",
+        offset: 1510,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "ROI_BEGIN",
+        offset: 1512,
+        kind: SpeHeaderType::RoiArray,
+    },
+    SpeHeaderEntry {
+        name: "FLAT_FIELD_FILE",
+        offset: 1632,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "BACKGROUND_FILE",
+        offset: 1752,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "BLEMISH_FILE",
+        offset: 1872,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "HEADER_VER",
+        offset: 1992,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "YT_INFO",
+        offset: 1996,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "WINVIEW_ID",
+        offset: 2996,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "X_SCALING_OFFSET",
+        offset: 3000,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "X_SCALING_FACTOR",
+        offset: 3008,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "X_SCALING_UNIT",
+        offset: 3016,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_RESERVED",
+        offset: 3017,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_SPECIAL_STRING",
+        offset: 3018,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "X_RESERVED2",
+        offset: 3058,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "X_CALIB_VALID",
+        offset: 3098,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_INPUT_UNIT",
+        offset: 3099,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_POLYNUM_UNIT",
+        offset: 3100,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_POLYNUM_ORDER",
+        offset: 3101,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_CALIB_COUNT",
+        offset: 3102,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_PIXEL_POSITION",
+        offset: 3103,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_CALIB_VALUE",
+        offset: 3183,
+        kind: SpeHeaderType::LongArray,
+    },
+    SpeHeaderEntry {
+        name: "X_POLYNUM_COEFF",
+        offset: 3263,
+        kind: SpeHeaderType::LongArray,
+    },
+    SpeHeaderEntry {
+        name: "X_LASER_POS",
+        offset: 3311,
+        kind: SpeHeaderType::LongArray,
+    },
+    SpeHeaderEntry {
+        name: "X_RESERVED3",
+        offset: 3319,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "X_CALIB_FLAG",
+        offset: 3320,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "X_CALIB_LABEL",
+        offset: 3321,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "X_EXPANSION",
+        offset: 3402,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "Y_SCALING_OFFSET",
+        offset: 3489,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "Y_SCALING_FACTOR",
+        offset: 3497,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "Y_SCALING_UNIT",
+        offset: 3505,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_RESERVED",
+        offset: 3506,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "Y_SPECIAL_STRING",
+        offset: 3507,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "Y_RESERVED2",
+        offset: 3547,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_CALIB_VALID",
+        offset: 3587,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_INPUT_UNIT",
+        offset: 3588,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_POLYNUM_UNIT",
+        offset: 3589,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_POLYNUM_ORDER",
+        offset: 3590,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_CALIB_COUNT",
+        offset: 3591,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_PIXEL_POSITION",
+        offset: 3592,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_CALIB_VALUE",
+        offset: 3672,
+        kind: SpeHeaderType::LongArray,
+    },
+    SpeHeaderEntry {
+        name: "Y_POLYNUM_COEFF",
+        offset: 3752,
+        kind: SpeHeaderType::LongArray,
+    },
+    SpeHeaderEntry {
+        name: "Y_LASER_POS",
+        offset: 3800,
+        kind: SpeHeaderType::LongArray,
+    },
+    SpeHeaderEntry {
+        name: "Y_RESERVED3",
+        offset: 3808,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "Y_CALIB_FLAG",
+        offset: 3809,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "Y_CALIB_LABEL",
+        offset: 3810,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "Y_EXPANSION",
+        offset: 3891,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "INTENSITY_STRING",
+        offset: 3978,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "SPARE6",
+        offset: 4018,
+        kind: SpeHeaderType::String,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_TYPE",
+        offset: 4043,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "SPEC_MODEL",
+        offset: 4044,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_BURST_USED",
+        offset: 4045,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_BURST_COUNT",
+        offset: 4046,
+        kind: SpeHeaderType::Int,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_BURST_PERIOD",
+        offset: 4050,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_BRACKET_USED",
+        offset: 4058,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_BRACKET_TYPE",
+        offset: 4059,
+        kind: SpeHeaderType::Byte,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_TIMECONST_FAST",
+        offset: 4060,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_AMP_FAST",
+        offset: 4068,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_TIMECONST_SLOW",
+        offset: 4076,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "PULSE_AMP_SLOW",
+        offset: 4084,
+        kind: SpeHeaderType::Long,
+    },
+    SpeHeaderEntry {
+        name: "ANALOG_GAIN",
+        offset: 4092,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "AV_GAIN_USED",
+        offset: 4094,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "AV_GAIN",
+        offset: 4096,
+        kind: SpeHeaderType::Short,
+    },
+    SpeHeaderEntry {
+        name: "LAST_VALUE",
+        offset: 4098,
+        kind: SpeHeaderType::Short,
+    },
+];
+
 fn r_i16_le(b: &[u8], off: usize) -> i16 {
     i16::from_le_bytes([b[off], b[off + 1]])
 }
@@ -46,6 +994,164 @@ fn r_i64_le(b: &[u8], off: usize) -> i64 {
         b[off + 6],
         b[off + 7],
     ])
+}
+fn r_u8(b: &[u8], off: usize) -> u8 {
+    b[off]
+}
+
+fn spe_string(hdr: &[u8], off: usize, len: usize) -> String {
+    String::from_utf8_lossy(&hdr[off..off + len])
+        .trim()
+        .to_string()
+}
+
+fn spe_array_string<T: std::fmt::Display>(values: &[T]) -> String {
+    let body = values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{body}]")
+}
+
+fn spe_header_entry_len(index: usize) -> usize {
+    SPE_HEADER_ENTRIES
+        .get(index + 1)
+        .map(|next| next.offset - SPE_HEADER_ENTRIES[index].offset)
+        .unwrap_or(HEADER_SIZE as usize - SPE_HEADER_ENTRIES[index].offset)
+}
+
+fn populate_spe_header_metadata(hdr: &[u8], meta: &mut HashMap<String, MetadataValue>) {
+    for (index, entry) in SPE_HEADER_ENTRIES.iter().enumerate() {
+        if entry.kind == SpeHeaderType::RoiArray {
+            continue;
+        }
+        let len = spe_header_entry_len(index);
+        match entry.kind {
+            SpeHeaderType::Int => {
+                let value = r_i32_le(hdr, entry.offset);
+                if value > 0 {
+                    meta.insert(entry.name.into(), MetadataValue::Int(value as i64));
+                }
+            }
+            SpeHeaderType::Short => {
+                let value = r_u16_le(hdr, entry.offset);
+                if value > 0 {
+                    meta.insert(entry.name.into(), MetadataValue::Int(value as i64));
+                }
+            }
+            SpeHeaderType::Long => {
+                let value = r_i64_le(hdr, entry.offset);
+                if value > 0 {
+                    meta.insert(entry.name.into(), MetadataValue::Int(value));
+                }
+            }
+            SpeHeaderType::Byte => {
+                let value = r_u8(hdr, entry.offset);
+                if value > 0 {
+                    meta.insert(entry.name.into(), MetadataValue::Int(value as i64));
+                }
+            }
+            SpeHeaderType::String => {
+                let value = spe_string(hdr, entry.offset, len);
+                if !value.is_empty() {
+                    meta.insert(entry.name.into(), MetadataValue::String(value));
+                }
+            }
+            SpeHeaderType::IntArray => {
+                let values: Vec<i32> = (0..len / 4)
+                    .map(|i| r_i32_le(hdr, entry.offset + i * 4))
+                    .collect();
+                if values.iter().any(|v| *v > 0) {
+                    meta.insert(
+                        entry.name.into(),
+                        MetadataValue::String(spe_array_string(&values)),
+                    );
+                }
+            }
+            SpeHeaderType::ShortArray => {
+                let values: Vec<u16> = (0..len / 2)
+                    .map(|i| r_u16_le(hdr, entry.offset + i * 2))
+                    .collect();
+                if values.iter().any(|v| *v > 0) {
+                    meta.insert(
+                        entry.name.into(),
+                        MetadataValue::String(spe_array_string(&values)),
+                    );
+                }
+            }
+            SpeHeaderType::LongArray => {
+                let values: Vec<i64> = (0..len / 8)
+                    .map(|i| r_i64_le(hdr, entry.offset + i * 8))
+                    .collect();
+                if values.iter().any(|v| *v > 0) {
+                    meta.insert(
+                        entry.name.into(),
+                        MetadataValue::String(spe_array_string(&values)),
+                    );
+                }
+            }
+            SpeHeaderType::RoiArray => {}
+        }
+    }
+}
+
+fn spe_rois(hdr: &[u8]) -> Vec<SpeRoi> {
+    let num_rois = r_u16_le(hdr, 1510) as usize;
+    let max_rois = ((1632usize - 1512usize) / 12).min(num_rois);
+    (0..max_rois)
+        .map(|i| {
+            let off = 1512 + i * 12;
+            SpeRoi {
+                start_x: r_u16_le(hdr, off),
+                end_x: r_u16_le(hdr, off + 2),
+                group_x: r_u16_le(hdr, off + 4),
+                start_y: r_u16_le(hdr, off + 6),
+                end_y: r_u16_le(hdr, off + 8),
+                group_y: r_u16_le(hdr, off + 10),
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct SpeRoi {
+    start_x: u16,
+    end_x: u16,
+    group_x: u16,
+    start_y: u16,
+    end_y: u16,
+    group_y: u16,
+}
+
+fn populate_spe_roi_metadata(hdr: &[u8], meta: &mut HashMap<String, MetadataValue>) {
+    for (index, roi) in spe_rois(hdr).iter().enumerate() {
+        let prefix = format!("ROI {}", index + 1);
+        meta.insert(
+            format!("{prefix} Start X"),
+            MetadataValue::Int(roi.start_x as i64),
+        );
+        meta.insert(
+            format!("{prefix} End X"),
+            MetadataValue::Int(roi.end_x as i64),
+        );
+        meta.insert(
+            format!("{prefix} Group X"),
+            MetadataValue::Int(roi.group_x as i64),
+        );
+        meta.insert(
+            format!("{prefix} Start Y"),
+            MetadataValue::Int(roi.start_y as i64),
+        );
+        meta.insert(
+            format!("{prefix} End Y"),
+            MetadataValue::Int(roi.end_y as i64),
+        );
+        meta.insert(
+            format!("{prefix} Group Y"),
+            MetadataValue::Int(roi.group_y as i64),
+        );
+    }
 }
 
 /// SPE datatype codes
@@ -173,16 +1279,8 @@ impl FormatReader for SpeReader {
         } else {
             positive_i32_dim(raw_numframes, "frame count")?
         };
-        let exposure = r_i32_le(&hdr, 10);
         let header_ver = r_i32_le(&hdr, 1992);
         let xml_offset = r_i64_le(&hdr, 678);
-
-        // Date string (best-effort)
-        let date = std::str::from_utf8(&hdr[20..30])
-            .unwrap_or("")
-            .trim_end_matches('\0')
-            .trim()
-            .to_string();
 
         // Java throws "Invalid pixel type" for unknown datatypes (FLOAT=0,
         // INT32=1, INT16=2, UNINT16=3, UNINT32=4).
@@ -195,13 +1293,8 @@ impl FormatReader for SpeReader {
         validate_spe_layout(xdim, ydim, numframes, pixel_type)?;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        if exposure > 0 {
-            meta_map.insert("EXPOSURE".into(), MetadataValue::Int(exposure as i64));
-        }
-        if !date.is_empty() {
-            meta_map.insert("date".into(), MetadataValue::String(date));
-        }
-        meta_map.insert("HEADER_VER".into(), MetadataValue::Int(header_ver as i64));
+        populate_spe_header_metadata(&hdr, &mut meta_map);
+        populate_spe_roi_metadata(&hdr, &mut meta_map);
 
         // SPE 3.0 XML footer: detected when HEADER_VER >= 3 or XML_OFFSET > 0.
         // Matching SPEReader.java, the binary-header dimensions are authoritative
@@ -229,7 +1322,7 @@ impl FormatReader for SpeReader {
             size_c: 1,
             size_t: numframes,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count: numframes,
             dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
@@ -320,7 +1413,7 @@ impl FormatReader for SpeReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::ome_metadata::OmeMetadata;
+        use crate::common::ome_metadata::{create_lsid, OmeMetadata, OmeROI, OmeShape};
         let meta = self.meta.as_ref()?;
         // SPEReader.java populates pixels only; exposure time is stored as a
         // global metadata int (microseconds, per the SPE spec) and is not mapped
@@ -333,8 +1426,47 @@ impl FormatReader for SpeReader {
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string());
         }
+        let roi_count = spe_metadata_roi_count(meta);
+        for index in 0..roi_count {
+            let prefix = format!("ROI {}", index + 1);
+            let start_x = spe_metadata_i64(meta, &format!("{prefix} Start X"))?;
+            let end_x = spe_metadata_i64(meta, &format!("{prefix} End X"))?;
+            let start_y = spe_metadata_i64(meta, &format!("{prefix} Start Y"))?;
+            let end_y = spe_metadata_i64(meta, &format!("{prefix} End Y"))?;
+            ome.rois.push(OmeROI {
+                id: Some(create_lsid("ROI", &[index])),
+                name: Some(prefix.clone()),
+                shapes: vec![OmeShape::Rectangle {
+                    x: start_x as f64,
+                    y: start_y as f64,
+                    width: (end_x - start_x) as f64,
+                    height: (end_y - start_y) as f64,
+                    the_z: None,
+                    the_t: None,
+                    the_c: None,
+                }],
+            });
+        }
         Some(ome)
     }
+}
+
+fn spe_metadata_i64(meta: &ImageMetadata, key: &str) -> Option<i64> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::Int(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn spe_metadata_roi_count(meta: &ImageMetadata) -> usize {
+    let mut count = 0usize;
+    while meta
+        .series_metadata
+        .contains_key(&format!("ROI {} Start X", count + 1))
+    {
+        count += 1;
+    }
+    count
 }
 
 fn positive_u16_dim(value: u16, label: &str) -> Result<u32> {
@@ -373,6 +1505,8 @@ fn validate_spe_layout(size_x: u32, size_y: u32, frames: u32, pixel_type: PixelT
 #[cfg(test)]
 mod tests {
     use super::SpeReader;
+    use crate::common::metadata::MetadataValue;
+    use crate::common::ome_metadata::OmeShape;
     use crate::common::reader::FormatReader;
 
     #[test]
@@ -381,5 +1515,72 @@ mod tests {
         assert!(!reader.is_this_type_by_bytes(&[0, 1, 2]));
         assert!(reader.is_this_type_by_bytes(&[0, 1, 2, 3]));
         assert!(reader.is_this_type_by_bytes(b"not actually spe"));
+    }
+
+    #[test]
+    fn spe_projects_java_header_metadata_and_roi_rectangles() {
+        let path = std::env::temp_dir().join("bioformats_spe_header_roi.spe");
+        let mut bytes = vec![0u8; 4100];
+        bytes[42..44].copy_from_slice(&10u16.to_le_bytes());
+        bytes[656..658].copy_from_slice(&8u16.to_le_bytes());
+        bytes[108..110].copy_from_slice(&3i16.to_le_bytes());
+        bytes[1446..1450].copy_from_slice(&1i32.to_le_bytes());
+        bytes[10..14].copy_from_slice(&25i32.to_le_bytes());
+        bytes[158..160].copy_from_slice(&4u16.to_le_bytes());
+        bytes[160..162].copy_from_slice(&5u16.to_le_bytes());
+        bytes[172..179].copy_from_slice(b"12:3456");
+        bytes[1510..1512].copy_from_slice(&1u16.to_le_bytes());
+        bytes[1512..1514].copy_from_slice(&2u16.to_le_bytes());
+        bytes[1514..1516].copy_from_slice(&7u16.to_le_bytes());
+        bytes[1516..1518].copy_from_slice(&2u16.to_le_bytes());
+        bytes[1518..1520].copy_from_slice(&3u16.to_le_bytes());
+        bytes[1520..1522].copy_from_slice(&6u16.to_le_bytes());
+        bytes[1522..1524].copy_from_slice(&3u16.to_le_bytes());
+        bytes.extend(std::iter::repeat_n(0, 10 * 8));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = SpeReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("EXPOSURE"),
+            Some(MetadataValue::Int(25))
+        ));
+        assert!(matches!(
+            metadata.get("SPEC_MIRR_LOC"),
+            Some(MetadataValue::String(value)) if value == "[4, 5]"
+        ));
+        assert!(matches!(
+            metadata.get("EXP_TIME_LOCAL"),
+            Some(MetadataValue::String(value)) if value == "12:3456"
+        ));
+        assert!(matches!(
+            metadata.get("ROI 1 Start X"),
+            Some(MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("ROI 1 End Y"),
+            Some(MetadataValue::Int(6))
+        ));
+        assert!(matches!(
+            metadata.get("ROI 1 Group Y"),
+            Some(MetadataValue::Int(3))
+        ));
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.rois.len(), 1);
+        assert_eq!(ome.rois[0].id.as_deref(), Some("ROI:0"));
+        assert_eq!(ome.rois[0].name.as_deref(), Some("ROI 1"));
+        assert!(matches!(
+            ome.rois[0].shapes.as_slice(),
+            [OmeShape::Rectangle {
+                x: 2.0,
+                y: 3.0,
+                width: 5.0,
+                height: 3.0,
+                ..
+            }]
+        ));
+        let _ = std::fs::remove_file(path);
     }
 }

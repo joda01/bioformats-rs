@@ -442,7 +442,7 @@ fn parse_topometrix(path: &Path) -> Result<TopoMetrixHeader> {
         size_c: 1,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: (bps * 8) as u8,
+        bits_per_pixel: (bps * 8) as u16,
         image_count: 1,
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: false,
@@ -490,15 +490,11 @@ impl FormatReader for TopometrixReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // Mirror Java `isThisType`: require at least 6 bytes and a "#R" prefix
-        // (Java reads a 6-char string and checks `startsWith("#R")`).
-        //
-        // NOTE: the Java method has a subtle bug — every code path falls
-        // through to `return false`, so the JVM reader's magic check never
-        // actually succeeds and detection relies on the extension. We diverge
-        // intentionally and honor the documented intent (the "#R" magic),
-        // which is what makes content-based detection useful here.
-        header.len() >= 6 && header.starts_with(b"#R")
+        // Java TopometrixReader.isThisType reads a 6-byte "#R..." probe, then
+        // falls through to `return false`; detection relies on the registered
+        // suffixes. Keep that behavior for reader-selection parity.
+        let _ = header;
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -871,7 +867,7 @@ fn parse_unisoku_hdr(path: &Path) -> Result<UnisokuHeader> {
         size_c: 1,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: (bps * 8) as u8,
+        bits_per_pixel: (bps * 8) as u16,
         image_count: 1,
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: false,
@@ -916,7 +912,10 @@ impl FormatReader for UnisokuReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= b":STM data".len() && &header[..b":STM data".len()] == b":STM data"
+        let block_len = 9.min(header.len());
+        header[..block_len]
+            .windows(b":STM data".len())
+            .any(|window| window == b":STM data")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1195,9 +1194,9 @@ mod tests {
     }
 
     #[test]
-    fn is_this_type_by_bytes_matches_magic() {
+    fn topometrix_byte_probe_matches_java_false_fallthrough() {
         let reader = TopometrixReader::new();
-        assert!(reader.is_this_type_by_bytes(b"#R1.0 stuff"));
+        assert!(!reader.is_this_type_by_bytes(b"#R1.0 stuff"));
         assert!(!reader.is_this_type_by_bytes(b"#X1.0 "));
         assert!(!reader.is_this_type_by_bytes(b"#R")); // too short (<6)
         assert!(!reader.is_this_type_by_bytes(b""));
@@ -1265,6 +1264,7 @@ mod tests {
         let reader = UnisokuReader::new();
         assert!(reader.is_this_type_by_bytes(b":STM data"));
         assert!(reader.is_this_type_by_bytes(b":STM data trailing"));
+        assert!(!reader.is_this_type_by_bytes(b"x:STM data"));
         assert!(!reader.is_this_type_by_bytes(b"xx:STM data"));
         assert!(!reader.is_this_type_by_bytes(b":STM dat"));
     }

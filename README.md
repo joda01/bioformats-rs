@@ -3,12 +3,17 @@
 A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/)
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 
+The Bio-Formats translation tracks [`ome/bioformats`](https://github.com/ome/bioformats)
+at commit `d87eb853f0f8d1496aec29ace384cdc5b963096a`.
+
 The internal Metakit table reader used for Volocity is translated from
 `ome.metakit.MetakitReader` in
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 
+* 2026-08-14: Continued audit for ND2, fixed parity issues. also audit for several other file formats (blocked on test data for remaining ones)
+* 2026-08-13: Broad audit: fixed metadata handling. Translation updated to track latest Bioformats at commit `d87eb853f0f8d1496aec29ace384cdc5b963096a`
 * 2026-08-04: fixed error handling + speed regression
 * 2026-07-15: Translated jpegxr, fixing a bug in it. Now using jpegxr-pure-rs instead as dependency
 * 2026-07-12: For now assumed to be a feature complete translation, tested on real data. API added to also enable extraction of embedded tile raw data (e.g., to avoid lossy conversion)
@@ -329,6 +334,67 @@ real fixtures, or the wrapped upstream library.
 | PCO B16 | `.b16` | Synthetic header and pixel tests. | Raw uint16 PCO camera files. |
 | PicoQuant PTU/PHU | `.ptu` `.phu` `.pqres` | Synthetic metadata/reconstruction tests plus optional real fixture. | Set `BIOFORMATS_RS_PICOQUANT_FIXTURE` for local PTU/PQRes coverage. |
 
+## Intentional deviations from Java Bio-Formats
+
+Everything else in this crate aims to reproduce Bio-Formats' behaviour, including
+its quirks. The entries below **deliberately do not**, because Java loses
+information that is demonstrably present in the file. Each was verified against
+`bioformats_package.jar` before being written, and each is gated so that files
+without the relevant vendor markers behave exactly as Java does.
+
+If you are diffing this crate against Java, these are the differences you should
+expect to see. Do not "fix" them back to parity without reading the rationale.
+
+| Deviation | Java Bio-Formats | This crate | Where |
+|---|---|---|---|
+| LaVision UltraMicroscope stage positions | reports none — `getPlanePositionX(0,0)` throws `IndexOutOfBoundsException`, `getStageLabelX(0)` is null | recovers the per-file stage offset and the acquisition-wide tile layout into `series_metadata` under `LaVision *` keys | [`src/tiff/lavision.rs`](src/tiff/lavision.rs), `tests/lavision_stage_test.rs` |
+
+### LaVision UltraMicroscope stage positions
+
+LaVision's UltraII writes a self-declaring OME-TIFF, so Bio-Formats dispatches to
+`OMETiffReader`, which trusts the OME-XML. That XML has **no `<Plane>` elements
+and no `<StageLabel>`** — the standard slots for stage geometry — so Java
+correctly reports nothing. This is not a Java defect; it is a file that does not
+populate the standard fields.
+
+The positions are nonetheless in the file, as **structured XML** in two
+`<CustomAttributes>` elements in LaVision's own namespace
+(`Schemas/CA/2008-02`) — `OME/Image/CustomAttributes`, holding the stage
+geometry, and `OME/CustomAttributes`, holding a `<PropArray>` of ~844 instrument
+properties. `OMETiffReader` reads the OME schema and walks past both:
+
+```xml
+<Offset Offset_0="-1861.449219" Offset_1="-5300.662598" Offset_2="0.0" .../>
+<TileConfiguration TileConfiguration="3
+..._UltraII[00 x 00]_C00_UltraII Filter0000.ome.tif;;(-4815.699219, 4234.837402, 0.000000)
+..."/>
+```
+
+We parse those out and publish them as `LaVision StagePositionX/Y/Z`,
+`LaVision TileCount`, and `LaVision Tile<N> FileName/PositionX/PositionY/PositionZ`.
+The keys carry a vendor prefix so they cannot collide with anything Java emits,
+and detection requires *both* the `xyz-Table` stage marker and an `<Offset>`
+element — `<Offset>` alone is far too generic to gate on.
+
+Why it is worth the divergence: absolute tile coordinates are not otherwise
+recoverable from these files through any standard OME field. Every file in the
+set repeats the whole `TileConfiguration`, so any single tile can reconstruct
+the mosaic.
+
+**It is not the tile overlap.** That is a separate property,
+`xyz-Table_X_Overlap` / `_Y_Overlap` in the root `PropArray`, and the file states
+it outright (65.650002 um; `xyz-Table_XY_Overlap` = 10 %). Read that property
+rather than deriving overlap from these offsets. The two do agree — tiles
+`[05 x 05]` and `[05 x 06]` differ in `Offset_0` by 590.85 um against a 656.5 um
+tile (404 px x 1.625 um/px), a 10.0 % overlap — which is a useful cross-check,
+not a reason to prefer the derivation.
+
+Real-fixture coverage is opt-in, since the files live outside the repository:
+
+```bash
+BIOFORMATS_RS_LAVISION=1 cargo test --test lavision_stage_test
+```
+
 ## API overview
 
 ### `ImageReader` — auto-detecting reader
@@ -599,6 +665,31 @@ around the whole harness process, so Java RSS includes JVM overhead.
 
 Original benchmark baseline: Java Bio-Formats/Open Microscopy tooling via `bioformats_package.jar` and public Open Microscopy images; this README/scripts do not currently state an exact jar version.
 
+#### JPEG 2000 ETS Real-Data Check
+
+Focused CellSens/VSI benchmark for the JPEG 2000 ETS tile path added on
+2026-08-15:
+
+```bash
+bench/compare_subset.sh --warmup 1 --measure 3 --planes 1 --region 256x256 \
+  --timeout 600 --manifest bench/manifests/jpeg2000-ets-realdata.paths \
+  --out bench/target/jpeg2000-ets-realdata.csv \
+  --markdown bench/target/jpeg2000-ets-realdata.md
+```
+
+The manifest currently covers confirmed real VSI files backed by ETS JPEG 2000
+tiles: the large Joda issue fixture under `/big/henriksson/ome_images/from_joda`
+and the smaller repository VSI fixture. Add standalone JP2/J2K or
+JPEG-2000-compressed TIFF rows here when comparable real fixtures are available.
+
+| Format | Path | Java status | Rust status | Java ms | Rust ms | Rust speedup | Java RSS KiB | Rust RSS KiB | RSS ratio | Bytes J/R | Planes J/R |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| vsi | `/big/henriksson/ome_images/from_joda/haut/Image_045_M5_MEV_Sk3_Zstack_40x_decon.vsi` | ok | ok | 870.139 | 314.992 | 2.762 | 954992 | 18016 | 53.008 | 3099648/3099648 | 21/21 |
+| vsi | `testdata/vsi/HN 485 HNSCC APOBEC3A-1.1000.vsi` | ok | ok | 124.509 | 47.949 | 2.597 | 264944 | 14236 | 18.611 | 1648128/1648128 | 9/9 |
+
+`Rust speedup` and `RSS ratio` are Java divided by Rust. Values below `1.0x`
+mean Rust was slower or used more RSS for that row.
+
 #### Open Microscopy Corpus Screening
 
 Latest sampled real-data speed/RSS screening command:
@@ -695,6 +786,18 @@ summary counts: instruments, objectives, detectors, light sources, filters,
 dichroics, plane metadata entries, ROIs/shapes, plates, wells, well samples, and
 structured annotation counts for annotation types represented by Rust.
 
+Zeiss LSM now maps the source-backed CZ-LSMINFO channel colors/names,
+scan-information instrument graph, timestamp/position plane metadata, and
+rotation/illumination/phase modulo annotations. Single-file
+DimensionM/DimensionP acquisitions are split into Java-style logical series
+with per-series plane offsets, image names, timestamps, and positions. The
+scan-information OME projection follows Java's acquired-before-non-acquired
+subblock ordering so skipped instrument blocks do not shift channel detector or
+filter references. Remaining rich-parity work is fixture- or model-dependent:
+MDB multi-file series grouping, overlay ROI shape projection, application-tag
+experimenter/SIM metadata, and broader multi-position pixel-order fixtures need
+representative files and, for some fields, additional Rust OME model surface.
+
 Pixel parity is evidence by default and becomes a gate with
 `BIOFORMATS_RS_JAVA_PARITY_STRICT=1`. Pixel sampling compares top-left 256x256
 crops for up to 64 planes per series (per-file caps may reduce this for very
@@ -742,6 +845,14 @@ Eliceiri, and Jason R. Swedlow (2010) Metadata matters: access to image data
 in the real world. The Journal of Cell Biology 189(5), 777-782.
 doi: 10.1083/jcb.201004104
 ```
+
+If you use our translation, we recommend that you also cite the precise version you use. If you link to [crates.io](http://crates.io), you can cite the version number;
+but if you link to our Git repository, for reproducibility, it is better that you provide the URL to the repository and the git hash (Github lists it high up on the page as 7 letters, under Code button, e.g. '21751cd')
+
+In addition, we appreciate if you cite the paper below describing the translation approach. If for some reason you struggle with journal citation limits, please prioritizing citing the original software over our translation paper.
+
+> Johan Henriksson. Static analysis-guided agentic AI translation enables Rust as a full stack bioinformatics language. arXiv:2608.13029, 2026. https://doi.org/10.48550/arXiv.2608.13029
+
 
 ## License
 

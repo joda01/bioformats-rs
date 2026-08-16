@@ -4169,7 +4169,7 @@ impl MngReader {
                 size_c: bands,
                 size_t: count,
                 pixel_type: pt,
-                bits_per_pixel: (pt.bytes_per_sample() * 8) as u8,
+                bits_per_pixel: (pt.bytes_per_sample() * 8) as u16,
                 image_count: count,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb: bands > 1,
@@ -5334,7 +5334,7 @@ impl MincReader {
             size_c: 1,
             size_t,
             pixel_type,
-            bits_per_pixel: bits,
+            bits_per_pixel: (bits).into(),
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -5559,7 +5559,7 @@ impl FormatReader for MincReader {
             size_c: 1,
             size_t,
             pixel_type,
-            bits_per_pixel: bits,
+            bits_per_pixel: (bits).into(),
             image_count,
             // Java MINCReader: dimensionOrder = "XYZCT".
             dimension_order: DimensionOrder::XYZCT,
@@ -6128,7 +6128,7 @@ impl OpenlabReader {
                 meta.pixel_type = PixelType::Uint16;
             }
             meta.bits_per_pixel = if meta.pixel_type == PixelType::Uint16 {
-                bits.max(9)
+                bits.max(9).into()
             } else {
                 8
             };
@@ -6723,20 +6723,36 @@ impl FormatReader for OpenlabReader {
 /// - `FF 4F FF 51` — JPEG 2000 codestream (J2C)
 /// - `00 00 00 0C 6A 50 20 20` — JP2 container
 ///
-/// Decodes pixel data using the `jpeg2k` crate (pure-Rust OpenJPEG port).
+/// Decodes pixel data using the pure-Rust OpenJPEG translation.
 pub struct Jpeg2000Reader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    pixel_data: Option<Vec<u8>>,
+    file_data: Option<Vec<u8>>,
+    metas: Vec<ImageMetadata>,
+    current_resolution: usize,
+    pixel_cache: Option<(usize, Vec<u8>)>,
 }
 
 impl Jpeg2000Reader {
     pub fn new() -> Self {
         Jpeg2000Reader {
             path: None,
-            meta: None,
-            pixel_data: None,
+            file_data: None,
+            metas: Vec::new(),
+            current_resolution: 0,
+            pixel_cache: None,
         }
+    }
+
+    fn decode_pixels(&self, reduce: usize) -> Result<Vec<u8>> {
+        let file_data = self
+            .file_data
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        crate::common::codec::decompress_jpeg2000_with_endianness_and_reduce(
+            file_data,
+            false,
+            reduce as u32,
+        )
     }
 }
 
@@ -6773,94 +6789,88 @@ impl FormatReader for Jpeg2000Reader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let file_data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let image = jpeg2k::Image::from_bytes(&file_data)
-            .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
+        let image = openjp2::Decoder::new(
+            openjp2::Format::detect(&file_data).unwrap_or(openjp2::Format::J2k),
+        )
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?
+        .decode(file_data.clone())
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e:?}")))?;
 
-        let components = image.components();
+        let components = &image.components;
         if components.is_empty() {
             return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
         }
 
-        let width = components[0].width() as u32;
-        let height = components[0].height() as u32;
+        let width = components[0].width;
+        let height = components[0].height;
         let n_components = components.len() as u32;
-        let prec = components[0].precision() as u8;
-        let signed = components[0].is_signed();
+        let prec = components[0].precision;
+        let signed = components[0].signed;
         let (pixel_type, bpp) = jpeg2000_pixel_type(prec, signed);
-        let bps = (bpp / 8) as usize;
         let is_rgb = n_components >= 3;
-
-        // Decode pixel data: interleave components
-        let w = width as usize;
-        let h = height as usize;
-        let nc = n_components as usize;
-        let mut pixels = Vec::with_capacity(w * h * nc * bps);
-        for y in 0..h {
-            for x in 0..w {
-                for c in 0..nc {
-                    let component = &components[c];
-                    let cw = component.width() as usize;
-                    let ch = component.height() as usize;
-                    if cw == 0 || ch == 0 {
-                        return Err(BioFormatsError::Codec(format!(
-                            "JPEG 2000: component {c} has zero geometry"
-                        )));
-                    }
-                    let cx = x * cw / w;
-                    let cy = y * ch / h;
-                    let data = component.data();
-                    let idx = cy * cw + cx;
-                    if idx >= data.len() {
-                        return Err(BioFormatsError::Codec(format!(
-                            "JPEG 2000: component {c} data is shorter than its geometry"
-                        )));
-                    }
-                    let val = data[idx];
-                    append_jpeg2000_sample(&mut pixels, val, bps, signed);
-                }
-            }
-        }
+        let pixels = jpeg2000_image_to_interleaved_be(&image)?;
 
         self.path = Some(path.to_path_buf());
-        self.pixel_data = Some(pixels);
-        self.meta = Some(ImageMetadata {
+        self.file_data = Some(file_data);
+        let resolution_count = jpeg2000_resolution_levels(
+            self.file_data
+                .as_deref()
+                .ok_or(BioFormatsError::NotInitialized)?,
+        )
+        .map(|levels| levels as usize + 1)
+        .unwrap_or(1);
+        let base_meta = ImageMetadata {
             size_x: width,
             size_y: height,
             size_z: 1,
             size_c: n_components,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count: 1,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb,
             is_interleaved: true,
             is_indexed: false,
             is_little_endian: false,
-            resolution_count: 1,
+            resolution_count: resolution_count as u32,
             thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
-        });
+        };
+        self.metas = Vec::with_capacity(resolution_count);
+        self.metas.push(base_meta);
+        for level in 1..resolution_count {
+            let previous = self.metas[level - 1].clone();
+            let mut meta = previous;
+            meta.size_x = (meta.size_x / 2).max(1);
+            meta.size_y = (meta.size_y / 2).max(1);
+            meta.thumbnail = true;
+            self.metas.push(meta);
+        }
+        self.current_resolution = 0;
+        self.pixel_cache = Some((0, pixels));
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.pixel_data = None;
+        self.file_data = None;
+        self.metas.clear();
+        self.current_resolution = 0;
+        self.pixel_cache = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        usize::from(!self.metas.is_empty())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_some() && s == 0 {
+        if !self.metas.is_empty() && s == 0 {
             Ok(())
         } else {
             Err(BioFormatsError::SeriesOutOfRange(s))
@@ -6872,8 +6882,8 @@ impl FormatReader for Jpeg2000Reader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.metas
+            .get(self.current_resolution)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
@@ -6881,9 +6891,20 @@ impl FormatReader for Jpeg2000Reader {
         if plane_index != 0 {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        self.pixel_data
-            .clone()
-            .ok_or(BioFormatsError::NotInitialized)
+        if self
+            .pixel_cache
+            .as_ref()
+            .is_some_and(|(level, _)| *level == self.current_resolution)
+        {
+            return self
+                .pixel_cache
+                .as_ref()
+                .map(|(_, pixels)| pixels.clone())
+                .ok_or(BioFormatsError::NotInitialized);
+        }
+        let pixels = self.decode_pixels(self.current_resolution)?;
+        self.pixel_cache = Some((self.current_resolution, pixels.clone()));
+        Ok(pixels)
     }
 
     fn open_bytes_region(
@@ -6894,19 +6915,160 @@ impl FormatReader for Jpeg2000Reader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        let meta = self
+            .metas
+            .get(self.current_resolution)
+            .cloned()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if x == 0 && y == 0 && w == meta.size_x && h == meta.size_y {
+            return self.open_bytes(plane_index);
+        }
+        if self.current_resolution == 0 {
+            if let Some(file_data) = self.file_data.as_ref() {
+                if let Ok(region) = crate::common::codec::decompress_jpeg2000_region_with_endianness(
+                    file_data, false, x, y, w, h,
+                ) {
+                    return Ok(region);
+                }
+            }
+        }
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("JPEG-2000", &full, meta, meta.size_c as usize, x, y, w, h)
+        crop_full_plane("JPEG-2000", &full, &meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_resolution)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn resolution_count(&self) -> usize {
+        self.metas.len().max(1)
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level >= self.metas.len() {
+            return Err(BioFormatsError::Format(format!(
+                "resolution level {} out of range (max {})",
+                level,
+                self.metas.len().saturating_sub(1)
+            )));
+        }
+        self.current_resolution = level;
+        Ok(())
+    }
+
+    fn resolution(&self) -> usize {
+        self.current_resolution
+    }
+}
+
+fn jpeg2000_image_to_interleaved_be(image: &openjp2::Image) -> Result<Vec<u8>> {
+    let components = &image.components;
+    if components.is_empty() {
+        return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
+    }
+    let width = components[0].width as usize;
+    let height = components[0].height as usize;
+    let n_components = components.len();
+    let prec = components[0].precision;
+    let signed = components[0].signed;
+    let (_pixel_type, bpp) = jpeg2000_pixel_type(prec, signed);
+    let bps = (bpp / 8) as usize;
+    let mut pixels = Vec::with_capacity(width * height * n_components * bps);
+    for y in 0..height {
+        for x in 0..width {
+            for (c, component) in components.iter().enumerate() {
+                let cw = component.width as usize;
+                let ch = component.height as usize;
+                if cw == 0 || ch == 0 {
+                    return Err(BioFormatsError::Codec(format!(
+                        "JPEG 2000: component {c} has zero geometry"
+                    )));
+                }
+                let cx = x * cw / width;
+                let cy = y * ch / height;
+                let data = &component.data;
+                let idx = cy * cw + cx;
+                if idx >= data.len() {
+                    return Err(BioFormatsError::Codec(format!(
+                        "JPEG 2000: component {c} data is shorter than its geometry"
+                    )));
+                }
+                append_jpeg2000_sample(&mut pixels, data[idx], bps, signed);
+            }
+        }
+    }
+    Ok(pixels)
+}
+
+fn jpeg2000_codestream_offset(data: &[u8]) -> Option<usize> {
+    if data.len() >= 2 && data[..2] == [0xff, 0x4f] {
+        return Some(0);
+    }
+    let mut pos = 0usize;
+    while pos.checked_add(8)? <= data.len() {
+        let len = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        let typ = &data[pos + 4..pos + 8];
+        let (header, box_len) = if len == 1 {
+            if pos.checked_add(16)? > data.len() {
+                return None;
+            }
+            (
+                16usize,
+                u64::from_be_bytes(data[pos + 8..pos + 16].try_into().ok()?) as usize,
+            )
+        } else if len == 0 {
+            (8usize, data.len().saturating_sub(pos))
+        } else {
+            (8usize, len)
+        };
+        if box_len < header || pos.checked_add(box_len)? > data.len() {
+            return None;
+        }
+        if typ == b"jp2c" {
+            return Some(pos + header);
+        }
+        pos += box_len;
+    }
+    None
+}
+
+fn jpeg2000_resolution_levels(data: &[u8]) -> Option<u8> {
+    let mut pos = jpeg2000_codestream_offset(data)?;
+    if data.get(pos..pos + 2)? != &[0xff, 0x4f] {
+        return None;
+    }
+    pos += 2;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xff {
+            return None;
+        }
+        let marker = data[pos + 1];
+        pos += 2;
+        if matches!(marker, 0x90 | 0x93 | 0xd9) {
+            return None;
+        }
+        let len = u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+        if len < 2 || pos + len > data.len() {
+            return None;
+        }
+        let body = &data[pos + 2..pos + len];
+        if marker == 0x52 {
+            return body.get(5).copied();
+        }
+        pos += len;
+    }
+    None
 }
 
 fn jpeg2000_pixel_type(precision: u8, signed: bool) -> (PixelType, u8) {
@@ -6953,6 +7115,7 @@ fn append_jpeg2000_sample(out: &mut Vec<u8>, value: i32, bytes_per_sample: usize
 #[cfg(test)]
 mod jpeg2000_tests {
     use super::*;
+    use crate::common::writer::FormatWriter;
 
     #[test]
     fn jpeg2000_name_and_byte_detection_matches_java_contract() {
@@ -6986,6 +7149,108 @@ mod jpeg2000_tests {
     }
 
     #[test]
+    fn jpeg2000_cod_parser_reads_resolution_levels_from_raw_and_jp2_codestreams() {
+        let codestream = vec![
+            0xff, 0x4f, // SOC
+            0xff, 0x52, // COD
+            0x00, 0x0c, // Lcod
+            0x00, // Scod
+            0x00, // progression
+            0x00, 0x01, // layers
+            0x00, // multiple component transform
+            0x03, // decomposition levels
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(jpeg2000_codestream_offset(&codestream), Some(0));
+        assert_eq!(jpeg2000_resolution_levels(&codestream), Some(3));
+
+        let mut jp2 = Vec::new();
+        jp2.extend_from_slice(&12u32.to_be_bytes());
+        jp2.extend_from_slice(b"jP  ");
+        jp2.extend_from_slice(&[0x0d, 0x0a, 0x87, 0x0a]);
+        jp2.extend_from_slice(&((8 + codestream.len()) as u32).to_be_bytes());
+        jp2.extend_from_slice(b"jp2c");
+        let offset = jp2.len();
+        jp2.extend_from_slice(&codestream);
+        assert_eq!(jpeg2000_codestream_offset(&jp2), Some(offset));
+        assert_eq!(jpeg2000_resolution_levels(&jp2), Some(3));
+    }
+    #[test]
+    fn jpeg2000_reader_exposes_codestream_resolutions_like_java_non_flattened() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_jpeg2000_resolutions_{}.jp2",
+            std::process::id()
+        ));
+        let mut meta = ImageMetadata {
+            size_x: 8,
+            size_y: 8,
+            size_c: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        };
+        meta.size_z = 1;
+        meta.size_t = 1;
+        let plane: Vec<u8> = (0..64).map(|v| v as u8).collect();
+
+        let mut writer = Jpeg2000Writer::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(&path).unwrap();
+        writer.save_bytes(0, &plane).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = Jpeg2000Reader::new();
+        reader.set_id(&path).unwrap();
+        assert!(reader.resolution_count() > 1);
+        assert_eq!(
+            reader.metadata().resolution_count as usize,
+            reader.resolution_count()
+        );
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (8, 8));
+        reader.set_resolution(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 4));
+        assert_eq!(reader.open_bytes(0).unwrap().len(), 16);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn jpeg2000_reader_region_matches_full_plane_crop() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_jpeg2000_region_{}.jp2",
+            std::process::id()
+        ));
+        let meta = ImageMetadata {
+            size_x: 8,
+            size_y: 6,
+            size_c: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        };
+        let plane: Vec<u8> = (0..48).map(|v| v as u8).collect();
+
+        let mut writer = Jpeg2000Writer::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(&path).unwrap();
+        writer.save_bytes(0, &plane).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = Jpeg2000Reader::new();
+        reader.set_id(&path).unwrap();
+        let full = reader.open_bytes(0).unwrap();
+        let region = reader.open_bytes_region(0, 2, 1, 3, 2).unwrap();
+        let expected = vec![full[10], full[11], full[12], full[18], full[19], full[20]];
+        assert_eq!(region, expected);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn failed_second_set_id_clears_previous_state() {
         let bad = std::env::temp_dir().join(format!(
             "bioformats_jpeg2000_bad_{}.jp2",
@@ -6995,7 +7260,7 @@ mod jpeg2000_tests {
 
         let mut reader = Jpeg2000Reader::new();
         reader.path = Some(PathBuf::from("previous.jp2"));
-        reader.meta = Some(ImageMetadata {
+        reader.metas = vec![ImageMetadata {
             size_x: 1,
             size_y: 1,
             size_z: 1,
@@ -7006,8 +7271,9 @@ mod jpeg2000_tests {
             image_count: 1,
             dimension_order: DimensionOrder::XYCZT,
             ..ImageMetadata::default()
-        });
-        reader.pixel_data = Some(vec![9]);
+        }];
+        reader.file_data = Some(vec![0xff, 0x4f]);
+        reader.pixel_cache = Some((0, vec![9]));
 
         assert!(reader.set_id(&bad).is_err());
         assert!(matches!(
@@ -7023,16 +7289,13 @@ mod jpeg2000_tests {
 ///
 /// Encodes a single 2D plane (1 grayscale or 3 RGB components) to a lossless
 /// JP2 file using the pure-Rust `openjp2` encoder, mirroring the lossless
-/// output of Java `JPEG2000Writer`. Gated behind the default-on
-/// `jpeg2000-write` feature.
-#[cfg(feature = "jpeg2000-write")]
+/// output of Java `JPEG2000Writer`.
 pub struct Jpeg2000Writer {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     wrote: bool,
 }
 
-#[cfg(feature = "jpeg2000-write")]
 impl Jpeg2000Writer {
     pub fn new() -> Self {
         Jpeg2000Writer {
@@ -7043,14 +7306,12 @@ impl Jpeg2000Writer {
     }
 }
 
-#[cfg(feature = "jpeg2000-write")]
 impl Default for Jpeg2000Writer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "jpeg2000-write")]
 impl crate::common::writer::FormatWriter for Jpeg2000Writer {
     fn is_this_type(&self, path: &Path) -> bool {
         let ext = path

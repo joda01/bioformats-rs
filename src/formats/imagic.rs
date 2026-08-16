@@ -16,7 +16,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{
+    DimensionOrder, ImageMetadata, MetadataLevel, MetadataOptions, MetadataValue,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -77,6 +79,7 @@ pub struct ImagicReader {
     physical_size_y: Option<f64>,
     physical_size_z: Option<f64>,
     bytes_per_sample: usize,
+    metadata_options: MetadataOptions,
 }
 
 impl ImagicReader {
@@ -90,6 +93,7 @@ impl ImagicReader {
             physical_size_y: None,
             physical_size_z: None,
             bytes_per_sample: 4,
+            metadata_options: MetadataOptions::default(),
         }
     }
 }
@@ -223,7 +227,7 @@ impl FormatReader for ImagicReader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: bpp,
+            bits_per_pixel: (bpp).into(),
             image_count: num_images as u32,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -257,6 +261,10 @@ impl FormatReader for ImagicReader {
         self.physical_size_y = None;
         self.physical_size_z = None;
         Ok(())
+    }
+
+    fn set_metadata_options(&mut self, options: MetadataOptions) {
+        self.metadata_options = options;
     }
     fn series_count(&self) -> usize {
         usize::from(self.meta.is_some())
@@ -324,10 +332,75 @@ impl FormatReader for ImagicReader {
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
         if let Some(img) = ome.images.first_mut() {
             img.name = self.image_name.clone();
-            img.physical_size_x = self.physical_size_x;
-            img.physical_size_y = self.physical_size_y;
-            img.physical_size_z = self.physical_size_z;
+            if self.metadata_options.level != MetadataLevel::Minimal {
+                img.physical_size_x = self.physical_size_x;
+                img.physical_size_y = self.physical_size_y;
+                img.physical_size_z = self.physical_size_z;
+            }
         }
         Some(ome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_imagic_base(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bioformats_rs_imagic_{}_{}",
+            std::process::id(),
+            name
+        ))
+    }
+
+    fn write_imagic_pair(base: &Path) {
+        let hed = base.with_extension("hed");
+        let img = base.with_extension("img");
+        let mut rec = vec![0u8; HDR_RECORD_BYTES];
+        rec[48..52].copy_from_slice(&2i32.to_le_bytes());
+        rec[52..56].copy_from_slice(&2i32.to_le_bytes());
+        rec[56..60].copy_from_slice(b"PACK");
+        let name = b"imagic test";
+        rec[IMAGE_NAME_OFFSET as usize..IMAGE_NAME_OFFSET as usize + name.len()]
+            .copy_from_slice(name);
+        rec[PHYSICAL_SIZE_X_OFFSET..PHYSICAL_SIZE_X_OFFSET + 4]
+            .copy_from_slice(&10_000f32.to_le_bytes());
+        rec[PHYSICAL_SIZE_Y_OFFSET..PHYSICAL_SIZE_Y_OFFSET + 4]
+            .copy_from_slice(&20_000f32.to_le_bytes());
+        rec[PHYSICAL_SIZE_Z_OFFSET..PHYSICAL_SIZE_Z_OFFSET + 4]
+            .copy_from_slice(&30_000f32.to_le_bytes());
+        std::fs::write(hed, rec).unwrap();
+        std::fs::write(img, [1u8, 2, 3, 4]).unwrap();
+    }
+
+    #[test]
+    fn imagic_minimal_metadata_skips_physical_sizes_like_java() {
+        let base = temp_imagic_base("minimal");
+        write_imagic_pair(&base);
+        let hed = base.with_extension("hed");
+        let img = base.with_extension("img");
+
+        let mut reader = ImagicReader::new();
+        reader.set_metadata_options(MetadataOptions {
+            level: MetadataLevel::Minimal,
+            original_metadata: true,
+        });
+        reader.set_id(&hed).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_z), (2, 2, 1));
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
+
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.name.as_deref(), Some("imagic test"));
+        assert_eq!(image.physical_size_x, None);
+        assert_eq!(image.physical_size_y, None);
+        assert_eq!(image.physical_size_z, None);
+
+        let _ = std::fs::remove_file(hed);
+        let _ = std::fs::remove_file(img);
     }
 }

@@ -100,7 +100,7 @@ impl FormatReader for SimfcsReader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: (bps * 8) as u8,
+            bits_per_pixel: (bps * 8) as u16,
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,

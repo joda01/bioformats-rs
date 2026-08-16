@@ -179,7 +179,7 @@ fn fits_series_from_hdu(hdu: FitsHdu) -> Result<FitsSeries> {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
             image_count: size_z,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -234,7 +234,7 @@ impl FormatReader for FitsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fits" | "fit" | "fts"))
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fits" | "fts"))
             .unwrap_or(false)
     }
 
@@ -769,5 +769,14 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fits_reader_name_suffixes_match_java() {
+        // Java FitsReader registers only "fits" and "fts".
+        let reader = FitsReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("sample.fits")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.fts")));
+        assert!(!reader.is_this_type_by_name(Path::new("sample.fit")));
     }
 }

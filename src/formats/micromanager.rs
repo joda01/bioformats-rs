@@ -26,7 +26,12 @@ use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::ome_metadata::{create_lsid, OmeMetadata, OmePlane};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::tiff::ifd::{Ifd, IfdValue};
 use crate::tiff::TiffReader;
+
+const JSON_TAG: u16 = 50839;
+const MM_JSON_TAG: u16 = 51123;
+const ACQUISITION_XML: &str = "Acqusition.xml";
 
 // ── Minimal JSON key extractor ────────────────────────────────────────────────
 /// Extract the integer value of a JSON key, e.g. `"Width": 512` or `"Width":512`.
@@ -89,6 +94,21 @@ fn json_float(json: &str, key: &str) -> Option<f64> {
         })
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+fn json_bool(json: &str, key: &str) -> Option<bool> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(':').map(str::trim_start).unwrap_or(rest);
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn positive_u32_from_json(json: &str, key: &str) -> Result<u32> {
@@ -391,16 +411,20 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     let pixel_type_str = json_str(summary, "PixelType").unwrap_or_else(|| "GRAY16".into());
     let mut pixel_type = pixel_type_from_str(&pixel_type_str)?;
     let mut bits = match json_int(summary, "BitDepth") {
-        Some(value) => u8::try_from(value).ok().filter(|&v| v > 0).ok_or_else(|| {
-            BioFormatsError::Format(format!("MicroManager: invalid BitDepth {value}"))
-        })?,
-        None => pixel_type.bytes_per_sample() as u8 * 8,
+        Some(value) => u16::try_from(value)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("MicroManager: invalid BitDepth {value}"))
+            })?,
+        None => pixel_type.bytes_per_sample() as u16 * 8,
     };
     let is_rgb_summary = pixel_type_str.starts_with("RGB");
 
     // Dimension order from "SlicesFirst": false -> XYCZT, else XYZCT (Java default).
     let dimension_order = match json_str(&json, "SlicesFirst")
         .or_else(|| json_int(&json, "SlicesFirst").map(|v| v.to_string()))
+        .or_else(|| json_bool(&json, "SlicesFirst").map(|v| v.to_string()))
     {
         Some(ref v) if v.eq_ignore_ascii_case("false") || v == "0" => DimensionOrder::XYCZT,
         _ => DimensionOrder::XYZCT,
@@ -409,13 +433,17 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     let dir = meta_path.parent().unwrap_or_else(|| Path::new("."));
 
     // Build the per-plane file name map and per-plane/camera metadata from the
-    // "FrameKey-<t>-<c>-<z>" blocks. Java derives the zero-padding `digits` from
-    // the (TIFF) plane count; here the number of FrameKey blocks is the plane
-    // count, so count them first.
+    // "FrameKey-<t>-<c>-<z>" and "Coords-<file>" blocks.
     let frame_block_count = json.matches("\"FrameKey-").count();
-    let digits = frame_block_count.saturating_sub(1).to_string().len();
+    let coords_block_count = json.matches("\"Coords-").count();
+    let digits = frame_block_count
+        .max(coords_block_count)
+        .saturating_sub(1)
+        .to_string()
+        .len();
     let mut frame = FrameData::default();
     parse_frame_keys(&json, dir, &mut frame, digits);
+    parse_coords_blocks(&json, dir, &mut frame);
     let file_name_map = std::mem::take(&mut frame.file_name_map);
 
     // Fallback: sorted list of all TIFF files in the directory.
@@ -433,6 +461,17 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         })
         .unwrap_or_default();
     tiffs.sort();
+
+    parse_tiff_private_metadata(
+        &tiffs,
+        &file_name_map,
+        dimension_order,
+        slices,
+        channels,
+        frames,
+        &mut frame,
+        digits,
+    );
 
     // Derive endianness/pixel type from the first available TIFF (Java reads the
     // first IFD: littleEndian and pixelType come from the IFD, not the JSON).
@@ -516,6 +555,7 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     if let Some(time) = json_str(summary, "Time") {
         meta_map.insert("time".into(), MetadataValue::String(time));
     }
+    parse_acquisition_xml(dir, &mut meta_map);
     // PositionName appears in per-frame blocks; scan the whole document.
     if let Some(name) = json_str(&json, "PositionName") {
         if name != "null" && !name.is_empty() {
@@ -545,7 +585,7 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         size_c: channels,
         size_t: frames,
         pixel_type,
-        bits_per_pixel: bits,
+        bits_per_pixel: (bits).into(),
         image_count,
         dimension_order,
         is_rgb: is_rgb_summary,
@@ -750,6 +790,310 @@ fn parse_frame_keys(json: &str, dir: &Path, data: &mut FrameData, digits: usize)
     // Java sorts the gathered timestamps (`Arrays.sort(p.timestamps)`, ~977).
     data.timestamps
         .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+/// Scan `"Coords-<file>"` blocks and map their `z`/`channel`/`time` coordinates
+/// to the named TIFF file. Java stores `position` too, but `Position.getFile`
+/// matches only Z/C/T when resolving a logical plane.
+fn parse_coords_blocks(json: &str, dir: &Path, data: &mut FrameData) {
+    let mut search = 0;
+    while let Some(rel) = json[search..].find("\"Coords-") {
+        let abs = search + rel + 1;
+        let rest = &json[abs..];
+        let Some(end_quote) = rest.find('"') else {
+            break;
+        };
+        let path = rest["Coords-".len()..end_quote].trim();
+        search = abs + end_quote + 1;
+
+        let Some(block_start_rel) = json[search..].find('{') else {
+            continue;
+        };
+        let block_start = search + block_start_rel;
+        let Some(block_end) = find_matching_brace(json, block_start) else {
+            continue;
+        };
+        let block = &json[block_start..=block_end];
+        let z = json_int(block, "z").unwrap_or(0).max(0) as u32;
+        let c = json_int(block, "channel").unwrap_or(0).max(0) as u32;
+        let t = json_int(block, "time").unwrap_or(0).max(0) as u32;
+        data.file_name_map.insert(Index { z, c, t }, dir.join(path));
+        search = block_end + 1;
+    }
+}
+
+fn find_matching_brace(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (rel, ch) in s[open..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + rel);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_acquisition_xml(dir: &Path, meta: &mut HashMap<String, MetadataValue>) {
+    let path = dir.join(ACQUISITION_XML);
+    let Ok(xml) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e))
+                if e.local_name().as_ref().eq_ignore_ascii_case(b"entry") =>
+            {
+                let mut key = None;
+                let mut value = None;
+                for attr in e.attributes().flatten() {
+                    if attr.key.as_ref().eq_ignore_ascii_case(b"key") {
+                        key = attr
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .ok()
+                            .map(|v| v.into_owned());
+                    } else if attr.key.as_ref().eq_ignore_ascii_case(b"value") {
+                        value = attr
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .ok()
+                            .map(|v| v.into_owned());
+                    }
+                }
+                if let (Some(k), Some(v)) = (key, value) {
+                    meta.insert(k, MetadataValue::String(v));
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+}
+
+fn parse_tiff_private_metadata(
+    tiffs: &[PathBuf],
+    file_name_map: &HashMap<Index, PathBuf>,
+    dimension_order: DimensionOrder,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    data: &mut FrameData,
+    digits: usize,
+) {
+    let mut parse_mm_json_tag = true;
+    let mut plane = 0usize;
+    while plane < tiffs.len() {
+        let mut path = tiffs[plane].clone();
+        if tiffs.len() == file_name_map.len() {
+            if let Some(mapped) = file_name_for_raster_plane(
+                file_name_map,
+                dimension_order,
+                size_z,
+                size_c,
+                size_t,
+                plane as u32,
+            ) {
+                path = mapped;
+            }
+        }
+        if !path.exists() {
+            plane += 1;
+            continue;
+        }
+        let mut reader = TiffReader::new();
+        if reader.set_id(&path).is_err() {
+            plane += 1;
+            continue;
+        }
+        let n_ifds = reader.ifd_count().max(1);
+        if let Some(json) = reader.ifd(0).and_then(|ifd| ifd_text_value(ifd, JSON_TAG)) {
+            parse_first_ifd_json_tag(data, &json, digits, plane * n_ifds, n_ifds);
+        }
+        for i in 0..n_ifds {
+            if !parse_mm_json_tag {
+                break;
+            }
+            let Some(json) = reader
+                .ifd(i)
+                .and_then(|ifd| ifd_text_value(ifd, MM_JSON_TAG))
+            else {
+                parse_mm_json_tag = false;
+                break;
+            };
+            parse_mm_json_tag_value(data, &json, digits, plane + i);
+        }
+        plane += n_ifds;
+    }
+    data.timestamps
+        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+fn file_name_for_raster_plane(
+    file_name_map: &HashMap<Index, PathBuf>,
+    dimension_order: DimensionOrder,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    no: u32,
+) -> Option<PathBuf> {
+    let (z, c, t) = Position::zct_coords(dimension_order, size_z, size_c, size_t, no);
+    let key = Index { z, c, t };
+    file_name_map.get(&key).cloned()
+}
+
+fn ifd_text_value(ifd: &Ifd, tag: u16) -> Option<String> {
+    match ifd.get(tag)? {
+        IfdValue::Ascii(s) => Some(s.trim_end_matches('\0').to_string()),
+        IfdValue::Byte(v) | IfdValue::Undefined(v) => Some(
+            String::from_utf8_lossy(v)
+                .trim_end_matches('\0')
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn parse_first_ifd_json_tag(
+    data: &mut FrameData,
+    json: &str,
+    digits: usize,
+    plane: usize,
+    n_planes: usize,
+) {
+    for line in json.lines() {
+        let to_split = line.trim().trim_end_matches(',');
+        let Some((key, value)) = to_split.split_once("\": ") else {
+            continue;
+        };
+        let key = key.replace('"', "");
+        let value = value.replace('"', "");
+        if !key.is_empty() && !value.is_empty() {
+            parse_key_and_value(data, &key, &value, digits, plane, n_planes);
+        }
+    }
+}
+
+fn parse_mm_json_tag_value(data: &mut FrameData, json: &str, digits: usize, plane: usize) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return;
+    };
+    parse_mm_json_value(data, &value, digits, plane);
+}
+
+fn parse_mm_json_value(
+    data: &mut FrameData,
+    value: &serde_json::Value,
+    digits: usize,
+    plane: usize,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if key == "completeCoords" {
+                    parse_mm_json_value(data, child, digits, plane);
+                    continue;
+                }
+                if let Some(prop) = child.get("PropVal") {
+                    let text = json_scalar_to_java_string(prop);
+                    parse_key_and_value(data, key, &text, digits, plane, 1);
+                    parse_frame_scalar(data, key, &text);
+                } else if child.is_object() || child.is_array() {
+                    parse_mm_json_value(data, child, digits, plane);
+                } else {
+                    let text = json_scalar_to_java_string(child);
+                    parse_key_and_value(data, key, &text, digits, plane, 1);
+                    parse_frame_scalar(data, key, &text);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                parse_mm_json_value(data, item, digits, plane);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_scalar_to_java_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(v) => v.to_string(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(json_scalar_to_java_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Object(_) => value.to_string(),
+    }
+}
+
+fn parse_frame_scalar(data: &mut FrameData, key: &str, value: &str) {
+    if key == "Exposure-ms" {
+        data.exposure_time = value.parse().ok();
+    } else if key == "ElapsedTime-ms" {
+        if let Ok(v) = value.parse() {
+            data.timestamps.push(v);
+        }
+    } else if key == "Core-Camera" {
+        data.camera_ref = Some(value.to_string());
+    } else if let Some(cam) = data.camera_ref.clone() {
+        if key == format!("{cam}-Binning") {
+            data.binning = Some(if value.contains('x') {
+                value.to_string()
+            } else {
+                format!("{value}x{value}")
+            });
+        } else if key == format!("{cam}-CameraID") {
+            data.detector_id = Some(value.to_string());
+        } else if key == format!("{cam}-CameraName") {
+            data.detector_model = Some(value.to_string());
+        } else if key == format!("{cam}-Gain") {
+            data.gain = value.parse::<f64>().ok().map(|v| v as i32);
+        } else if key == format!("{cam}-Name") {
+            data.detector_manufacturer = Some(value.to_string());
+        } else if key == format!("{cam}-Temperature") {
+            data.temperature = value.parse().ok();
+        } else if key == format!("{cam}-CCDMode") {
+            data.camera_mode = Some(value.to_string());
+        } else if key.starts_with("DAC-") && key.ends_with("-Volts") {
+            if let Ok(v) = value.parse() {
+                data.voltage.push(v);
+            }
+        }
+    }
 }
 
 /// Append the voltage of every `DAC-*-Volts` key found in `block`, mirroring the
@@ -1006,8 +1350,16 @@ impl FormatReader for MicromanagerReader {
         name == "metadata.json"
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Java MicromanagerReader.isThisType(RandomAccessInputStream)
+        // delegates directly to MinimalTiffReader.
+        matches!(
+            header.get(..4),
+            Some([b'I', b'I', 42, 0])
+                | Some([b'M', b'M', 0, 42])
+                | Some([b'I', b'I', 43, 0])
+                | Some([b'M', b'M', 0, 43])
+        )
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1135,6 +1487,98 @@ impl FormatReader for MicromanagerReader {
 mod tests {
     use super::*;
 
+    fn push_u16_le(data: &mut Vec<u8>, value: u16) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32_le(data: &mut Vec<u8>, value: u32) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_ifd_short(data: &mut Vec<u8>, tag: u16, value: u16) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 3);
+        push_u32_le(data, 1);
+        push_u16_le(data, value);
+        push_u16_le(data, 0);
+    }
+
+    fn push_ifd_long(data: &mut Vec<u8>, tag: u16, value: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 4);
+        push_u32_le(data, 1);
+        push_u32_le(data, value);
+    }
+
+    fn push_ifd_ascii(data: &mut Vec<u8>, tag: u16, count: u32, offset: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 2);
+        push_u32_le(data, count);
+        push_u32_le(data, offset);
+    }
+
+    fn write_mm_private_tiff(
+        path: &Path,
+        pixel: u8,
+        json_tag: Option<&str>,
+        mm_json_tag: Option<&str>,
+    ) {
+        let entry_count = 9 + u16::from(json_tag.is_some()) + u16::from(mm_json_tag.is_some());
+        let mut payloads = Vec::<(u16, Vec<u8>)>::new();
+        if let Some(text) = json_tag {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(0);
+            payloads.push((JSON_TAG, bytes));
+        }
+        if let Some(text) = mm_json_tag {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(0);
+            payloads.push((MM_JSON_TAG, bytes));
+        }
+        let mut next_offset = 8 + 2 + u32::from(entry_count) * 12 + 4;
+        let payload_offsets: Vec<u32> = payloads
+            .iter()
+            .map(|(_, bytes)| {
+                let offset = next_offset;
+                next_offset += bytes.len() as u32;
+                offset
+            })
+            .collect();
+        let pixel_offset = next_offset;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, entry_count);
+        push_ifd_long(&mut data, crate::tiff::ifd::tag::IMAGE_WIDTH, 1);
+        push_ifd_long(&mut data, crate::tiff::ifd::tag::IMAGE_LENGTH, 1);
+        push_ifd_short(&mut data, crate::tiff::ifd::tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, crate::tiff::ifd::tag::COMPRESSION, 1);
+        push_ifd_short(
+            &mut data,
+            crate::tiff::ifd::tag::PHOTOMETRIC_INTERPRETATION,
+            1,
+        );
+        push_ifd_long(
+            &mut data,
+            crate::tiff::ifd::tag::STRIP_OFFSETS,
+            pixel_offset,
+        );
+        push_ifd_short(&mut data, crate::tiff::ifd::tag::SAMPLES_PER_PIXEL, 1);
+        push_ifd_long(&mut data, crate::tiff::ifd::tag::ROWS_PER_STRIP, 1);
+        push_ifd_long(&mut data, crate::tiff::ifd::tag::STRIP_BYTE_COUNTS, 1);
+        for ((tag, bytes), offset) in payloads.iter().zip(payload_offsets.iter()) {
+            push_ifd_ascii(&mut data, *tag, bytes.len() as u32, *offset);
+        }
+        push_u32_le(&mut data, 0);
+        for (_, bytes) in payloads {
+            data.extend_from_slice(&bytes);
+        }
+        data.push(pixel);
+        std::fs::write(path, data).unwrap();
+    }
+
     /// Build a temp MicroManager dataset: a `metadata.txt` with two FrameKey
     /// blocks (two time points) carrying per-plane position/exposure/elapsed and
     /// camera/detector keys, plus the real TIFF files the FrameKeys reference
@@ -1254,6 +1698,17 @@ mod tests {
         assert_eq!(reader.open_bytes(1).unwrap().len(), 64);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn byte_probe_delegates_to_tiff_header_like_java() {
+        let reader = MicromanagerReader::new();
+        assert!(reader.is_this_type_by_bytes(&[b'I', b'I', 42, 0]));
+        assert!(reader.is_this_type_by_bytes(&[b'M', b'M', 0, 42, 0]));
+        assert!(reader.is_this_type_by_bytes(&[b'I', b'I', 43, 0]));
+        assert!(reader.is_this_type_by_bytes(&[b'M', b'M', 0, 43, 0]));
+        assert!(!reader.is_this_type_by_bytes(&[b'I', b'I', 0]));
+        assert!(!reader.is_this_type_by_bytes(b"metadata"));
     }
 
     #[test]
@@ -1414,13 +1869,139 @@ mod tests {
         let metadata = write_dataset();
         let dir = metadata.parent().unwrap().to_path_buf();
         let xml = dir.join("Acqusition.xml");
-        std::fs::write(&xml, "<root>Micro-Manager</root>").unwrap();
+        std::fs::write(
+            &xml,
+            r#"<root>Micro-Manager<entry key="XMLKey" value="XMLValue"/></root>"#,
+        )
+        .unwrap();
 
         let mut reader = MicromanagerReader::new();
         assert!(reader.is_this_type_by_name(&xml));
         reader.set_id(&xml).unwrap();
         assert_eq!(reader.metadata().size_x, 8);
+        assert!(matches!(
+            reader.metadata().series_metadata.get("XMLKey"),
+            Some(MetadataValue::String(value)) if value == "XMLValue"
+        ));
         assert_eq!(reader.open_bytes(0).unwrap()[0], 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn coords_blocks_drive_logical_plane_mapping_like_java() {
+        let dir = std::env::temp_dir().join(format!(
+            "mm_coords_mapping_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_mm_private_tiff(&dir.join("z1.tif"), 9, None, None);
+        write_mm_private_tiff(&dir.join("z0.tif"), 7, None, None);
+        std::fs::write(
+            dir.join("metadata.txt"),
+            r#"{
+  "Summary": {
+    "Source": "Micro-Manager",
+    "Width": 1,
+    "Height": 1,
+    "Channels": 1,
+    "Slices": 2,
+    "Frames": 1,
+    "PixelType": "GRAY8"
+  },
+  "Coords-z1.tif": {
+    "position": 0,
+    "time": 0,
+    "z": 1,
+    "channel": 0
+  },
+  "Coords-z0.tif": {
+    "position": 0,
+    "time": 0,
+    "z": 0,
+    "channel": 0
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut reader = MicromanagerReader::new();
+        reader.set_id(&dir.join("metadata.txt")).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![9]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn private_tiff_json_tags_populate_per_plane_metadata_like_java() {
+        let dir = std::env::temp_dir().join(format!(
+            "mm_private_json_tags_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_mm_private_tiff(
+            &dir.join("plane.tif"),
+            5,
+            Some("\"YPositionUm\": 20.25,\n"),
+            Some(
+                r#"{
+  "XPositionUm": {"PropVal": 10.5, "PropType": "Double"},
+  "ZPositionUm": {"PropVal": 1.25, "PropType": "Double"},
+  "Exposure-ms": {"PropVal": 12.5, "PropType": "Double"},
+  "ElapsedTime-ms": {"PropVal": 3.5, "PropType": "Double"},
+  "Core-Camera": {"PropVal": "Camera", "PropType": "String"},
+  "Camera-Binning": {"PropVal": "2", "PropType": "String"},
+  "Camera-Gain": {"PropVal": 4, "PropType": "Integer"}
+}"#,
+            ),
+        );
+        std::fs::write(
+            dir.join("metadata.txt"),
+            r#"{
+  "Summary": {
+    "Source": "Micro-Manager",
+    "Width": 1,
+    "Height": 1,
+    "Channels": 1,
+    "Slices": 1,
+    "Frames": 1,
+    "PixelType": "GRAY8"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut reader = MicromanagerReader::new();
+        reader.set_id(&dir.join("metadata.txt")).unwrap();
+        let m = reader.metadata();
+        assert!(matches!(
+            m.series_metadata.get("Plane #0 XPositionUm"),
+            Some(MetadataValue::String(value)) if value == "10.5"
+        ));
+        assert!(matches!(
+            m.series_metadata.get("Plane #0 YPositionUm"),
+            Some(MetadataValue::String(value)) if value == "20.25"
+        ));
+        let ome = reader.ome_metadata().unwrap();
+        let plane = &ome.images[0].planes[0];
+        assert_eq!(plane.position_x, Some(10.5));
+        assert_eq!(plane.position_y, Some(20.25));
+        assert_eq!(plane.position_z, Some(1.25));
+        assert_eq!(plane.exposure_time, Some(12.5));
+        assert_eq!(plane.delta_t, Some(3.5));
+        let channel = &ome.images[0].channels[0];
+        assert_eq!(channel.detector_settings_binning.as_deref(), Some("2x2"));
+        assert_eq!(channel.detector_settings_gain, Some(4.0));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![5]);
 
         let _ = std::fs::remove_dir_all(dir);
     }

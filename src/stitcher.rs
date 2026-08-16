@@ -36,6 +36,11 @@ pub struct FileStitcher {
     plane_maps: Vec<Vec<(usize, usize, u32)>>,
     /// The currently selected exposed series.
     current_series: usize,
+    /// The currently selected resolution within the selected exposed series.
+    current_resolution: usize,
+    /// Metadata for the active resolution, when it differs from the stored
+    /// base-series metadata or must be borrowed after forwarding to a child.
+    resolution_meta: Option<ImageMetadata>,
     /// Whether this is Java FileStitcher's noStitch path: a single file should
     /// be exposed exactly like the wrapped reader, including all series.
     no_stitch: bool,
@@ -112,6 +117,8 @@ impl FileStitcher {
                 metas,
                 plane_maps,
                 current_series: 0,
+                current_resolution: 0,
+                resolution_meta: None,
                 no_stitch: true,
                 current_reader: None,
             });
@@ -131,6 +138,8 @@ impl FileStitcher {
             metas: vec![meta],
             plane_maps: vec![plane_map],
             current_series: 0,
+            current_resolution: 0,
+            resolution_meta: None,
             no_stitch: false,
             current_reader: None,
         })
@@ -151,6 +160,15 @@ impl FileStitcher {
             .get(plane_index as usize)
             .copied()
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+    }
+
+    fn set_reader_position(
+        reader: &mut Box<dyn FormatReader>,
+        local_series: usize,
+        resolution: usize,
+    ) -> Result<()> {
+        reader.set_series(local_series)?;
+        reader.set_resolution(resolution)
     }
 
     /// Ensure the reader for `file_idx` is open.
@@ -686,6 +704,8 @@ impl FormatReader for FileStitcher {
         self.files.clear();
         self.plane_maps.clear();
         self.current_series = 0;
+        self.current_resolution = 0;
+        self.resolution_meta = None;
         self.no_stitch = false;
         Ok(())
     }
@@ -699,6 +719,8 @@ impl FormatReader for FileStitcher {
             return Err(BioFormatsError::SeriesOutOfRange(s));
         }
         self.current_series = s;
+        self.current_resolution = 0;
+        self.resolution_meta = None;
         if self.no_stitch {
             if let Some((_, reader)) = &mut self.current_reader {
                 reader.set_series(s)?;
@@ -712,15 +734,62 @@ impl FormatReader for FileStitcher {
     }
 
     fn metadata(&self) -> &ImageMetadata {
+        if let Some(meta) = &self.resolution_meta {
+            return meta;
+        }
         self.metas
             .get(self.current_series)
             .expect("FileStitcher not initialized")
     }
 
+    fn resolution_count(&self) -> usize {
+        if let Some((_, reader)) = &self.current_reader {
+            if self.no_stitch || reader.series() == 0 {
+                return reader.resolution_count();
+            }
+        }
+        self.metas
+            .get(self.current_series)
+            .map(|m| m.resolution_count.max(1) as usize)
+            .unwrap_or(1)
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level >= self.resolution_count() {
+            return Err(BioFormatsError::PlaneOutOfRange(level as u32));
+        }
+        self.current_resolution = level;
+        self.resolution_meta = None;
+
+        if self.no_stitch {
+            let current_series = self.current_series;
+            let reader = self.ensure_reader(0)?;
+            Self::set_reader_position(reader, current_series, level)?;
+            self.resolution_meta = Some(reader.metadata().clone());
+        } else if level == 0 {
+            self.resolution_meta = None;
+        } else {
+            let (file_idx, local_series, _) = self
+                .plane_maps
+                .get(self.current_series)
+                .and_then(|planes| planes.first().copied())
+                .ok_or(BioFormatsError::NotInitialized)?;
+            let reader = self.ensure_reader(file_idx)?;
+            Self::set_reader_position(reader, local_series, level)?;
+            self.resolution_meta = Some(reader.metadata().clone());
+        }
+        Ok(())
+    }
+
+    fn resolution(&self) -> usize {
+        self.current_resolution
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (file_idx, local_series, local_plane) = self.resolve_plane(plane_index)?;
+        let resolution = self.current_resolution;
         let reader = self.ensure_reader(file_idx)?;
-        reader.set_series(local_series)?;
+        Self::set_reader_position(reader, local_series, resolution)?;
         reader.open_bytes(local_plane)
     }
 
@@ -733,15 +802,17 @@ impl FormatReader for FileStitcher {
         h: u32,
     ) -> Result<Vec<u8>> {
         let (file_idx, local_series, local_plane) = self.resolve_plane(plane_index)?;
+        let resolution = self.current_resolution;
         let reader = self.ensure_reader(file_idx)?;
-        reader.set_series(local_series)?;
+        Self::set_reader_position(reader, local_series, resolution)?;
         reader.open_bytes_region(local_plane, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (file_idx, local_series, local_plane) = self.resolve_plane(plane_index)?;
+        let resolution = self.current_resolution;
         let reader = self.ensure_reader(file_idx)?;
-        reader.set_series(local_series)?;
+        Self::set_reader_position(reader, local_series, resolution)?;
         reader.open_thumb_bytes(local_plane)
     }
 
@@ -749,6 +820,15 @@ impl FormatReader for FileStitcher {
         let meta = self.metas.get(self.current_series)?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let image = ome.images.get_mut(0)?;
+        if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeX") {
+            image.physical_size_x = Some(*value);
+        }
+        if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeY") {
+            image.physical_size_y = Some(*value);
+        }
+        if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeZ") {
+            image.physical_size_z = Some(*value);
+        }
         for (idx, channel) in image.channels.iter_mut().enumerate() {
             if let Some(MetadataValue::String(name)) =
                 meta.series_metadata.get(&format!("Channel {idx} Name"))
@@ -3236,11 +3316,17 @@ mod tests {
             "Channel 1 Name".into(),
             MetadataValue::String("FITC".into()),
         );
+        meta.series_metadata
+            .insert("PhysicalSizeX".into(), MetadataValue::Float(0.25));
+        meta.series_metadata
+            .insert("PhysicalSizeY".into(), MetadataValue::Float(0.5));
         let stitcher = FileStitcher {
             files: Vec::new(),
             metas: vec![meta],
             plane_maps: vec![Vec::new()],
             current_series: 0,
+            current_resolution: 0,
+            resolution_meta: None,
             no_stitch: false,
             current_reader: None,
         };
@@ -3248,6 +3334,8 @@ mod tests {
         let ome = stitcher.ome_metadata().unwrap();
         assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
         assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
+        assert_eq!(ome.images[0].physical_size_x, Some(0.25));
+        assert_eq!(ome.images[0].physical_size_y, Some(0.5));
     }
 
     #[test]

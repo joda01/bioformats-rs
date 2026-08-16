@@ -5790,6 +5790,7 @@ fn dcimg_v1_reads_header_beyond_initial_probe() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+
 #[test]
 fn dcimg_v1_ignores_bytes_per_row_field_like_java() {
     let dir = isolated_tmp_dir("dcimg_v1_ignored_row_stride");
@@ -8988,22 +8989,30 @@ fn ndpis_merges_pyramid_channels_but_keeps_extras_from_first_ndpi() {
     assert!(!reader.is_this_type_by_bytes(b"not checked by Rust routing"));
     reader.set_id(&ndpis).unwrap();
 
-    assert_eq!(reader.series_count(), 3);
+    assert_eq!(reader.series_count(), 2);
     assert_eq!(reader.metadata().size_c, 2);
     assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.resolution_count(), 2);
+    assert_eq!(reader.resolution(), 0);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 11]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![20, 21]);
 
-    reader.set_series(1).unwrap();
+    reader.set_resolution(1).unwrap();
+    assert_eq!(reader.resolution(), 1);
     assert_eq!(reader.metadata().size_x, 1);
     assert_eq!(reader.metadata().size_c, 2);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![12]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![22]);
+    assert!(matches!(
+        reader.set_resolution(2),
+        Err(BioFormatsError::PlaneOutOfRange(2))
+    ));
 
-    reader.set_series(2).unwrap();
+    reader.set_series(1).unwrap();
     assert_eq!(reader.metadata().size_x, 3);
     assert_eq!(reader.metadata().size_c, 1);
     assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.resolution_count(), 1);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![13, 14, 15]);
     assert!(matches!(
         reader.open_bytes(1),
@@ -9585,7 +9594,7 @@ fn mrc_round_trip_float32() {
 }
 
 #[test]
-fn mrc_rejects_non_positive_z_and_short_payload_before_metadata() {
+fn mrc_rejects_non_positive_z_and_zero_fills_short_payload_on_read() {
     let zero_z = tmp("zero_z.mrc");
     let mut bytes = vec![0u8; 1024];
     write_i32_le(&mut bytes, 0, 2);
@@ -9612,11 +9621,11 @@ fn mrc_rejects_non_positive_z_and_short_payload_before_metadata() {
     bytes.truncate(1024);
     bytes.extend_from_slice(&[1, 2, 3]);
     std::fs::write(&short, bytes).unwrap();
-    let err = match ImageReader::open(&short) {
-        Ok(_) => panic!("short MRC unexpectedly opened"),
-        Err(err) => err,
-    };
-    assert!(err.to_string().contains("shorter than declared"));
+    let mut reader = ImageReader::open(&short).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_z, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0, 0, 0]);
     let _ = std::fs::remove_file(short);
 }
 

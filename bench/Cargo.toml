@@ -3,6 +3,8 @@ name = "bench-read"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+
 [[bin]]
 name = "bench_rust"
 path = "bench_rust.rs"

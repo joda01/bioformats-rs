@@ -15,7 +15,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::ome_metadata::{
     create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeMetadata, OmeObjective,
-    OmePlate, OmeWell, OmeWellSample,
+    OmePlane, OmePlate, OmeWell, OmeWellSample,
 };
 use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
@@ -217,10 +217,55 @@ fn attr_f64(
     attr_val(e, decoder, name).and_then(|s| s.trim().parse::<f64>().ok())
 }
 
+fn incell_decode_xml_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Ok(String::from_utf8_lossy(&bytes[3..]).into_owned());
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return Ok(String::from_utf16_lossy(&units));
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return Ok(String::from_utf16_lossy(&units));
+    }
+
+    let ascii_prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+    if let Some(start) = ascii_prefix.find("encoding=\"") {
+        let rest = &ascii_prefix[start + "encoding=\"".len()..];
+        if let Some(end) = rest.find('"') {
+            let label = rest[..end].as_bytes();
+            if let Some(encoding) = encoding_rs::Encoding::for_label(label) {
+                let (decoded, _, _) = encoding.decode(&bytes);
+                return Ok(decoded.into_owned());
+            }
+        }
+    }
+    if let Some(start) = ascii_prefix.find("encoding='") {
+        let rest = &ascii_prefix[start + "encoding='".len()..];
+        if let Some(end) = rest.find('\'') {
+            let label = rest[..end].as_bytes();
+            if let Some(encoding) = encoding_rs::Encoding::for_label(label) {
+                let (decoded, _, _) = encoding.decode(&bytes);
+                return Ok(decoded.into_owned());
+            }
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Parse the .xdce / .xml metadata into a usable structure (mirrors Java
 /// MinimalInCellHandler).
 fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
-    let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    let content = incell_decode_xml_file(path)?;
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     let mut m = InCellMeta {
@@ -778,7 +823,7 @@ fn validate_incell_companions(m: &InCellMeta) -> Result<()> {
     }
     if !has_existing_companion {
         return Err(BioFormatsError::UnsupportedFormat(
-            "InCell XML/XDCE does not reference any existing companion image files".into(),
+            "InCell XML/XDCE does not reference any existing companion image files; no TIFF image files found referenced in index".into(),
         ));
     }
     if has_tiff_companion {
@@ -920,7 +965,7 @@ impl InCellReader {
         let mut size_x = m.image_width;
         let mut size_y = m.image_height;
         let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
+        let mut bits = 16u16;
         let mut little_endian = true;
         let mut is_tiff_first = false;
 
@@ -1042,7 +1087,7 @@ impl InCellReader {
                 size_c: series_size_c,
                 size_t: series_size_t,
                 pixel_type,
-                bits_per_pixel: bits,
+                bits_per_pixel: (bits).into(),
                 image_count: size_z * series_size_c * series_size_t,
                 dimension_order: DimensionOrder::XYZCT,
                 is_rgb: false,
@@ -1427,6 +1472,51 @@ impl FormatReader for InCellReader {
                 });
             }
 
+            let mut planes = Vec::new();
+            if let Some(meta) = self.series.get(s) {
+                planes.reserve(meta.image_count as usize);
+                for plane_index in 0..meta.image_count {
+                    let (the_z, the_c, the_t) = match meta.dimension_order {
+                        DimensionOrder::XYZCT => (
+                            plane_index % meta.size_z.max(1),
+                            (plane_index / meta.size_z.max(1)) % meta.size_c.max(1),
+                            plane_index / (meta.size_z.max(1) * meta.size_c.max(1)),
+                        ),
+                        DimensionOrder::XYZTC => (
+                            plane_index % meta.size_z.max(1),
+                            plane_index / (meta.size_z.max(1) * meta.size_t.max(1)),
+                            (plane_index / meta.size_z.max(1)) % meta.size_t.max(1),
+                        ),
+                        DimensionOrder::XYCZT => (
+                            (plane_index / meta.size_c.max(1)) % meta.size_z.max(1),
+                            plane_index % meta.size_c.max(1),
+                            plane_index / (meta.size_c.max(1) * meta.size_z.max(1)),
+                        ),
+                        DimensionOrder::XYCTZ => (
+                            plane_index / (meta.size_c.max(1) * meta.size_t.max(1)),
+                            plane_index % meta.size_c.max(1),
+                            (plane_index / meta.size_c.max(1)) % meta.size_t.max(1),
+                        ),
+                        DimensionOrder::XYTZC => (
+                            (plane_index / meta.size_t.max(1)) % meta.size_z.max(1),
+                            plane_index / (meta.size_t.max(1) * meta.size_z.max(1)),
+                            plane_index % meta.size_t.max(1),
+                        ),
+                        DimensionOrder::XYTCZ => (
+                            plane_index / (meta.size_t.max(1) * meta.size_c.max(1)),
+                            (plane_index / meta.size_t.max(1)) % meta.size_c.max(1),
+                            plane_index % meta.size_t.max(1),
+                        ),
+                    };
+                    planes.push(OmePlane {
+                        the_z,
+                        the_c,
+                        the_t,
+                        ..Default::default()
+                    });
+                }
+            }
+
             images.push(OmeImage {
                 name: Some(name),
                 // Java: store.setImageAcquisitionDate(creationDate).
@@ -1434,6 +1524,7 @@ impl FormatReader for InCellReader {
                 physical_size_x: h.physical_size_x.filter(|&v| v > 0.0),
                 physical_size_y: h.physical_size_y.filter(|&v| v > 0.0),
                 channels,
+                planes,
                 instrument_ref: if has_instrument { Some(0) } else { None },
                 objective_ref: if has_objective { Some(0) } else { None },
                 ..Default::default()

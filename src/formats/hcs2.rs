@@ -189,6 +189,41 @@ impl MetaxpressTiffReader {
         files
     }
 
+    /// Flat-directory fallback from `MetaxpressTiffReader.getTiffFiles`: collect
+    /// all sibling TIFFs beginning with the well prefix and ignore thumbnails.
+    /// This handles MetaXpress UUID-suffixed files such as
+    /// `<plate>_A01_s1_[uuid].tif`, which the inherited CellWorx exact-name path
+    /// cannot resolve.
+    fn collect_flat_tiff_files(parent: &Path, base: &str) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = Vec::new();
+        for f in Self::list_dir_sorted(parent) {
+            let name = f.to_string_lossy();
+            if !name.starts_with(base) {
+                continue;
+            }
+            let path = parent.join(&f);
+            let lower = path.to_string_lossy().to_ascii_lowercase();
+            if lower.contains("_thumb") || !(lower.ends_with(".tif") || lower.ends_with(".tiff")) {
+                continue;
+            }
+            files.push(path);
+        }
+        files
+    }
+
+    fn collect_override_tiff_files(
+        parent: &Path,
+        base: &str,
+        n_timepoints: u32,
+        z_steps: u32,
+    ) -> Vec<PathBuf> {
+        let flat = Self::collect_flat_tiff_files(parent, base);
+        if !flat.is_empty() {
+            return flat;
+        }
+        Self::collect_subdir_tiff_files(parent, base, n_timepoints, z_steps)
+    }
+
     /// `Location.list(true)` analogue: directory entry file-names sorted
     /// ascending (matching the `Arrays.sort(zList)` in Java).
     fn list_dir_sorted(dir: &Path) -> Vec<std::ffi::OsString> {
@@ -229,19 +264,6 @@ impl MetaxpressTiffReader {
         }
         None
     }
-
-    /// Does a `TimePoint_*` directory exist beside the HTD? Java only reaches the
-    /// `subdirectories` branch after the flat naming finds nothing; we use this
-    /// as the structural gate before retrying the inner assembly via the hook.
-    fn has_timepoint_layout(path: &Path) -> Option<PathBuf> {
-        let htd = Self::resolve_htd(path)?;
-        let parent = htd.parent()?.to_path_buf();
-        let found = std::fs::read_dir(&parent)
-            .ok()?
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().starts_with("TimePoint_"));
-        found.then_some(htd)
-    }
 }
 
 impl Default for MetaxpressTiffReader {
@@ -280,7 +302,7 @@ impl FormatReader for MetaxpressTiffReader {
                 // that by re-running the assembly through the CellWorxReader hook
                 // with a per-well subdir resolver, so the full well x field x T x Z
                 // series grid is produced instead of a flat single series.
-                let Some(htd) = Self::has_timepoint_layout(path) else {
+                let Some(htd) = Self::resolve_htd(path) else {
                     return Err(e);
                 };
                 let parent = htd
@@ -297,7 +319,7 @@ impl FormatReader for MetaxpressTiffReader {
                             .file_name()
                             .map(|f| f.to_string_lossy().into_owned())
                             .unwrap_or(base);
-                        Self::collect_subdir_tiff_files(
+                        Self::collect_override_tiff_files(
                             &parent,
                             &file_base,
                             dims.n_timepoints,
@@ -339,6 +361,10 @@ impl FormatReader for MetaxpressTiffReader {
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        self.inner.ome_metadata()
     }
 
     fn resolution_count(&self) -> usize {
@@ -538,7 +564,7 @@ impl SimplePciTiffReader {
                 m.image_count = m.image_count.saturating_mul(m.size_c);
             }
             if let Some(bpp) = bits_per_pixel {
-                m.bits_per_pixel = bpp;
+                m.bits_per_pixel = (bpp).into();
             }
             // OME-store equivalents, surfaced as series metadata.
             if let Some(d) = &date {
@@ -1791,13 +1817,20 @@ tiff_wrapper! {
 pub struct TrestleReader {
     inner: crate::tiff::TiffReader,
     /// `overlaps[coreIndex*2 + {0,1}]` — the per-tile X/Y pixel overlaps parsed
-    /// from the first IFD comment's `OverlapsXY` entry. Indexed by core (=
-    /// resolution) index, mirroring Java's `overlaps[getCoreIndex()*2 + …]`.
+    /// from the first IFD comment's `OverlapsXY` entry. Indexed by flattened
+    /// core (= resolution) index, mirroring Java's `overlaps[getCoreIndex()*2 + …]`.
     overlaps: Vec<i64>,
-    /// IFD index backing each flattened Trestle series, in series order (Java
-    /// `ifds.get(getCoreIndex())`). Empty when the regroup did not run (single
-    /// IFD), in which case pixel reads delegate straight to the inner reader.
+    /// IFD index backing each public flattened Trestle series, in Java core
+    /// order (`ifds.get(getCoreIndex())`). Empty when the regroup did not run
+    /// (single IFD), in which case pixel reads delegate straight to the inner
+    /// reader.
     level_ifd: Vec<usize>,
+    /// Overlap-adjusted metadata for each public resolution. Java computes
+    /// these adjusted core values in `initStandardMetadata`; the shared TIFF
+    /// sub-resolution metadata uses raw IFD dimensions, so Trestle keeps the
+    /// Java-adjusted copies here.
+    level_metadata: Vec<ImageMetadata>,
+    current_metadata: Option<ImageMetadata>,
 }
 
 impl TrestleReader {
@@ -1806,6 +1839,8 @@ impl TrestleReader {
             inner: crate::tiff::TiffReader::new(),
             overlaps: Vec::new(),
             level_ifd: Vec::new(),
+            level_metadata: Vec::new(),
+            current_metadata: None,
         }
     }
 
@@ -1875,15 +1910,16 @@ impl TrestleReader {
         }
 
         // Mirror the core-metadata rebuild in `TrestleReader.initStandardMetadata`:
-        // every main IFD becomes a separate series. SizeX/SizeY are reduced by
-        // the per-tile overlaps.
+        // Java's default public view has flattened resolutions, so every IFD is
+        // exposed as a top-level series with resolutionCount=1. SizeX/SizeY are
+        // reduced by the per-tile overlaps.
         self.regroup_resolutions(overlaps.as_deref());
     }
 
     /// Faithful port of the core-metadata loop in
-    /// `TrestleReader.initStandardMetadata`. Each main IFD is one resolution
-    /// series; `overlaps[index*2 + {0,1}]` are the per-tile X/Y overlaps used to
-    /// shrink each level's `SizeX`/`SizeY`.
+    /// `TrestleReader.initStandardMetadata` with Java's default flattened
+    /// public view: every main IFD is a series. `overlaps[index*2 + {0,1}]`
+    /// are the per-tile X/Y overlaps used to shrink each level's `SizeX`/`SizeY`.
     fn regroup_resolutions(&mut self, overlaps: Option<&[i64]>) {
         let ifd_count = self.inner.ifd_count();
         if ifd_count <= 1 {
@@ -1956,6 +1992,8 @@ impl TrestleReader {
         }
 
         let mut flattened = Vec::with_capacity(ifd_count);
+        let mut level_metadata = Vec::with_capacity(ifd_count);
+
         for (index, source) in series.iter().cloned().enumerate() {
             let Some(level) = levels.get(index) else {
                 return;
@@ -1992,13 +2030,16 @@ impl TrestleReader {
                         .insert("PhysicalSizeY".to_string(), MetadataValue::Float(value));
                 }
             }
+            level_metadata.push(s.metadata.clone());
             flattened.push(s);
         }
 
-        // Record the per-series IFD mapping and the (per-core-index) overlaps so
+        // Record the per-core IFD mapping and the (per-core-index) overlaps so
         // `openBytes` can replicate Java's overlap-aware `tiffParser.getSamples`.
         self.level_ifd = ifd_for_series.clone();
         self.overlaps = overlaps.map(|o| o.to_vec()).unwrap_or_default();
+        self.current_metadata = level_metadata.first().cloned();
+        self.level_metadata = level_metadata;
 
         self.inner.replace_series(flattened);
     }
@@ -2027,6 +2068,8 @@ impl FormatReader for TrestleReader {
         self.inner.close()?;
         self.overlaps.clear();
         self.level_ifd.clear();
+        self.level_metadata.clear();
+        self.current_metadata = None;
         self.inner.set_id(path)?;
         for series in self.inner.series_list_mut() {
             series.metadata.series_metadata.insert(
@@ -2041,6 +2084,8 @@ impl FormatReader for TrestleReader {
     fn close(&mut self) -> Result<()> {
         self.overlaps.clear();
         self.level_ifd.clear();
+        self.level_metadata.clear();
+        self.current_metadata = None;
         self.inner.close()
     }
 
@@ -2052,7 +2097,9 @@ impl FormatReader for TrestleReader {
         if self.inner.series_count() == 0 {
             return Err(BioFormatsError::NotInitialized);
         }
-        self.inner.set_series(s)
+        self.inner.set_series(s)?;
+        self.current_metadata = self.level_metadata.get(s).cloned();
+        Ok(())
     }
 
     fn series(&self) -> usize {
@@ -2060,7 +2107,9 @@ impl FormatReader for TrestleReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.current_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -2086,11 +2135,7 @@ impl FormatReader for TrestleReader {
         if self.level_ifd.is_empty() {
             return self.inner.open_bytes_region(p, x, y, w, h);
         }
-        let core_index = if self.inner.resolution_count() > 1 {
-            self.inner.resolution()
-        } else {
-            self.inner.series()
-        };
+        let core_index = self.inner.series();
         let ifd_index = match self.level_ifd.get(core_index) {
             Some(&i) => i,
             None => return self.inner.open_bytes_region(p, x, y, w, h),
@@ -2251,15 +2296,20 @@ impl FormatReader for TrestleReader {
             let _ = ome.populate_pixels(&series.metadata, index);
             if let Some(image) = ome.images.get_mut(index) {
                 image.name = Some(format!("Series {}", index + 1));
-                if let Some(MetadataValue::Float(value)) =
-                    series.metadata.series_metadata.get("PhysicalSizeX")
-                {
-                    image.physical_size_x = Some(*value);
-                }
-                if let Some(MetadataValue::Float(value)) =
-                    series.metadata.series_metadata.get("PhysicalSizeY")
-                {
-                    image.physical_size_y = Some(*value);
+                if index == 0 {
+                    if let Some(MetadataValue::Float(value)) =
+                        series.metadata.series_metadata.get("PhysicalSizeX")
+                    {
+                        image.physical_size_x = Some(*value);
+                    }
+                    if let Some(MetadataValue::Float(value)) =
+                        series.metadata.series_metadata.get("PhysicalSizeY")
+                    {
+                        image.physical_size_y = Some(*value);
+                    }
+                } else {
+                    image.physical_size_x = None;
+                    image.physical_size_y = None;
                 }
             }
         }
@@ -2271,7 +2321,13 @@ impl FormatReader for TrestleReader {
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        if level == 0 {
+            self.inner.set_resolution(level)
+        } else {
+            Err(BioFormatsError::Format(format!(
+                "Trestle flattened public series expose only resolution level 0, got {level}"
+            )))
+        }
     }
 }
 
@@ -4224,6 +4280,170 @@ impl HcsAssembly {
         crop_full_plane("BD Pathway", &full, &meta, 1, x, y, w, h)
     }
 
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeInstrument, OmeMetadata, OmeObjective, OmePlane, OmePlate, OmeWell,
+            OmeWellSample,
+        };
+
+        if self.series.is_empty() {
+            return None;
+        }
+
+        let mut ome = OmeMetadata::default();
+        for (image_index, meta) in self.series.iter().enumerate() {
+            let _ = ome.populate_pixels(meta, image_index);
+            let image = &mut ome.images[image_index];
+            image.name = hcs_meta_string(meta, "ImageName")
+                .or_else(|| hcs_meta_string(meta, "image.name"))
+                .or_else(|| hcs_java_hcs_image_name(meta, image_index));
+            image.physical_size_x = hcs_meta_f64(meta, "PhysicalSizeX")
+                .or_else(|| hcs_meta_f64(meta, "columbus.PhysicalSizeX"));
+            image.physical_size_y = hcs_meta_f64(meta, "PhysicalSizeY")
+                .or_else(|| hcs_meta_f64(meta, "columbus.PhysicalSizeY"));
+            image.physical_size_z = hcs_meta_f64(meta, "PhysicalSizeZ")
+                .or_else(|| hcs_meta_f64(meta, "columbus.PhysicalSizeZ"));
+
+            for c in 0..image.channels.len() {
+                if let Some(name) = hcs_meta_string(meta, &format!("channel.{c}.name"))
+                    .or_else(|| hcs_meta_string(meta, &format!("Channel {c} Name")))
+                    .or_else(|| hcs_meta_string(meta, &format!("columbus.channel.{c}.name")))
+                {
+                    image.channels[c].name = Some(name);
+                }
+                if let Some(emission) =
+                    hcs_meta_f64(meta, &format!("channel.{c}.emission_wavelength"))
+                        .or_else(|| hcs_meta_f64(meta, &format!("columbus.channel.{c}.emission")))
+                {
+                    image.channels[c].emission_wavelength = Some(emission);
+                }
+                if let Some(excitation) =
+                    hcs_meta_f64(meta, &format!("channel.{c}.excitation_wavelength"))
+                        .or_else(|| hcs_meta_f64(meta, &format!("columbus.channel.{c}.excitation")))
+                {
+                    image.channels[c].excitation_wavelength = Some(excitation);
+                }
+            }
+
+            image.planes.clear();
+            for p in 0..meta.image_count {
+                let (z, c, t) = get_zct_coords(
+                    meta.dimension_order,
+                    meta.size_z,
+                    meta.size_c,
+                    meta.size_t,
+                    p,
+                );
+                image.planes.push(OmePlane {
+                    the_z: z,
+                    the_c: c,
+                    the_t: t,
+                    delta_t: hcs_meta_f64(meta, "PlaneDeltaT")
+                        .or_else(|| hcs_meta_f64(meta, "columbus.PlaneDeltaT")),
+                    exposure_time: hcs_meta_f64(meta, &format!("Channel {c} ExposureTime"))
+                        .or_else(|| hcs_meta_f64(meta, &format!("columbus.channel.{c}.exposure"))),
+                    position_x: hcs_meta_f64(meta, "PlanePositionX")
+                        .or_else(|| hcs_meta_f64(meta, "columbus.PlanePositionX")),
+                    position_y: hcs_meta_f64(meta, "PlanePositionY")
+                        .or_else(|| hcs_meta_f64(meta, "columbus.PlanePositionY")),
+                    position_z: hcs_meta_f64(meta, "PlanePositionZ")
+                        .or_else(|| hcs_meta_f64(meta, "columbus.PlanePositionZ")),
+                });
+            }
+        }
+
+        let plate_rows = self
+            .series
+            .iter()
+            .filter_map(|m| hcs_meta_u32(m, "PlateRows").or_else(|| hcs_meta_u32(m, "plate_rows")))
+            .max()
+            .unwrap_or(0);
+        let plate_columns = self
+            .series
+            .iter()
+            .filter_map(|m| {
+                hcs_meta_u32(m, "PlateColumns").or_else(|| hcs_meta_u32(m, "plate_columns"))
+            })
+            .max()
+            .unwrap_or(0);
+
+        if plate_rows > 0 || plate_columns > 0 || self.series.iter().any(hcs_has_well_metadata) {
+            let mut wells: Vec<OmeWell> = Vec::new();
+            for (image_index, meta) in self.series.iter().enumerate() {
+                let row = hcs_meta_u32(meta, "WellRow")
+                    .or_else(|| hcs_meta_u32(meta, "columbus.WellRow"))
+                    .unwrap_or(image_index as u32);
+                let column = hcs_meta_u32(meta, "WellColumn")
+                    .or_else(|| hcs_meta_u32(meta, "columbus.WellColumn"))
+                    .unwrap_or(0);
+                let well_index = wells
+                    .iter()
+                    .position(|well| well.row == row && well.column == column)
+                    .unwrap_or_else(|| {
+                        let index = wells.len();
+                        wells.push(OmeWell {
+                            id: Some(create_lsid("Well", &[0, index])),
+                            row,
+                            column,
+                            well_samples: Vec::new(),
+                        });
+                        index
+                    });
+                let field = hcs_meta_u32(meta, "FieldIndex")
+                    .or_else(|| hcs_meta_u32(meta, "columbus.FieldIndex"))
+                    .unwrap_or(wells[well_index].well_samples.len() as u32);
+                wells[well_index].well_samples.push(OmeWellSample {
+                    id: Some(create_lsid("WellSample", &[0, well_index, field as usize])),
+                    index: image_index as u32,
+                    image_ref: Some(image_index),
+                    position_x: hcs_meta_f64(meta, "WellSamplePositionX")
+                        .or_else(|| hcs_meta_f64(meta, "columbus.WellSamplePositionX")),
+                    position_y: hcs_meta_f64(meta, "WellSamplePositionY")
+                        .or_else(|| hcs_meta_f64(meta, "columbus.WellSamplePositionY")),
+                });
+            }
+            ome.plates.push(OmePlate {
+                id: Some(create_lsid("Plate", &[0])),
+                name: self
+                    .series
+                    .iter()
+                    .find_map(|m| hcs_meta_string(m, "Plate name")),
+                rows: plate_rows,
+                columns: plate_columns,
+                wells,
+            });
+        }
+
+        let objective_magnification = self.series.iter().find_map(|m| {
+            hcs_meta_f64(m, "objective.nominal_magnification")
+                .or_else(|| hcs_meta_f64(m, "objective.magnification"))
+                .or_else(|| hcs_meta_f64(m, "operetta.ObjectiveMagnification"))
+        });
+        let objective_lens_na = self.series.iter().find_map(|m| {
+            hcs_meta_f64(m, "objective.lens_na")
+                .or_else(|| hcs_meta_f64(m, "objective.na"))
+                .or_else(|| hcs_meta_f64(m, "operetta.ObjectiveNA"))
+        });
+        if objective_magnification.is_some() || objective_lens_na.is_some() {
+            ome.instruments.push(OmeInstrument {
+                id: Some(create_lsid("Instrument", &[0])),
+                objectives: vec![OmeObjective {
+                    id: Some(create_lsid("Objective", &[0, 0])),
+                    nominal_magnification: objective_magnification,
+                    lens_na: objective_lens_na,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            for image in &mut ome.images {
+                image.instrument_ref = Some(0);
+                image.objective_ref = Some(0);
+            }
+        }
+
+        Some(ome)
+    }
+
     fn validate(&self, format_name: &str) -> Result<()> {
         if self.series.is_empty() {
             return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -4236,7 +4456,6 @@ impl HcsAssembly {
             )));
         }
 
-        let mut saw_payload = false;
         for (series_index, meta) in self.series.iter().enumerate() {
             if meta.size_x == 0
                 || meta.size_y == 0
@@ -4278,7 +4497,6 @@ impl HcsAssembly {
                     if tr.set_id(&tile.filename).is_err() {
                         continue;
                     }
-                    saw_payload = true;
                     let tm = tr.metadata();
                     if tm.size_x == 0 || tm.size_y == 0 || tm.image_count == 0 {
                         continue;
@@ -4315,13 +4533,66 @@ impl HcsAssembly {
                 }
             }
         }
-        if !saw_payload {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "{format_name}: index does not reference any readable companion TIFF payload"
-            )));
-        }
         Ok(())
     }
+}
+
+fn hcs_meta_string(meta: &ImageMetadata, key: &str) -> Option<String> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn hcs_meta_f64(meta: &ImageMetadata, key: &str) -> Option<f64> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::Float(value)) => Some(*value),
+        Some(MetadataValue::Int(value)) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn hcs_meta_u32(meta: &ImageMetadata, key: &str) -> Option<u32> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::Int(value)) => (*value >= 0).then_some(*value as u32),
+        Some(MetadataValue::Float(value)) if *value >= 0.0 => Some(*value as u32),
+        _ => None,
+    }
+}
+
+fn hcs_has_well_metadata(meta: &ImageMetadata) -> bool {
+    hcs_meta_u32(meta, "WellRow").is_some()
+        || hcs_meta_u32(meta, "WellColumn").is_some()
+        || hcs_meta_u32(meta, "columbus.WellRow").is_some()
+        || hcs_meta_u32(meta, "columbus.WellColumn").is_some()
+}
+
+fn hcs_java_hcs_image_name(meta: &ImageMetadata, image_index: usize) -> Option<String> {
+    let field = hcs_meta_u32(meta, "FieldIndex")
+        .or_else(|| hcs_meta_u32(meta, "columbus.FieldIndex"))
+        .map(|v| v + 1)
+        .unwrap_or(1);
+    if meta
+        .series_metadata
+        .get("format")
+        .and_then(|v| match v {
+            MetadataValue::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .map(|s| s.contains("ScanR"))
+        .unwrap_or(false)
+    {
+        let well = hcs_meta_u32(meta, "WellIndex")
+            .map(|v| v + 1)
+            .unwrap_or(image_index as u32 + 1);
+        return Some(format!(
+            "Well {}, Field {} (Spot {})",
+            well,
+            field,
+            image_index + 1
+        ));
+    }
+    None
 }
 
 /// Build an `ImageMetadata` for an assembled HCS series.
@@ -4333,7 +4604,7 @@ fn make_series_meta(
     size_c: u32,
     size_t: u32,
     pixel_type: PixelType,
-    bits: u8,
+    bits: u16,
     little_endian: bool,
     order: DimensionOrder,
     format: &str,
@@ -4350,7 +4621,7 @@ fn make_series_meta(
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: bits,
+        bits_per_pixel: (bits).into(),
         image_count: size_z * size_c * size_t,
         dimension_order: order,
         is_rgb: false,
@@ -4369,7 +4640,7 @@ fn make_series_meta(
 
 /// Probe a TIFF for (size_x, size_y, pixel_type, bits, little_endian).
 /// Returns `None` if the file cannot be opened.
-fn probe_tiff(path: &Path) -> Option<(u32, u32, PixelType, u8, bool)> {
+fn probe_tiff(path: &Path) -> Option<(u32, u32, PixelType, u16, bool)> {
     let mut tr = crate::tiff::TiffReader::new();
     if tr.set_id(path).is_ok() {
         let m = tr.metadata();
@@ -4448,6 +4719,10 @@ macro_rules! impl_assembled_reader {
                     .series
                     .get(self.asm.current_series)
                     .unwrap_or(crate::common::reader::uninitialized_metadata())
+            }
+
+            fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+                self.asm.ome_metadata()
             }
 
             fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -4734,7 +5009,7 @@ impl FormatReader for InCell3000Reader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("frm") | Some("xdce"))
+        matches!(ext.as_deref(), Some("frm"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -5339,6 +5614,13 @@ mod xmlutil {
 /// Java FormatTools.getWellName(row, col): row letter(s) + 1-based column.
 fn well_name(row: i32, col: i32) -> String {
     // Row 0 -> 'A', 25 -> 'Z', 26 -> 'AA', etc.
+    let letters = well_row_letters(row);
+    // Java FormatTools.getWellName zero-pads the 1-based column to a minimum
+    // of 2 digits (FormatTools.java:1372-1376): "A1" -> "A01".
+    format!("{}{:02}", letters, col + 1)
+}
+
+fn well_row_letters(row: i32) -> String {
     let mut r = row;
     let mut letters = String::new();
     loop {
@@ -5349,9 +5631,7 @@ fn well_name(row: i32, col: i32) -> String {
             break;
         }
     }
-    // Java FormatTools.getWellName zero-pads the 1-based column to a minimum
-    // of 2 digits (FormatTools.java:1372-1376): "A1" -> "A01".
-    format!("{}{:02}", letters, col + 1)
+    letters
 }
 
 // ===========================================================================
@@ -5643,9 +5923,9 @@ mod operetta {
         // Determine pixel type / size from the first valid TIFF found.
         let mut size_x = planes[0].x.max(1);
         let mut size_y = planes[0].y.max(1);
-        let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
-        let mut little_endian = true;
+        let mut pixel_type = PixelType::Int8;
+        let mut bits = 8u16;
+        let mut little_endian = false;
         'find: for sp in &series_planes {
             for p in sp.iter().flatten() {
                 if let Some(f) = &p.filename {
@@ -5709,7 +5989,7 @@ mod operetta {
                 );
             }
             // Per-channel + per-plane scalars (OperettaReader.populateMetadataStore).
-            project_series_metadata(&mut meta, sp, size_c, size_z);
+            project_series_metadata(&mut meta, sp, size_c, size_z, plate_rows, plate_cols);
             series.push(meta);
             asm_planes.push(
                 sp.iter()
@@ -6220,9 +6500,50 @@ mod operetta {
         sp: &[Option<Plane>],
         size_c: u32,
         size_z: u32,
+        plate_rows: i32,
+        plate_cols: i32,
     ) {
         let m = &mut meta.series_metadata;
         let n = sp.len();
+
+        let mut first: Option<&Plane> = sp.first().and_then(|p| p.as_ref());
+        if let Some(first_plane) = first {
+            let well = super::well_name(first_plane.row, first_plane.col);
+            m.insert(
+                "ImageName".to_string(),
+                MetadataValue::String(format!("Well {well}, Field {}", first_plane.field)),
+            );
+            m.insert(
+                "WellRow".to_string(),
+                MetadataValue::Int(first_plane.row as i64),
+            );
+            m.insert(
+                "WellColumn".to_string(),
+                MetadataValue::Int(first_plane.col as i64),
+            );
+            m.insert(
+                "FieldIndex".to_string(),
+                MetadataValue::Int(first_plane.field.max(0) as i64),
+            );
+            if let Some(x) = first_plane.position_x {
+                m.insert("WellSamplePositionX".to_string(), MetadataValue::Float(x));
+            }
+            if let Some(y) = first_plane.position_y {
+                m.insert("WellSamplePositionY".to_string(), MetadataValue::Float(y));
+            }
+        }
+        if plate_rows > 0 {
+            m.insert(
+                "PlateRows".to_string(),
+                MetadataValue::Int(plate_rows as i64),
+            );
+        }
+        if plate_cols > 0 {
+            m.insert(
+                "PlateColumns".to_string(),
+                MetadataValue::Int(plate_cols as i64),
+            );
+        }
 
         // Objective magnification / NA from the first plane (planes[0][0]).
         if let Some(Some(p0)) = sp.first() {
@@ -6231,15 +6552,19 @@ mod operetta {
                     "operetta.ObjectiveMagnification".to_string(),
                     MetadataValue::Float(mag),
                 );
+                m.insert(
+                    "objective.nominal_magnification".to_string(),
+                    MetadataValue::Float(mag),
+                );
             }
             if let Some(na) = p0.lens_na {
                 m.insert("operetta.ObjectiveNA".to_string(), MetadataValue::Float(na));
+                m.insert("objective.lens_na".to_string(), MetadataValue::Float(na));
             }
         }
 
         // Per-channel metadata. Java picks planes[i][c]; if null, advances by
         // size_c to find the next plane acquired for that channel.
-        let mut first: Option<&Plane> = sp.first().and_then(|p| p.as_ref());
         for c in 0..size_c as usize {
             let mut plane: Option<&Plane> = sp.get(c).and_then(|p| p.as_ref());
             if plane.is_none() {
@@ -6256,6 +6581,10 @@ mod operetta {
                 if let Some(name) = &p.channel_name {
                     m.insert(
                         format!("operetta.Channel{c}.Name"),
+                        MetadataValue::String(name.clone()),
+                    );
+                    m.insert(
+                        format!("channel.{c}.name"),
                         MetadataValue::String(name.clone()),
                     );
                 }
@@ -6283,12 +6612,20 @@ mod operetta {
                             format!("operetta.Channel{c}.EmissionWavelength"),
                             MetadataValue::Float(em),
                         );
+                        m.insert(
+                            format!("channel.{c}.emission_wavelength"),
+                            MetadataValue::Float(em),
+                        );
                     }
                 }
                 if let Some(ex) = p.ex_wavelength {
                     if ex > 0.0 {
                         m.insert(
                             format!("operetta.Channel{c}.ExcitationWavelength"),
+                            MetadataValue::Float(ex),
+                        );
+                        m.insert(
+                            format!("channel.{c}.excitation_wavelength"),
                             MetadataValue::Float(ex),
                         );
                     }
@@ -6347,12 +6684,14 @@ mod operetta {
                     "operetta.PhysicalSizeX".to_string(),
                     MetadataValue::Float(x),
                 );
+                m.insert("PhysicalSizeX".to_string(), MetadataValue::Float(x));
             }
             if let Some(y) = first.resolution_y {
                 m.insert(
                     "operetta.PhysicalSizeY".to_string(),
                     MetadataValue::Float(y),
                 );
+                m.insert("PhysicalSizeY".to_string(), MetadataValue::Float(y));
             }
             if size_z > 1 {
                 if let (Some(last), Some(first_z)) = (last, first.position_z) {
@@ -6365,6 +6704,7 @@ mod operetta {
                             "operetta.PhysicalSizeZ".to_string(),
                             MetadataValue::Float(avg),
                         );
+                        m.insert("PhysicalSizeZ".to_string(), MetadataValue::Float(avg));
                     }
                 }
             }
@@ -6535,7 +6875,7 @@ mod columbus {
         let mut size_x = 1u32;
         let mut size_y = 1u32;
         let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
+        let mut bits = 16u16;
         let mut little_endian = true;
         for p in &planes {
             if let Some(f) = &p.file {
@@ -6610,6 +6950,39 @@ mod columbus {
                         field,
                         size_c,
                         acquisition_date.as_deref(),
+                    );
+                    meta.series_metadata.insert(
+                        "PlateRows".to_string(),
+                        MetadataValue::Int(plate_rows as i64),
+                    );
+                    meta.series_metadata.insert(
+                        "PlateColumns".to_string(),
+                        MetadataValue::Int(plate_cols as i64),
+                    );
+                    meta.series_metadata
+                        .insert("WellRow".to_string(), MetadataValue::Int(row as i64));
+                    meta.series_metadata
+                        .insert("WellColumn".to_string(), MetadataValue::Int(col as i64));
+                    meta.series_metadata
+                        .insert("FieldIndex".to_string(), MetadataValue::Int(field as i64));
+                    meta.series_metadata.insert(
+                        "ImageName".to_string(),
+                        MetadataValue::String(format!(
+                            "{} Well {}{} Field #{}",
+                            measurement
+                                .global
+                                .iter()
+                                .find_map(|(key, value)| match (key.as_str(), value) {
+                                    ("PlateName", MetadataValue::String(name)) => {
+                                        Some(name.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or(""),
+                            well_row_letters(row),
+                            col + 1,
+                            field + 1
+                        )),
                     );
                     // MeasurementHandler.endElement addGlobalMeta(...) keys
                     // (ScreenName, PlateName, PlateType, Measurement, ...).
@@ -6822,11 +7195,19 @@ mod columbus {
                         format!("columbus.Channel{c}.Name"),
                         MetadataValue::String(name.clone()),
                     );
+                    m.insert(
+                        format!("channel.{c}.name"),
+                        MetadataValue::String(name.clone()),
+                    );
                 }
                 if let Some(em) = p.em_wavelength {
                     if em as i64 > 0 {
                         m.insert(
                             format!("columbus.Channel{c}.EmissionWavelength"),
+                            MetadataValue::Float(em),
+                        );
+                        m.insert(
+                            format!("channel.{c}.emission_wavelength"),
                             MetadataValue::Float(em),
                         );
                     }
@@ -6835,6 +7216,10 @@ mod columbus {
                     if ex as i64 > 0 {
                         m.insert(
                             format!("columbus.Channel{c}.ExcitationWavelength"),
+                            MetadataValue::Float(ex),
+                        );
+                        m.insert(
+                            format!("channel.{c}.excitation_wavelength"),
                             MetadataValue::Float(ex),
                         );
                     }
@@ -7390,12 +7775,20 @@ mod scanr {
                 "WellColumn".to_string(),
                 MetadataValue::Int(well_col as i64),
             );
+            meta.series_metadata
+                .insert("WellIndex".to_string(), MetadataValue::Int(well as i64));
+            meta.series_metadata
+                .insert("FieldIndex".to_string(), MetadataValue::Int(field as i64));
 
             // store.setChannelName(channelNames.get(c), i, c).
             for c in 0..size_c as usize {
                 if let Some(cname) = h.channel_names.get(c) {
                     meta.series_metadata.insert(
                         format!("Channel {} Name", c),
+                        MetadataValue::String(cname.clone()),
+                    );
+                    meta.series_metadata.insert(
+                        format!("channel.{c}.name"),
                         MetadataValue::String(cname.clone()),
                     );
                 }
@@ -7448,7 +7841,6 @@ mod scanr {
             if field == n_fields - 1 {
                 well_index_cursor += 1;
             }
-            let _ = well;
 
             // tiffs layout: index = series * image_count + plane (per Java openBytes).
             // tiffs is compacted by the skip-missing-wells loop above, so series
@@ -7921,7 +8313,7 @@ mod bd {
         let mut full_x = 0u32;
         let mut full_y = 0u32;
         let mut pixel_type = PixelType::Uint16;
-        let mut bits_pp = bits;
+        let mut bits_pp = bits as u16;
         let mut little_endian = true;
         for (_, tiffs) in &well_tiffs {
             if let Some(p) = tiffs.first() {
@@ -8166,8 +8558,7 @@ mod cellvoyager {
                             .unwrap_or(1.0);
                     }
                 }
-                let number = ch.child_text(&["Number"]).unwrap_or_default();
-                channel_names.push(format!("Channel {}", number.trim()));
+                channel_names.push(read_channel_name(&ch));
             }
         }
         if channel_names.is_empty() {
@@ -8294,7 +8685,7 @@ mod cellvoyager {
 
         // Probe pixel type from any existing field-0 tile.
         let mut pixel_type = PixelType::Uint16;
-        let mut bits = 16u8;
+        let mut bits = 16u16;
         let mut little_endian = true;
         'probe: for (wi, well) in wells.iter().enumerate() {
             for area in &well.areas {
@@ -8323,7 +8714,7 @@ mod cellvoyager {
             for area in &well.areas {
                 let size_x = area.width.max(tile_w).max(1) as u32;
                 let size_y = area.height.max(tile_h).max(1) as u32;
-                series.push(super::make_series_meta(
+                let mut meta = super::make_series_meta(
                     size_x,
                     size_y,
                     n_z,
@@ -8334,7 +8725,14 @@ mod cellvoyager {
                     little_endian,
                     order,
                     "CellVoyager",
-                ));
+                );
+                for (c, name) in channel_names.iter().enumerate() {
+                    meta.series_metadata.insert(
+                        format!("channel.{c}.name"),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+                series.push(meta);
                 let mut sp = vec![PlaneRef::default(); image_count];
                 for plane in 0..image_count {
                     let (z, c, t) = super::get_zct_coords(order, n_z, n_c, n_t, plane as u32);
@@ -8444,6 +8842,27 @@ mod cellvoyager {
             width: width + tile_w,
             height: height + tile_h,
         }
+    }
+
+    fn read_channel_name(channel_el: &dom::Node) -> String {
+        let excitation_type = channel_el
+            .child(&["Excitation"])
+            .and_then(|node| node.attr("type"))
+            .unwrap_or_default();
+        let excitation_name = channel_el
+            .child_text(&["Excitation", "Name", "Value"])
+            .unwrap_or_default();
+        let emission_name = channel_el
+            .child_text(&["Emission", "Name", "Value"])
+            .unwrap_or_default();
+        let fluorophore_name = channel_el
+            .child_text(&["Emission", "FluorescentProbe", "Value"])
+            .unwrap_or_else(|| "\u{f8}".to_string());
+
+        format!(
+            "Ex: {}({}) / Em: {} / Fl: {}",
+            excitation_type, excitation_name, emission_name, fluorophore_name
+        )
     }
 
     // -- Minimal read-only DOM for navigating MeasurementResult.xml --
@@ -8628,6 +9047,13 @@ mod tests {
         writer.set_id(path).unwrap();
         writer.save_bytes(0, data).unwrap();
         writer.close().unwrap();
+    }
+
+    #[test]
+    fn incell3000_name_suffix_matches_java_frm_only() {
+        let reader = InCell3000Reader::new();
+        assert!(reader.is_this_type_by_name(Path::new("frame.frm")));
+        assert!(!reader.is_this_type_by_name(Path::new("plate.xdce")));
     }
 
     fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
@@ -9018,6 +9444,10 @@ mod tests {
             md.get("columbus.Channel0.EmissionWavelength"),
             Some(MetadataValue::Float(v)) if (*v - 461.0).abs() < 1e-9
         ));
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(ome.images[0].channels[0].emission_wavelength, Some(461.0));
+        assert_eq!(ome.images[0].channels[0].excitation_wavelength, Some(358.0));
         // PositionX 0.001 m -> 1000 um via correct_units("m").
         assert!(matches!(
             md.get("columbus.WellSamplePositionX"),
@@ -9047,6 +9477,47 @@ mod tests {
             md.get("PlateType"),
             Some(MetadataValue::String(v)) if v == "96well"
         ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn operetta_ome_metadata_projects_channel_name_and_wavelengths_like_java() {
+        let dir = temp_path("operetta_channels");
+        let images = dir.join("Images");
+        std::fs::create_dir_all(&images).unwrap();
+
+        let tiff = images.join("img.tif");
+        let meta = test_meta(2, 2);
+        write_tiff(&tiff, &meta, &[1u8, 2, 3, 4]);
+
+        std::fs::write(
+            dir.join("Index.idx.xml"),
+            r#"<EvaluationInputData>
+  <PlateRows>1</PlateRows><PlateColumns>1</PlateColumns>
+  <Entry ChannelID="0">
+    <ChannelName>DAPI</ChannelName>
+    <ImageSizeX>2</ImageSizeX><ImageSizeY>2</ImageSizeY>
+    <MainEmissionWavelength>461</MainEmissionWavelength>
+    <MainExcitationWavelength>358</MainExcitationWavelength>
+  </Entry>
+  <Images><Image>
+    <URL>img.tif</URL>
+    <Row>1</Row><Col>1</Col><FieldID>1</FieldID><PlaneID>0</PlaneID>
+    <TimepointID>0</TimepointID><ChannelID>0</ChannelID>
+  </Image></Images>
+</EvaluationInputData>"#,
+        )
+        .unwrap();
+
+        let mut reader = OperettaReader::new();
+        reader.set_id(&dir.join("Index.idx.xml")).unwrap();
+
+        let ome = reader.ome_metadata().unwrap();
+        let channel = &ome.images[0].channels[0];
+        assert_eq!(channel.name.as_deref(), Some("DAPI"));
+        assert_eq!(channel.emission_wavelength, Some(461.0));
+        assert_eq!(channel.excitation_wavelength, Some(358.0));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -9120,6 +9591,85 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn push_tiff_entry(out: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tiff_entry(tag, typ, count, value));
+    }
+
+    fn write_trestle_two_resolution_tiff(path: &Path) {
+        let mut copyright = b"Copyright Trestle Corp.".to_vec();
+        copyright.push(0);
+        let mut desc = b"OverlapsXY=1 2 0 0;Scanner=MedScan".to_vec();
+        desc.push(0);
+
+        let ifd0 = 8u32;
+        let entries = 15u32;
+        let ifd_size = 2 + entries * 12 + 4;
+        let ifd1 = ifd0 + ifd_size;
+        let copyright_offset = ifd1 + ifd_size;
+        let desc_offset = copyright_offset + copyright.len() as u32;
+        let pixel0_offset = desc_offset + desc.len() as u32;
+        let pixel1_offset = pixel0_offset + 16;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd0.to_le_bytes());
+
+        bytes.extend_from_slice(&(entries as u16).to_le_bytes());
+        push_tiff_entry(&mut bytes, 256, 4, 1, 4);
+        push_tiff_entry(&mut bytes, 257, 4, 1, 4);
+        push_tiff_entry(&mut bytes, 258, 3, 1, 8);
+        push_tiff_entry(&mut bytes, 259, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 262, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 270, 2, desc.len() as u32, desc_offset);
+        push_tiff_entry(&mut bytes, 277, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 284, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 322, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 323, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 324, 4, 4, pixel0_offset);
+        push_tiff_entry(&mut bytes, 325, 4, 4, 16);
+        push_tiff_entry(
+            &mut bytes,
+            33432,
+            2,
+            copyright.len() as u32,
+            copyright_offset,
+        );
+        push_tiff_entry(&mut bytes, 273, 4, 1, pixel0_offset);
+        push_tiff_entry(&mut bytes, 279, 4, 1, 16);
+        bytes.extend_from_slice(&ifd1.to_le_bytes());
+
+        bytes.extend_from_slice(&(entries as u16).to_le_bytes());
+        push_tiff_entry(&mut bytes, 256, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 257, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 258, 3, 1, 8);
+        push_tiff_entry(&mut bytes, 259, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 262, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 270, 2, desc.len() as u32, desc_offset);
+        push_tiff_entry(&mut bytes, 277, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 284, 3, 1, 1);
+        push_tiff_entry(&mut bytes, 322, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 323, 4, 1, 2);
+        push_tiff_entry(&mut bytes, 324, 4, 1, pixel1_offset);
+        push_tiff_entry(&mut bytes, 325, 4, 1, 4);
+        push_tiff_entry(
+            &mut bytes,
+            33432,
+            2,
+            copyright.len() as u32,
+            copyright_offset,
+        );
+        push_tiff_entry(&mut bytes, 273, 4, 1, pixel1_offset);
+        push_tiff_entry(&mut bytes, 279, 4, 1, 4);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        bytes.extend_from_slice(&copyright);
+        bytes.extend_from_slice(&desc);
+        bytes.extend_from_slice(&[1u8; 16]);
+        bytes.extend_from_slice(&[2u8; 4]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn trestle_parses_comment_keyvalues_when_copyright_matches() {
         let path = temp_path("trestle.tif");
@@ -9177,6 +9727,32 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn trestle_pyramid_ifds_are_flattened_series_like_java_default() {
+        let path = temp_path("trestle_pyramid.tif");
+        write_trestle_two_resolution_tiff(&path);
+
+        let mut reader = TrestleReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.metadata().resolution_count, 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (3, 2));
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.metadata().resolution_count, 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.images[0].name.as_deref(), Some("Series 1"));
+        assert_eq!(ome.images[1].name.as_deref(), Some("Series 2"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Build a minimal ScanR dataset (experiment_descriptor.xml + one data TIFF)
     /// and confirm the newly-captured ScanrHandler fields surface into
     /// series_metadata: plate name, physical pixel size, channel name,
@@ -9227,6 +9803,8 @@ mod tests {
             matches!(md.get("Channel 0 Name"), Some(MetadataValue::String(v)) if v == "DAPI"),
             "channel name not captured: {md:?}"
         );
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
         assert!(
             matches!(md.get("Channel 0 ExposureTime"), Some(MetadataValue::Float(v)) if (*v - 1.5).abs() < 1e-9),
             "exposure time (s) not captured: {md:?}"
@@ -9237,6 +9815,52 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cellvoyager_ome_metadata_projects_channel_name_like_java() {
+        let dir = temp_path("cellvoyager_channels");
+        let image_dir = dir.join("Image");
+        std::fs::create_dir_all(&image_dir).unwrap();
+
+        let tiff = image_dir.join("W1F001T0001Z01C1.tif");
+        let meta = test_meta(2, 2);
+        write_tiff(&tiff, &meta, &[1u8, 2, 3, 4]);
+
+        std::fs::write(
+            dir.join("MeasurementResult.xml"),
+            r#"<MeasurementResult xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ObjectiveLens><Magnification>1</Magnification></ObjectiveLens>
+  <Channels><Channel>
+    <IsEnabled>true</IsEnabled>
+    <Number>1</Number>
+    <AcquisitionSetting><Camera>
+      <EffectiveHorizontalPixels_pixel>2</EffectiveHorizontalPixels_pixel>
+      <EffectiveVerticalPixels_pixel>2</EffectiveVerticalPixels_pixel>
+      <HorizonalCellSize_um>1</HorizonalCellSize_um>
+      <VerticalCellSize_um>1</VerticalCellSize_um>
+    </Camera></AcquisitionSetting>
+    <Excitation xsi:type="Laser"><Name><Value>488</Value></Name></Excitation>
+    <Emission><Name><Value>525</Value></Name><FluorescentProbe><Value>GFP</Value></FluorescentProbe></Emission>
+  </Channel></Channels>
+  <Wells><Well>
+    <IsEnabled>true</IsEnabled><Number>1</Number>
+    <Areas><Area><Fields><Field><StageX_um>0</StageX_um><StageY_um>0</StageY_um></Field></Fields></Area></Areas>
+  </Well></Wells>
+</MeasurementResult>"#,
+        )
+        .unwrap();
+
+        let mut reader = CellVoyagerReader::new();
+        reader.set_id(&dir.join("MeasurementResult.xml")).unwrap();
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images[0].channels[0].name.as_deref(),
+            Some("Ex: Laser(488) / Em: 525 / Fl: GFP")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Confirm ScanR subposition-list field positions surface as
@@ -9352,5 +9976,22 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metaxpress_real_htd_projects_metamorph_uic_calibration() {
+        let path = std::path::Path::new(
+            "/big/henriksson/ome_images/MetaXpress/idr0005/Primary_001/2011-04-19-plate-1.HTD",
+        );
+        if !path.exists() {
+            eprintln!("SKIP metaxpress_real_htd_projects_metamorph_uic_calibration (no fixture)");
+            return;
+        }
+
+        let mut reader = MetaxpressTiffReader::new();
+        reader.set_id(path).expect("set_id");
+        let ome = reader.ome_metadata().expect("ome");
+        assert_eq!(ome.images[0].physical_size_x, Some(1.6125));
+        assert_eq!(ome.images[0].physical_size_y, Some(1.6125));
     }
 }

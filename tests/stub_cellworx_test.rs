@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use bioformats::common::metadata::MetadataValue;
 use bioformats::common::reader::FormatReader;
 use bioformats::formats::mias::CellWorxReader;
 
@@ -46,7 +47,20 @@ fn cellworx_parses_htd_and_reads_present_plane() {
             bioformats::common::pixel_type::PixelType::Uint16
         );
         assert!(m.is_little_endian);
+        assert!(matches!(
+            m.series_metadata.get("channel.0.name"),
+            Some(MetadataValue::String(v)) if v == "DAPI"
+        ));
+        assert!(matches!(
+            m.series_metadata.get("channel.1.name"),
+            Some(MetadataValue::String(v)) if v == "FITC"
+        ));
     }
+
+    let ome = reader.ome_metadata().expect("OME metadata after set_id");
+    assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+    assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
+    assert_eq!(ome.images[0].planes.len(), 2);
 
     // Series 0 = well A01. Plane 0 = wavelength 1 (the TIFF that exists).
     reader.set_series(0).expect("set_series(0)");

@@ -1748,14 +1748,14 @@ impl FormatReader for MetamorphReader {
                         .cloned()
                         .unwrap_or_else(|| (series_index + 1).to_string());
                     image.name = Some(format!("Stage{} \"{}\"", series_index + 1, stage_name));
-                    if image.physical_size_x.is_none() {
-                        image.physical_size_x = self.phys_x.or(Some(0.65));
+                    if let Some(v) = self.phys_x.or(Some(0.65)) {
+                        image.physical_size_x = Some(v);
                     }
-                    if image.physical_size_y.is_none() {
-                        image.physical_size_y = self.phys_y.or(Some(0.65));
+                    if let Some(v) = self.phys_y.or(Some(0.65)) {
+                        image.physical_size_y = Some(v);
                     }
-                    if image.physical_size_z.is_none() {
-                        image.physical_size_z = self.phys_z;
+                    if let Some(v) = self.phys_z {
+                        image.physical_size_z = Some(v);
                     }
                     image.instrument_ref = Some(0);
                     image.objective_ref = Some(series_index);
@@ -1813,27 +1813,42 @@ impl FormatReader for MetamorphReader {
             return Some(ome);
         }
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let detector_id = crate::common::ome_metadata::create_lsid("Detector", &[0, 0]);
+        ome.instruments
+            .push(crate::common::ome_metadata::OmeInstrument {
+                id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                detectors: vec![crate::common::ome_metadata::OmeDetector {
+                    id: Some(detector_id.clone()),
+                    detector_type: Some("Other".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
         if let Some(image) = ome.images.first_mut() {
             // Java sets the image name (makeImageName, "" for a standalone STK)
             // and the physical pixel sizes from the UIC calibration tags.
             if let Some(name) = &self.image_name {
                 image.name = Some(name.clone());
             }
-            if image.physical_size_x.is_none() {
-                image.physical_size_x = self.phys_x;
+            if let Some(v) = self.phys_x {
+                image.physical_size_x = Some(v);
             }
-            if image.physical_size_y.is_none() {
-                image.physical_size_y = self.phys_y;
+            if let Some(v) = self.phys_y {
+                image.physical_size_y = Some(v);
             }
-            if image.physical_size_z.is_none() {
-                image.physical_size_z = self.phys_z;
+            if let Some(v) = self.phys_z {
+                image.physical_size_z = Some(v);
             }
+            image.instrument_ref = Some(0);
             // Java sets DetectorSettings binning (and gain) per channel from the
             // UIC1 CameraBin field / comment Gain (store.setDetectorSettingsBinning
             // / setDetectorSettingsGain). The generic OME builder only surfaces
             // channel name/wavelengths from series_metadata, so apply binning/gain
             // here directly.
             for ch in image.channels.iter_mut() {
+                if ch.detector_ref.is_none() {
+                    ch.detector_ref = Some(detector_id.clone());
+                }
                 if ch.detector_settings_binning.is_none() {
                     if let Some(binning) = &self.data.binning {
                         ch.detector_settings_binning = Some(binning.clone());
@@ -2611,5 +2626,24 @@ mod tests {
         let ome = reader.ome_metadata().expect("ome");
         let ch0 = &ome.images[0].channels[0];
         assert_eq!(ch0.detector_settings_binning.as_deref(), Some("1x1"));
+    }
+
+    #[test]
+    fn metamorph_real_metaxpress_tiff_reads_uic_calibration() {
+        let path = Path::new(
+            "/big/henriksson/ome_images/MetaXpress/idr0005/Primary_001/\
+             2011-04-19-plate-1_A01_s1_[A192FCC1-DC1A-4523-97BB-07688327EAC3].tif",
+        );
+        if !path.exists() {
+            eprintln!("SKIP metamorph_real_metaxpress_tiff_reads_uic_calibration (no fixture)");
+            return;
+        }
+
+        let mut reader = MetamorphReader::new();
+        reader.set_id(path).expect("set_id");
+        let ome = reader.ome_metadata().expect("ome");
+        let image = &ome.images[0];
+        assert_eq!(image.physical_size_x, Some(1.6125));
+        assert_eq!(image.physical_size_y, Some(1.6125));
     }
 }

@@ -15,7 +15,12 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{
+    DimensionOrder, ImageMetadata, MetadataLevel, MetadataOptions, MetadataValue,
+};
+use crate::common::ome_metadata::{
+    create_lsid, OmeDetector, OmeExperimenter, OmeInstrument, OmePlane, OmeROI, OmeShape,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -34,16 +39,40 @@ pub struct ZeissZviReader {
     current_series: usize,
     /// OME enrichment harvested from the per-item Tags streams.
     ome_info: ZviOmeInfo,
+    metadata_options: MetadataOptions,
 }
 
 /// OME metadata harvested from ZVI tag streams, mirroring the subset of
-/// BaseZeissReader.parseMainTags that the parity harness checks: physical pixel
-/// sizes and per-channel name / emission / excitation, keyed by channel index.
+/// BaseZeissReader.parseMainTags that can be backed by already parsed Rust tag
+/// streams: image description, physical pixel sizes, objective fields,
+/// detector/channel fields, and per-plane exposure/stage metadata.
 #[derive(Default, Clone)]
 struct ZviOmeInfo {
+    image_description: Option<String>,
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
     physical_size_z: Option<f64>,
+    objective_magnification: Option<f64>,
+    objective_lens_na: Option<f64>,
+    objective_immersion: Option<String>,
+    objective_working_distance: Option<f64>,
+    acquisition_date: Option<String>,
+    experimenter_first_name: Option<String>,
+    experimenter_last_name: Option<String>,
+    experimenter_institution: Option<String>,
+    objective_id: Option<String>,
+    objective_correction: Option<String>,
+    /// channel index -> detector gain
+    detector_gain: HashMap<u32, f64>,
+    /// channel index -> detector offset
+    detector_offset: HashMap<u32, f64>,
+    /// image item index -> exposure time (seconds)
+    exposure_time: HashMap<usize, f64>,
+    /// image item index -> camera acquisition timestamp, in Java/ZVI Excel days.
+    camera_time: HashMap<usize, f64>,
+    /// image item index -> stage X/Y in reference-frame units.
+    stage_x: HashMap<usize, f64>,
+    stage_y: HashMap<usize, f64>,
     /// channel index -> name
     channel_names: HashMap<u32, String>,
     /// channel index -> emission wavelength (nm)
@@ -52,11 +81,14 @@ struct ZviOmeInfo {
     excitation: HashMap<u32, f64>,
     /// channel index -> Java packed false color.
     channel_colors: HashMap<u32, i32>,
+    rois: Vec<OmeROI>,
 }
 
 struct ZviPlane {
     /// Stream path inside the CFB, e.g. "/Image/Item(1)/CONTENTS"
     stream_path: String,
+    /// Original Item(N) index, used to attach per-item Tags to sorted planes.
+    image_num: usize,
     z: u32,
     c: u32,
     t: u32,
@@ -232,20 +264,123 @@ fn read_zero_padded<R: Read>(reader: &mut R, out: &mut [u8]) -> std::io::Result<
     Ok(())
 }
 
-/// Harvest OME-relevant tags from one item's Tags stream, mirroring
+fn parse_f64_tag(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+fn zvi_immersion_from_tag(value: &str) -> Option<String> {
+    match value.trim().parse::<i32>().ok()? {
+        2 => Some("Oil".to_string()),
+        3 => Some("Water".to_string()),
+        _ => Some("Other".to_string()),
+    }
+}
+
+fn parse_zvi_objective_name(value: &str) -> (Option<String>, Option<f64>, Option<f64>) {
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        let Some(slash) = token.find('/') else {
+            continue;
+        };
+        if slash == 0 {
+            continue;
+        }
+        let mag = token[..slash].trim_end_matches('x').parse::<f64>().ok();
+        let na = token[slash + 1..].parse::<f64>().ok();
+        let correction = i
+            .checked_sub(1)
+            .and_then(|prev| tokens.get(prev))
+            .map(|s| (*s).to_string());
+        return (correction, mag, na);
+    }
+    (None, None, None)
+}
+
+fn zvi_timestamp_to_iso8601(value: &str) -> Option<String> {
+    let dstamp = value.trim().parse::<f64>().ok()?;
+    if !dstamp.is_finite() {
+        return None;
+    }
+
+    let mut days = dstamp.floor() as i64 - 1;
+    if days > 60 {
+        // Match BaseZeissReader.parseTimestamp's Excel leap-year correction.
+        days -= 1;
+    }
+    let millis_in_day = 24.0 * 60.0 * 60.0 * 1000.0;
+    let mut millis = ((dstamp - dstamp.floor()) * millis_in_day + 0.5).floor() as i64;
+    if millis >= 86_400_000 {
+        days += 1;
+        millis -= 86_400_000;
+    }
+
+    let (year, month, day) = civil_from_days(days);
+    let hour = millis / 3_600_000;
+    let minute = (millis / 60_000) % 60;
+    let second = (millis / 1000) % 60;
+    let millis = millis % 1000;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}"
+    ))
+}
+
+fn civil_from_days(days_since_1900_01_01: i64) -> (i64, u32, u32) {
+    // Howard Hinnant's civil-from-days algorithm, with Unix day 0 shifted to
+    // Java's ZVI epoch of 1900-01-01.
+    let z = days_since_1900_01_01 - 25_567 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    (y + if m <= 2 { 1 } else { 0 }, m as u32, d as u32)
+}
+
+/// Harvest OME-relevant tags from one Tags stream, mirroring
 /// BaseZeissReader.parseMainTags. Reads each (value, tagID) record in stream
 /// order, tracking the current channel index (tag 2820 "Image Channel Index")
 /// so that channel name (1284), emission (16777489), and excitation (16777488)
 /// are attributed to the right channel. Physical sizes come from tags 769/772/775
 /// ("Scale Factor for X/Y/Z"); Java keeps the first value seen for each.
+/// Per-image tags such as exposure time and stage X/Y are attached when
+/// `image_num` is the enclosing Item(N), matching ZeissZVIReader.java:246-257
+/// and BaseZeissReader.java:934-1014.
 ///
 /// `c_index` is threaded across all item streams to match Java's stateful field.
-fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
+fn harvest_zvi_ome_tags(
+    data: &[u8],
+    info: &mut ZviOmeInfo,
+    c_index: &mut i32,
+    image_num: Option<usize>,
+) {
     const TAG_SCALE_X: u32 = 769;
     const TAG_SCALE_Y: u32 = 772;
     const TAG_SCALE_Z: u32 = 775;
     const TAG_CHANNEL_COLOR: u32 = 1282;
     const TAG_CHANNEL_NAME: u32 = 1284;
+    const TAG_COMMENTS: u32 = 1540;
+    const TAG_ACQUISITION_DATE: u32 = 1793;
+    const TAG_USER_COMPANY: u32 = 1795;
+    const TAG_USER_NAME: u32 = 1801;
+    const TAG_OBJECTIVE_NAME: u32 = 2049;
+    const TAG_OBJECTIVE_MAGNIFICATION: u32 = 1412;
+    const TAG_OBJECTIVE_MAGNIFICATION_ALT: u32 = 2076;
+    const TAG_OBJECTIVE_NA: u32 = 1413;
+    const TAG_OBJECTIVE_NA_ALT: u32 = 2077;
+    const TAG_OBJECTIVE_WORKING_DISTANCE: u32 = 1415;
+    const TAG_OBJECTIVE_WORKING_DISTANCE_ALT: u32 = 2151;
+    const TAG_OBJECTIVE_IMMERSION: u32 = 1416;
+    const TAG_OBJECTIVE_IMMERSION_ALT: u32 = 2105;
+    const TAG_OBJECTIVE_ID: u32 = 2261;
+    const TAG_CAMERA_ACQUISITION_TIME: u32 = 1025;
+    const TAG_EXPOSURE_TIME_MS: u32 = 2564;
+    const TAG_ORCA_ANALOG_GAIN: u32 = 65_633;
+    const TAG_ORCA_ANALOG_OFFSET: u32 = 65_634;
+    const TAG_STAGE_X: u32 = 16777218;
+    const TAG_STAGE_Y: u32 = 16777219;
     const TAG_CHANNEL_INDEX: u32 = 2820;
     const TAG_EXCITATION: u32 = 16_777_488;
     const TAG_EMISSION: u32 = 16_777_489;
@@ -282,24 +417,76 @@ fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
             }
             TAG_SCALE_X => {
                 if info.physical_size_x.is_none() {
-                    if let Ok(v) = value.trim().parse::<f64>() {
+                    if let Some(v) = parse_f64_tag(&value) {
                         info.physical_size_x = Some(v);
                     }
                 }
             }
             TAG_SCALE_Y => {
                 if info.physical_size_y.is_none() {
-                    if let Ok(v) = value.trim().parse::<f64>() {
+                    if let Some(v) = parse_f64_tag(&value) {
                         info.physical_size_y = Some(v);
                     }
                 }
             }
             TAG_SCALE_Z => {
                 if info.physical_size_z.is_none() {
-                    if let Ok(v) = value.trim().parse::<f64>() {
+                    if let Some(v) = parse_f64_tag(&value) {
                         info.physical_size_z = Some(v);
                     }
                 }
+            }
+            TAG_COMMENTS => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    info.image_description = Some(value.to_string());
+                }
+            }
+            TAG_ACQUISITION_DATE => {
+                info.acquisition_date = zvi_timestamp_to_iso8601(&value);
+            }
+            TAG_USER_NAME => {
+                let parts: Vec<&str> = value.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    info.experimenter_first_name = Some(parts[0].to_string());
+                    info.experimenter_last_name = Some(parts[parts.len() - 1].to_string());
+                }
+            }
+            TAG_USER_COMPANY => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    info.experimenter_institution = Some(value.to_string());
+                }
+            }
+            TAG_OBJECTIVE_NAME => {
+                let (correction, mag, na) = parse_zvi_objective_name(&value);
+                if let Some(v) = mag.filter(|v| *v > 0.0) {
+                    info.objective_magnification = Some(v);
+                }
+                if let Some(v) = na.filter(|v| *v > 0.0) {
+                    info.objective_lens_na = Some(v);
+                }
+                if let Some(v) = correction {
+                    info.objective_correction = Some(v);
+                }
+            }
+            TAG_OBJECTIVE_MAGNIFICATION | TAG_OBJECTIVE_MAGNIFICATION_ALT => {
+                info.objective_magnification = parse_f64_tag(&value).filter(|v| *v > 0.0);
+            }
+            TAG_OBJECTIVE_ID => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    info.objective_id = Some(format!("Objective:{value}"));
+                }
+            }
+            TAG_OBJECTIVE_NA | TAG_OBJECTIVE_NA_ALT => {
+                info.objective_lens_na = parse_f64_tag(&value).filter(|v| *v > 0.0);
+            }
+            TAG_OBJECTIVE_WORKING_DISTANCE | TAG_OBJECTIVE_WORKING_DISTANCE_ALT => {
+                info.objective_working_distance = parse_f64_tag(&value).filter(|v| *v > 0.0);
+            }
+            TAG_OBJECTIVE_IMMERSION | TAG_OBJECTIVE_IMMERSION_ALT => {
+                info.objective_immersion = zvi_immersion_from_tag(&value);
             }
             TAG_CHANNEL_NAME => {
                 if *c_index != -1 {
@@ -314,9 +501,43 @@ fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
                     }
                 }
             }
+            TAG_EXPOSURE_TIME_MS => {
+                if let (Some(image_num), Some(v)) = (image_num, parse_f64_tag(&value)) {
+                    info.exposure_time.entry(image_num).or_insert(v / 1000.0);
+                }
+            }
+            TAG_CAMERA_ACQUISITION_TIME => {
+                if let (Some(image_num), Some(v)) = (image_num, parse_f64_tag(&value)) {
+                    info.camera_time.insert(image_num, v);
+                }
+            }
+            TAG_STAGE_X => {
+                if let (Some(image_num), Some(v)) = (image_num, parse_f64_tag(&value)) {
+                    info.stage_x.insert(image_num, v);
+                }
+            }
+            TAG_STAGE_Y => {
+                if let (Some(image_num), Some(v)) = (image_num, parse_f64_tag(&value)) {
+                    info.stage_y.insert(image_num, v);
+                }
+            }
+            TAG_ORCA_ANALOG_GAIN => {
+                if *c_index != -1 {
+                    if let Some(v) = parse_f64_tag(&value) {
+                        info.detector_gain.insert(*c_index as u32, v);
+                    }
+                }
+            }
+            TAG_ORCA_ANALOG_OFFSET => {
+                if *c_index != -1 {
+                    if let Some(v) = parse_f64_tag(&value) {
+                        info.detector_offset.insert(*c_index as u32, v);
+                    }
+                }
+            }
             TAG_EMISSION => {
                 if *c_index != -1 {
-                    if let Ok(v) = value.trim().parse::<f64>() {
+                    if let Some(v) = parse_f64_tag(&value) {
                         if v > 0.0 {
                             info.emission.insert(*c_index as u32, v);
                         }
@@ -325,7 +546,7 @@ fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
             }
             TAG_EXCITATION => {
                 if *c_index != -1 {
-                    if let Ok(v) = value.trim().parse::<f64>() {
+                    if let Some(v) = parse_f64_tag(&value) {
                         if v > 0.0 {
                             info.excitation.insert(*c_index as u32, v);
                         }
@@ -390,6 +611,7 @@ impl ZeissZviReader {
             tile_count: 1,
             current_series: 0,
             ome_info: ZviOmeInfo::default(),
+            metadata_options: MetadataOptions::default(),
         }
     }
 }
@@ -420,16 +642,48 @@ impl<'a> Cursor<'a> {
         self.pos = self.pos.saturating_add(n);
     }
 
+    fn seek(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     fn read_i16(&mut self) -> Option<i16> {
         let b = self.data.get(self.pos..self.pos + 2)?;
         self.pos += 2;
         Some(i16::from_le_bytes([b[0], b[1]]))
     }
 
+    fn read_u16(&mut self) -> Option<u16> {
+        let b = self.data.get(self.pos..self.pos + 2)?;
+        self.pos += 2;
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    }
+
     fn read_i32(&mut self) -> Option<i32> {
         let b = self.data.get(self.pos..self.pos + 4)?;
         self.pos += 4;
         Some(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_u64(&mut self) -> Option<u64> {
+        let b = self.data.get(self.pos..self.pos + 8)?;
+        self.pos += 8;
+        Some(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn read_f64(&mut self) -> Option<f64> {
+        let b = self.data.get(self.pos..self.pos + 8)?;
+        self.pos += 8;
+        Some(f64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+        let b = self.data.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        Some(b)
     }
 
     fn read_string(&mut self, len: usize) {
@@ -487,6 +741,520 @@ fn skip_next_tag(s: &mut Cursor) {
             s.read_string(fp.saturating_sub(old).saturating_add(2));
         }
     }
+}
+
+const ZVI_ROI_SIGNATURE: u64 = 0x21fff6977547000d;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZviFeatureType {
+    Unknown,
+    Point,
+    Points,
+    Line,
+    Caliper,
+    Distance,
+    MultipleCaliper,
+    MultipleDistance,
+    Angle3,
+    Angle4,
+    Circle,
+    ScaleBar,
+    PolylineOpen,
+    AlignedRectangle,
+    Rectangle,
+    Ellipse,
+    PolylineClosed,
+    Text,
+    Length,
+    SplineOpen,
+    SplineClosed,
+    Lut,
+    MeasProfile,
+    MeasPoint,
+    MeasPoints,
+    MeasLine,
+    MeasCaliper,
+    MeasDistance,
+    MeasMultipleCaliper,
+    MeasMultipleDistance,
+    MeasAngle3,
+    MeasAngle4,
+    MeasCircle,
+    MeasPolylineOpen,
+    MeasAlignedRectangle,
+    MeasRectangle,
+    MeasEllipse,
+    MeasPolylineClosed,
+    MeasLength,
+    MeasSplineOpen,
+    MeasSplineClosed,
+}
+
+impl ZviFeatureType {
+    fn get(value: i32) -> Self {
+        match value {
+            0 => Self::Point,
+            1 => Self::Points,
+            2 => Self::Line,
+            3 => Self::Caliper,
+            4 => Self::Distance,
+            5 => Self::MultipleDistance,
+            7 => Self::Angle3,
+            8 => Self::Angle4,
+            9 => Self::Circle,
+            10 => Self::ScaleBar,
+            12 => Self::PolylineOpen,
+            13 => Self::AlignedRectangle,
+            14 => Self::Rectangle,
+            15 => Self::Ellipse,
+            16 => Self::PolylineClosed,
+            17 => Self::Text,
+            18 => Self::Length,
+            19 => Self::SplineOpen,
+            20 => Self::SplineClosed,
+            21 => Self::Lut,
+            28 | 284 => Self::MeasProfile,
+            32 => Self::MeasPoint,
+            33 => Self::MeasPoints,
+            34 => Self::MeasLine,
+            35 => Self::MeasCaliper,
+            36 => Self::MeasDistance,
+            37 => Self::MeasMultipleCaliper,
+            38 => Self::MeasMultipleDistance,
+            39 => Self::MeasAngle3,
+            40 => Self::MeasAngle4,
+            41 => Self::MeasCircle,
+            42 => Self::MeasPolylineOpen,
+            43 => Self::MeasAlignedRectangle,
+            44 => Self::MeasRectangle,
+            45 => Self::MeasEllipse,
+            46 => Self::MeasPolylineClosed,
+            48 => Self::MeasLength,
+            49 => Self::MeasSplineOpen,
+            50 => Self::MeasSplineClosed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+struct ZviParsedShape {
+    ty: ZviFeatureType,
+    name: Option<String>,
+    text: Option<String>,
+    points: Vec<(f64, f64)>,
+}
+
+fn parse_zvi_roi_string(s: &mut Cursor) -> Option<String> {
+    while s.pos < s.len().saturating_sub(4) {
+        if s.read_u16()? == 8 {
+            break;
+        }
+    }
+    if s.pos >= s.len().saturating_sub(8) {
+        return None;
+    }
+    let strlen = s.read_i32()?.max(0) as usize;
+    if strlen.checked_add(s.pos)? > s.len() {
+        return None;
+    }
+    if strlen >= 2 {
+        let raw = s.read_bytes(strlen - 2)?;
+        s.skip(2);
+        let utf16: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|&ch| ch != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&utf16))
+    } else {
+        s.skip(strlen);
+        Some(String::new())
+    }
+}
+
+fn zvi_points_to_shape(shape: &ZviParsedShape) -> Vec<OmeShape> {
+    let p = &shape.points;
+    let none = (None, None, None);
+    match shape.ty {
+        ZviFeatureType::Point
+        | ZviFeatureType::Points
+        | ZviFeatureType::MeasPoint
+        | ZviFeatureType::MeasPoints => p
+            .iter()
+            .map(|&(x, y)| OmeShape::Point {
+                x,
+                y,
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            })
+            .collect(),
+        ZviFeatureType::Line | ZviFeatureType::MeasLine | ZviFeatureType::MeasProfile
+            if p.len() >= 2 =>
+        {
+            vec![OmeShape::Line {
+                x1: p[0].0,
+                y1: p[0].1,
+                x2: p[1].0,
+                y2: p[1].1,
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            }]
+        }
+        ZviFeatureType::Circle | ZviFeatureType::MeasCircle if p.len() >= 2 => {
+            let radius = ((p[0].0 - p[1].0).powi(2) + (p[0].1 - p[1].1).powi(2)).sqrt();
+            vec![
+                OmeShape::Ellipse {
+                    x: p[0].0,
+                    y: p[0].1,
+                    radius_x: radius,
+                    radius_y: radius,
+                    the_z: none.0,
+                    the_t: none.1,
+                    the_c: none.2,
+                },
+                OmeShape::Line {
+                    x1: p[0].0,
+                    y1: p[0].1,
+                    x2: p[1].0,
+                    y2: p[1].1,
+                    the_z: none.0,
+                    the_t: none.1,
+                    the_c: none.2,
+                },
+            ]
+        }
+        ZviFeatureType::ScaleBar if p.len() >= 2 => vec![
+            OmeShape::Line {
+                x1: p[0].0,
+                y1: p[0].1,
+                x2: p[1].0,
+                y2: p[1].1,
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            },
+            OmeShape::Point {
+                x: p[0].0,
+                y: p[0].1,
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            },
+            OmeShape::Rectangle {
+                x: p[0].0,
+                y: p[0].1,
+                width: p[1].0 - p[0].0,
+                height: p[1].1 - p[0].1,
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            },
+        ],
+        ZviFeatureType::PolylineOpen
+        | ZviFeatureType::MeasPolylineOpen
+        | ZviFeatureType::SplineOpen
+        | ZviFeatureType::MeasSplineOpen
+            if p.len() >= 2 =>
+        {
+            vec![OmeShape::Polyline {
+                points: p.clone(),
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            }]
+        }
+        ZviFeatureType::PolylineClosed
+        | ZviFeatureType::MeasPolylineClosed
+        | ZviFeatureType::SplineClosed
+        | ZviFeatureType::MeasSplineClosed
+            if p.len() >= 2 =>
+        {
+            vec![OmeShape::Polygon {
+                points: p.clone(),
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            }]
+        }
+        ZviFeatureType::AlignedRectangle
+        | ZviFeatureType::MeasAlignedRectangle
+        | ZviFeatureType::Text
+            if p.len() >= 3 =>
+        {
+            vec![
+                OmeShape::Point {
+                    x: p[0].0,
+                    y: p[0].1,
+                    the_z: none.0,
+                    the_t: none.1,
+                    the_c: none.2,
+                },
+                OmeShape::Rectangle {
+                    x: p[0].0,
+                    y: p[0].1,
+                    width: p[2].0 - p[0].0,
+                    height: p[2].1 - p[0].1,
+                    the_z: none.0,
+                    the_t: none.1,
+                    the_c: none.2,
+                },
+            ]
+        }
+        ZviFeatureType::Rectangle | ZviFeatureType::MeasRectangle if p.len() >= 4 => {
+            vec![OmeShape::Polygon {
+                points: p.iter().take(4).copied().collect(),
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            }]
+        }
+        ZviFeatureType::Ellipse | ZviFeatureType::MeasEllipse if p.len() >= 3 => {
+            vec![OmeShape::Ellipse {
+                x: (p[0].0 + p[2].0) / 2.0,
+                y: (p[0].1 + p[2].1) / 2.0,
+                radius_x: (p[2].0 - p[0].0) / 2.0,
+                radius_y: (p[2].1 - p[0].1) / 2.0,
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            }]
+        }
+        ZviFeatureType::Caliper
+        | ZviFeatureType::MeasCaliper
+        | ZviFeatureType::Distance
+        | ZviFeatureType::MeasDistance
+        | ZviFeatureType::MultipleCaliper
+        | ZviFeatureType::MeasMultipleCaliper
+        | ZviFeatureType::MultipleDistance
+        | ZviFeatureType::MeasMultipleDistance => {
+            let mut point_count = p.len();
+            if matches!(
+                shape.ty,
+                ZviFeatureType::Caliper | ZviFeatureType::MeasCaliper
+            ) {
+                point_count = point_count.saturating_sub(2);
+            }
+            p.windows(2)
+                .take(point_count.saturating_sub(1))
+                .map(|w| OmeShape::Line {
+                    x1: w[0].0,
+                    y1: w[0].1,
+                    x2: w[1].0,
+                    y2: w[1].1,
+                    the_z: none.0,
+                    the_t: none.1,
+                    the_c: none.2,
+                })
+                .collect()
+        }
+        ZviFeatureType::Angle3
+        | ZviFeatureType::MeasAngle3
+        | ZviFeatureType::Angle4
+        | ZviFeatureType::MeasAngle4
+            if p.len() >= 4 =>
+        {
+            vec![
+                OmeShape::Line {
+                    x1: p[0].0,
+                    y1: p[0].1,
+                    x2: p[1].0,
+                    y2: p[1].1,
+                    the_z: none.0,
+                    the_t: none.1,
+                    the_c: none.2,
+                },
+                OmeShape::Line {
+                    x1: p[2].0,
+                    y1: p[2].1,
+                    x2: p[3].0,
+                    y2: p[3].1,
+                    the_z: none.0,
+                    the_t: none.1,
+                    the_c: none.2,
+                },
+            ]
+        }
+        ZviFeatureType::Length | ZviFeatureType::MeasLength if p.len() >= 6 => p
+            .windows(2)
+            .take(5)
+            .step_by(2)
+            .map(|w| OmeShape::Line {
+                x1: w[0].0,
+                y1: w[0].1,
+                x2: w[1].0,
+                y2: w[1].1,
+                the_z: none.0,
+                the_t: none.1,
+                the_c: none.2,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_zvi_roi_stream(data: &[u8]) -> Vec<OmeROI> {
+    let mut s = Cursor::new(data);
+    if s.len() < 18 {
+        return Vec::new();
+    }
+
+    // ZeissZVIReader.parseROIs seeks to byte 2, reads the layer version, then
+    // optionally reads a UTF-16LE BSTR layer name before the shape count.
+    s.seek(2);
+    let _layer_version = match s.read_i32() {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let tmp = s.pos;
+    let layer_name = if s.read_u16() == Some(8) {
+        s.seek(tmp);
+        parse_zvi_roi_string(&mut s)
+    } else {
+        None
+    };
+    s.skip(8);
+    let Some(roi_count) = s.read_u16() else {
+        return Vec::new();
+    };
+
+    let mut shapes = Vec::new();
+    while shapes.len() < roi_count as usize && s.pos < s.len().saturating_sub(8) {
+        let mut signature = match s.read_u64() {
+            Some(v) => v,
+            None => break,
+        };
+        while signature != ZVI_ROI_SIGNATURE {
+            if s.pos >= s.len() {
+                break;
+            }
+            s.seek(s.pos.saturating_sub(6));
+            signature = match s.read_u64() {
+                Some(v) => v,
+                None => break,
+            };
+        }
+        if s.pos >= s.len() {
+            break;
+        }
+
+        let roi_offset = s.pos.saturating_sub(8);
+        s.seek(roi_offset + 26);
+        let Some(length) = s.read_i32() else {
+            break;
+        };
+        s.skip(length.max(0) as usize + 6);
+
+        let Some(shape_attr_length) = s.read_i32() else {
+            break;
+        };
+        let Some(shape_type) = s.read_i32() else {
+            break;
+        };
+        let ty = ZviFeatureType::get(shape_type);
+        if shape_attr_length < 32 {
+            break;
+        }
+
+        s.skip(8);
+        let (Some(_x1), Some(_y1), Some(_x2), Some(_y2)) =
+            (s.read_i32(), s.read_i32(), s.read_i32(), s.read_i32())
+        else {
+            break;
+        };
+        if shape_attr_length >= 72 {
+            s.skip(16 + 7 * 4);
+        }
+        if shape_attr_length >= 100 {
+            s.skip(5 * 4);
+        }
+        if shape_attr_length >= 148 {
+            s.skip(36 + 4 * 4);
+        }
+        if shape_attr_length >= 152 {
+            s.skip(4);
+        }
+        if shape_attr_length >= 156 {
+            s.skip(4);
+        }
+
+        let tmp = s.pos;
+        let text = if s.read_u16() == Some(8) {
+            s.seek(tmp);
+            parse_zvi_roi_string(&mut s)
+        } else if s.read_u16() == Some(8) {
+            s.seek(tmp + 2);
+            parse_zvi_roi_string(&mut s)
+        } else {
+            None
+        };
+
+        if s.pos + 8 > s.len() {
+            break;
+        }
+        s.skip(4);
+        let _tag_id = s.read_i32();
+
+        if parse_zvi_roi_string(&mut s).is_none() {
+            break;
+        }
+        let name = match parse_zvi_roi_string(&mut s) {
+            Some(v) => (!v.is_empty()).then_some(v),
+            None => break,
+        };
+
+        if s.pos + 20 > s.len() {
+            break;
+        }
+        s.skip(4);
+        let _handle_size = s.read_i32();
+        s.skip(2);
+        let Some(point_count) = s.read_i32() else {
+            break;
+        };
+        s.skip(6);
+        if point_count < 0 || s.pos + (16 * point_count as usize) > s.len() {
+            break;
+        }
+
+        let mut points = Vec::with_capacity(point_count as usize);
+        for _ in 0..point_count {
+            let (Some(x), Some(y)) = (s.read_f64(), s.read_f64()) else {
+                points.clear();
+                break;
+            };
+            points.push((x, y));
+        }
+        if points.len() == point_count as usize {
+            shapes.push(ZviParsedShape {
+                ty,
+                name,
+                text,
+                points,
+            });
+        }
+    }
+
+    let mut rois = Vec::new();
+    for shape in shapes {
+        if matches!(shape.ty, ZviFeatureType::Unknown | ZviFeatureType::Lut) {
+            continue;
+        }
+        let ome_shapes = zvi_points_to_shape(&shape);
+        if !ome_shapes.is_empty() {
+            rois.push(OmeROI {
+                id: Some(create_lsid("ROI", &[rois.len()])),
+                name: shape.name.or(shape.text),
+                shapes: ome_shapes,
+            });
+        }
+    }
+    if rois.is_empty() && layer_name.is_some() {
+        return Vec::new();
+    }
+    rois
 }
 
 /// Result of parsing a single ZVI item (image) stream.
@@ -644,6 +1412,7 @@ fn parse_zvi_item_stream<R: Read + Seek>(stream: &mut R) -> Result<Option<Parsed
 
 fn parse_zvi(
     path: &Path,
+    parse_overlays: bool,
 ) -> Result<(
     ImageMetadata,
     Vec<ZviPlane>,
@@ -782,8 +1551,10 @@ fn parse_zvi(
         // Keep every image stream, including tiles. ZeissZVIReader records the
         // tile index in coordinates[i][3] and exposes each tile as a series
         // rather than stitching them into a single plane.
+        let image_num = item_num(&stream_path) as usize;
         planes.push(ZviPlane {
             stream_path,
+            image_num,
             z: item.z,
             c: item.c,
             t: item.t,
@@ -810,7 +1581,7 @@ fn parse_zvi(
             let mut data = Vec::new();
             if stream.read_to_end(&mut data).is_ok() {
                 series_metadata.extend(parse_zvi_tag_stream(&data, image_num));
-                harvest_zvi_ome_tags(&data, &mut ome_info, &mut c_index);
+                harvest_zvi_ome_tags(&data, &mut ome_info, &mut c_index, Some(image_num));
             }
         }
     }
@@ -823,7 +1594,39 @@ fn parse_zvi(
         let mut data = Vec::new();
         if stream.read_to_end(&mut data).is_ok() {
             let mut scratch_index: i32 = -1;
-            harvest_zvi_ome_tags(&data, &mut ome_info, &mut scratch_index);
+            harvest_zvi_ome_tags(&data, &mut ome_info, &mut scratch_index, None);
+        }
+    }
+
+    if parse_overlays {
+        let mut shape_paths: Vec<String> = comp
+            .walk()
+            .filter_map(|entry| {
+                if !entry.is_stream() {
+                    return None;
+                }
+                let p = entry.path().to_string_lossy().to_string();
+                if p.to_ascii_uppercase().ends_with("/CONTENTS")
+                    && parent_dir(&p).eq_ignore_ascii_case("Shapes")
+                    && p.to_ascii_uppercase().contains("ITEM")
+                {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        shape_paths.sort_by_key(|p| item_num(p));
+        for shape_path in shape_paths {
+            if let Ok(mut stream) = comp.open_stream(&shape_path) {
+                let mut data = Vec::new();
+                if stream.read_to_end(&mut data).is_ok() {
+                    ome_info.rois.extend(parse_zvi_roi_stream(&data));
+                }
+            }
+        }
+        for (ri, roi) in ome_info.rois.iter_mut().enumerate() {
+            roi.id = Some(create_lsid("ROI", &[ri]));
         }
     }
 
@@ -934,7 +1737,7 @@ fn parse_zvi(
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: (bytes_per_sample * 8) as u8,
+        bits_per_pixel: (bytes_per_sample * 8) as u16,
         image_count,
         dimension_order,
         is_rgb,
@@ -1006,7 +1809,9 @@ impl FormatReader for ZeissZviReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, planes, bpp, is_rgb, tile_count, ome_info, comp) = parse_zvi(path)?;
+        let parse_overlays = self.metadata_options.level == MetadataLevel::All;
+        let (meta, planes, bpp, is_rgb, tile_count, ome_info, comp) =
+            parse_zvi(path, parse_overlays)?;
         self.meta = Some(meta);
         self.planes = planes;
         self.comp = Some(comp);
@@ -1028,6 +1833,10 @@ impl FormatReader for ZeissZviReader {
         self.current_series = 0;
         self.ome_info = ZviOmeInfo::default();
         Ok(())
+    }
+
+    fn set_metadata_options(&mut self, options: MetadataOptions) {
+        self.metadata_options = options;
     }
 
     fn series_count(&self) -> usize {
@@ -1097,6 +1906,7 @@ impl FormatReader for ZeissZviReader {
         let stream_path = plane.stream_path.clone();
         let plane = ZviPlane {
             stream_path: stream_path.clone(),
+            image_num: plane.image_num,
             z: plane.z,
             c: plane.c,
             t: plane.t,
@@ -1270,6 +2080,8 @@ impl FormatReader for ZeissZviReader {
                 .map(str::to_string);
         }
 
+        img.description = info.image_description.clone();
+        img.acquisition_date = info.acquisition_date.clone();
         img.physical_size_x = info.physical_size_x;
         img.physical_size_y = info.physical_size_y;
         img.physical_size_z = info.physical_size_z;
@@ -1282,6 +2094,8 @@ impl FormatReader for ZeissZviReader {
         channel_keys.extend(info.channel_colors.keys().copied());
         channel_keys.extend(info.emission.keys().copied());
         channel_keys.extend(info.excitation.keys().copied());
+        channel_keys.extend(info.detector_gain.keys().copied());
+        channel_keys.extend(info.detector_offset.keys().copied());
         channel_keys.sort_unstable();
         channel_keys.dedup();
         for (ci, ch) in img.channels.iter_mut().enumerate() {
@@ -1299,7 +2113,119 @@ impl FormatReader for ZeissZviReader {
                 let blue = ((color >> 16) & 0xff) as u8;
                 ch.color = Some(u32::from_be_bytes([red, green, blue, 0xff]) as i32);
             }
+            ch.detector_ref = Some(create_lsid("Detector", &[0, ci]));
+            ch.detector_settings_gain = info.detector_gain.get(&key).copied();
+            ch.detector_settings_offset = info.detector_offset.get(&key).copied();
         }
+
+        img.planes.clear();
+        let base = self.current_series.checked_mul(meta.image_count as usize)?;
+        let first_camera_time = self
+            .planes
+            .get(base)
+            .and_then(|plane| info.camera_time.get(&plane.image_num))
+            .copied()
+            .or_else(|| info.camera_time.values().copied().min_by(f64::total_cmp));
+        for plane_index in 0..meta.image_count {
+            let plane = self.planes.get(base + plane_index as usize)?;
+            let image_num = plane.image_num;
+            let exposure_time = info.exposure_time.get(&image_num).copied();
+            let delta_t = match (info.camera_time.get(&image_num).copied(), first_camera_time) {
+                (Some(stamp), Some(first)) => Some((stamp - first) * 86_400.0),
+                _ => None,
+            };
+            let position_x = info.stage_x.get(&image_num).copied();
+            let position_y = info.stage_y.get(&image_num).copied();
+            if exposure_time.is_some()
+                || delta_t.is_some()
+                || position_x.is_some()
+                || position_y.is_some()
+            {
+                img.planes.push(OmePlane {
+                    the_z: plane.z,
+                    the_c: plane.c,
+                    the_t: plane.t,
+                    delta_t,
+                    exposure_time,
+                    position_x,
+                    position_y,
+                    position_z: None,
+                });
+            }
+        }
+
+        let has_objective = info.objective_magnification.is_some()
+            || info.objective_lens_na.is_some()
+            || info.objective_immersion.is_some()
+            || info.objective_working_distance.is_some()
+            || info.objective_id.is_some()
+            || info.objective_correction.is_some();
+        // BaseZeissReader creates one detector per logical ZVI channel. Gain and
+        // offset tags only enrich those detector records when present.
+        let has_detector = !img.channels.is_empty();
+        if has_objective || has_detector {
+            if ome.instruments.is_empty() {
+                ome.instruments.push(OmeInstrument {
+                    id: Some(create_lsid("Instrument", &[0])),
+                    ..Default::default()
+                });
+            }
+            img.instrument_ref = Some(0);
+            if has_objective {
+                if ome.instruments[0].objectives.is_empty() {
+                    ome.instruments[0].objectives.push(Default::default());
+                }
+                let objective = &mut ome.instruments[0].objectives[0];
+                objective.id = info
+                    .objective_id
+                    .clone()
+                    .or_else(|| Some(create_lsid("Objective", &[0, 0])));
+                objective.nominal_magnification = info.objective_magnification;
+                objective.lens_na = info.objective_lens_na;
+                objective.immersion = info.objective_immersion.clone();
+                objective.correction = info
+                    .objective_correction
+                    .clone()
+                    .or_else(|| Some("Other".to_string()));
+                objective.working_distance = info.objective_working_distance;
+                img.objective_ref = Some(0);
+            }
+            if has_detector {
+                let detector_count = img.channels.len();
+                let detectors = &mut ome.instruments[0].detectors;
+                while detectors.len() < detector_count {
+                    let di = detectors.len();
+                    let key = channel_keys.get(di).copied().unwrap_or(di as u32);
+                    detectors.push(OmeDetector {
+                        id: Some(create_lsid("Detector", &[0, di])),
+                        detector_type: Some("Other".to_string()),
+                        gain: info.detector_gain.get(&key).copied(),
+                        offset: info.detector_offset.get(&key).copied(),
+                        ..Default::default()
+                    });
+                }
+                for (ci, channel) in img.channels.iter_mut().enumerate() {
+                    if channel.detector_ref.is_none() {
+                        channel.detector_ref = Some(create_lsid("Detector", &[0, ci]));
+                    }
+                }
+            }
+        }
+
+        if info.experimenter_first_name.is_some()
+            || info.experimenter_last_name.is_some()
+            || info.experimenter_institution.is_some()
+        {
+            ome.experimenters.push(OmeExperimenter {
+                id: Some(create_lsid("Experimenter", &[0])),
+                first_name: info.experimenter_first_name.clone(),
+                last_name: info.experimenter_last_name.clone(),
+                institution: info.experimenter_institution.clone(),
+                ..Default::default()
+            });
+        }
+
+        ome.rois.extend(info.rois.clone());
 
         Some(ome)
     }
@@ -1378,6 +2304,46 @@ mod tests {
         build_item_with_pad(z, c, t, tile, pixel, 1100)
     }
 
+    fn tag_i32(tag_id: u32, value: i32) -> Vec<u8> {
+        let mut tag = Vec::new();
+        tag.extend_from_slice(&3u16.to_le_bytes());
+        tag.extend_from_slice(&value.to_le_bytes());
+        tag.extend_from_slice(&[0u8; 2]);
+        tag.extend_from_slice(&tag_id.to_le_bytes());
+        tag.extend_from_slice(&[0u8; 6]);
+        tag
+    }
+
+    fn tag_f64(tag_id: u32, value: f64) -> Vec<u8> {
+        let mut tag = Vec::new();
+        tag.extend_from_slice(&5u16.to_le_bytes());
+        tag.extend_from_slice(&value.to_le_bytes());
+        tag.extend_from_slice(&[0u8; 2]);
+        tag.extend_from_slice(&tag_id.to_le_bytes());
+        tag.extend_from_slice(&[0u8; 6]);
+        tag
+    }
+
+    fn tag_string(tag_id: u32, value: &str) -> Vec<u8> {
+        let mut tag = Vec::new();
+        tag.extend_from_slice(&8u16.to_le_bytes());
+        tag.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        tag.extend_from_slice(value.as_bytes());
+        tag.extend_from_slice(&[0u8; 2]);
+        tag.extend_from_slice(&tag_id.to_le_bytes());
+        tag.extend_from_slice(&[0u8; 6]);
+        tag
+    }
+
+    fn build_tag_stream(tags: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut stream = vec![0u8; 8];
+        stream.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+        for tag in tags {
+            stream.extend_from_slice(&tag);
+        }
+        stream
+    }
+
     struct OneByteReads {
         data: Vec<u8>,
         pos: usize,
@@ -1394,6 +2360,52 @@ mod tests {
         }
     }
 
+    fn roi_string(value: &str) -> Vec<u8> {
+        let utf16: Vec<u16> = value.encode_utf16().collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&((utf16.len() * 2 + 2) as i32).to_le_bytes());
+        for ch in utf16 {
+            out.extend_from_slice(&ch.to_le_bytes());
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn build_roi_stream(shape_type: i32, name: &str, points: &[(f64, f64)]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&3u16.to_le_bytes());
+        stream.extend_from_slice(&0x04100010i32.to_le_bytes());
+        stream.extend_from_slice(&0u16.to_le_bytes());
+        stream.extend_from_slice(&[0u8; 8]);
+        stream.extend_from_slice(&1u16.to_le_bytes());
+        stream.extend_from_slice(&ZVI_ROI_SIGNATURE.to_le_bytes());
+        stream.extend_from_slice(&[0u8; 18]);
+        stream.extend_from_slice(&0i32.to_le_bytes());
+        stream.extend_from_slice(&[0u8; 6]);
+        stream.extend_from_slice(&32i32.to_le_bytes());
+        stream.extend_from_slice(&shape_type.to_le_bytes());
+        stream.extend_from_slice(&[0u8; 8]);
+        stream.extend_from_slice(&0i32.to_le_bytes());
+        stream.extend_from_slice(&0i32.to_le_bytes());
+        stream.extend_from_slice(&100i32.to_le_bytes());
+        stream.extend_from_slice(&100i32.to_le_bytes());
+        stream.extend_from_slice(&[0u8; 8]);
+        stream.extend_from_slice(&0i32.to_le_bytes());
+        stream.extend_from_slice(&roi_string("Arial"));
+        stream.extend_from_slice(&roi_string(name));
+        stream.extend_from_slice(&[0u8; 4]);
+        stream.extend_from_slice(&5i32.to_le_bytes());
+        stream.extend_from_slice(&[0u8; 2]);
+        stream.extend_from_slice(&(points.len() as i32).to_le_bytes());
+        stream.extend_from_slice(&[0u8; 6]);
+        for &(x, y) in points {
+            stream.extend_from_slice(&x.to_le_bytes());
+            stream.extend_from_slice(&y.to_le_bytes());
+        }
+        stream
+    }
+
     #[test]
     fn zvi_zero_padded_read_loops_until_eof() {
         let mut reader = OneByteReads {
@@ -1403,6 +2415,18 @@ mod tests {
         let mut out = vec![0; 5];
         read_zero_padded(&mut reader, &mut out).unwrap();
         assert_eq!(out, vec![1, 2, 3, 0, 0]);
+    }
+
+    #[test]
+    fn zvi_timestamp_conversion_matches_java_excel_epoch() {
+        assert_eq!(
+            zvi_timestamp_to_iso8601("1.0").as_deref(),
+            Some("1900-01-01T00:00:00.000")
+        );
+        assert_eq!(
+            zvi_timestamp_to_iso8601("43831.5").as_deref(),
+            Some("2020-01-01T12:00:00.000")
+        );
     }
 
     #[test]
@@ -1538,6 +2562,186 @@ mod tests {
         assert_eq!((meta.size_x, meta.size_y, meta.image_count), (1, 1, 1));
         assert_eq!(meta.pixel_type, PixelType::Uint8);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![77]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zvi_ome_metadata_projects_java_parse_main_tags_subset() {
+        let path = temp_path("ome_tag_projection");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            comp.create_storage_all("/Image/Item(1)/Tags").unwrap();
+            comp.create_storage_all("/Image/Item(2)/Tags").unwrap();
+            comp.create_storage_all("/Image/Tags").unwrap();
+            comp.create_stream("/Image/Item(1)/CONTENTS")
+                .unwrap()
+                .write_all(&build_item(0, 4, 0, 0, 55))
+                .unwrap();
+            comp.create_stream("/Image/Item(2)/CONTENTS")
+                .unwrap()
+                .write_all(&build_item(0, 5, 0, 0, 56))
+                .unwrap();
+            comp.create_stream("/Image/Item(1)/Tags/Contents")
+                .unwrap()
+                .write_all(&build_tag_stream(vec![
+                    tag_i32(2820, 4),             // Image Channel Index
+                    tag_string(1284, "DAPI"),     // Channel Name
+                    tag_f64(16_777_488, 405.0),   // Excitation Wavelength
+                    tag_f64(16_777_489, 450.0),   // Emission Wavelength
+                    tag_i32(1282, 0x00_22_44_66), // MultiChannel Color
+                    tag_f64(1025, 43831.5),       // Camera Acquisition Time
+                    tag_f64(2564, 12.5),          // Exposure Time [ms]
+                    tag_f64(16_777_218, 123.0),   // Stage Position X
+                    tag_f64(16_777_219, 456.0),   // Stage Position Y
+                    tag_f64(65_633, 1.25),        // Orca Analog Gain
+                    tag_f64(65_634, -3.5),        // Orca Analog Offset
+                ]))
+                .unwrap();
+            comp.create_stream("/Image/Item(2)/Tags/Contents")
+                .unwrap()
+                .write_all(&build_tag_stream(vec![
+                    tag_i32(2820, 5),         // Image Channel Index
+                    tag_string(1284, "FITC"), // Channel Name
+                ]))
+                .unwrap();
+            comp.create_stream("/Image/Tags/Contents")
+                .unwrap()
+                .write_all(&build_tag_stream(vec![
+                    tag_f64(769, 0.11),                              // Scale Factor for X
+                    tag_f64(772, 0.22),                              // Scale Factor for Y
+                    tag_f64(775, 0.33),                              // Scale Factor for Z
+                    tag_string(1540, "note"),                        // Comments
+                    tag_f64(1793, 43831.5),                          // Acquisition Date
+                    tag_string(1795, "Analytical Engines"),          // User Company
+                    tag_string(1801, "Ada Lovelace"),                // User Name
+                    tag_string(2049, "Plan-Apochromat 63x/1.4 Oil"), // Objective Name
+                    tag_f64(1412, 63.0),                             // Objective Magnification
+                    tag_f64(1413, 1.4),                              // Objective N.A.
+                    tag_f64(1415, 210.0),                            // Objective Working Distance
+                    tag_i32(1416, 2),      // Objective Immersion Type -> Oil
+                    tag_string(2261, "7"), // Objective ID
+                ]))
+                .unwrap();
+        }
+
+        let mut reader = ZeissZviReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        let img = &ome.images[0];
+        assert_eq!(img.description.as_deref(), Some("note"));
+        assert_eq!(
+            img.acquisition_date.as_deref(),
+            Some("2020-01-01T12:00:00.000")
+        );
+        assert_eq!(img.physical_size_x, Some(0.11));
+        assert_eq!(img.physical_size_y, Some(0.22));
+        assert_eq!(img.physical_size_z, Some(0.33));
+        assert_eq!(img.channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(img.channels[0].excitation_wavelength, Some(405.0));
+        assert_eq!(img.channels[0].emission_wavelength, Some(450.0));
+        assert_eq!(img.channels[0].detector_settings_gain, Some(1.25));
+        assert_eq!(img.channels[0].detector_settings_offset, Some(-3.5));
+        assert_eq!(img.channels[1].name.as_deref(), Some("FITC"));
+        assert_eq!(
+            img.channels[1].detector_ref.as_deref(),
+            Some("Detector:0:1")
+        );
+        assert_eq!(img.channels[1].detector_settings_gain, None);
+        assert_eq!(img.channels[1].detector_settings_offset, None);
+        assert_eq!(img.planes.len(), 1);
+        assert_eq!(img.planes[0].delta_t, Some(0.0));
+        assert_eq!(img.planes[0].exposure_time, Some(0.0125));
+        assert_eq!(img.planes[0].position_x, Some(123.0));
+        assert_eq!(img.planes[0].position_y, Some(456.0));
+
+        assert_eq!(ome.instruments.len(), 1);
+        assert_eq!(ome.instruments[0].detectors.len(), 2);
+        assert_eq!(ome.instruments[0].detectors[0].gain, Some(1.25));
+        assert_eq!(ome.instruments[0].detectors[0].offset, Some(-3.5));
+        assert_eq!(ome.instruments[0].detectors[1].gain, None);
+        assert_eq!(ome.instruments[0].detectors[1].offset, None);
+        assert_eq!(ome.instruments[0].objectives.len(), 1);
+        let objective = &ome.instruments[0].objectives[0];
+        assert_eq!(objective.id.as_deref(), Some("Objective:7"));
+        assert_eq!(objective.nominal_magnification, Some(63.0));
+        assert_eq!(objective.lens_na, Some(1.4));
+        assert_eq!(objective.correction.as_deref(), Some("Plan-Apochromat"));
+        assert_eq!(objective.immersion.as_deref(), Some("Oil"));
+        assert_eq!(objective.working_distance, Some(210.0));
+        assert_eq!(ome.experimenters.len(), 1);
+        assert_eq!(ome.experimenters[0].id.as_deref(), Some("Experimenter:0"));
+        assert_eq!(ome.experimenters[0].first_name.as_deref(), Some("Ada"));
+        assert_eq!(ome.experimenters[0].last_name.as_deref(), Some("Lovelace"));
+        assert_eq!(
+            ome.experimenters[0].institution.as_deref(),
+            Some("Analytical Engines")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zvi_shapes_stream_projects_representable_ome_rois() {
+        let path = temp_path("shapes_roi");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            comp.create_storage_all("/Image/Item(1)/Shapes").unwrap();
+            comp.create_stream("/Image/Item(1)/CONTENTS")
+                .unwrap()
+                .write_all(&build_item(0, 0, 0, 0, 33))
+                .unwrap();
+            comp.create_stream("/Image/Item(1)/Shapes/Contents")
+                .unwrap()
+                .write_all(&build_roi_stream(
+                    12,
+                    "polyline roi",
+                    &[(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)],
+                ))
+                .unwrap();
+        }
+
+        let mut reader = ZeissZviReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+
+        assert_eq!(ome.rois.len(), 1);
+        assert_eq!(ome.rois[0].id.as_deref(), Some("ROI:0"));
+        assert_eq!(ome.rois[0].name.as_deref(), Some("polyline roi"));
+        assert_eq!(ome.rois[0].shapes.len(), 1);
+        match &ome.rois[0].shapes[0] {
+            OmeShape::Polyline { points, .. } => {
+                assert_eq!(points, &vec![(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]);
+            }
+            other => panic!("expected polyline ROI, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zvi_shapes_stream_respects_no_overlays_metadata_level() {
+        let path = temp_path("shapes_no_overlays");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            comp.create_storage_all("/Image/Item(1)/Shapes").unwrap();
+            comp.create_stream("/Image/Item(1)/CONTENTS")
+                .unwrap()
+                .write_all(&build_item(0, 0, 0, 0, 44))
+                .unwrap();
+            comp.create_stream("/Image/Item(1)/Shapes/Contents")
+                .unwrap()
+                .write_all(&build_roi_stream(0, "point roi", &[(7.0, 8.0)]))
+                .unwrap();
+        }
+
+        let mut reader = ZeissZviReader::new();
+        reader.set_metadata_options(MetadataOptions {
+            level: MetadataLevel::NoOverlays,
+            original_metadata: true,
+        });
+        reader.set_id(&path).unwrap();
+        assert!(reader.ome_metadata().unwrap().rois.is_empty());
 
         let _ = std::fs::remove_file(path);
     }

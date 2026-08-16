@@ -232,8 +232,18 @@ mod inner {
             Ok(())
         }
 
-        fn set_flattened_resolutions(&mut self, flattened: bool) {
+        fn has_flattened_resolutions(&self) -> bool {
+            self.flattened_resolutions
+        }
+
+        fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+            if self.meta.is_some() {
+                return Err(BioFormatsError::Format(
+                    "set_flattened_resolutions must be called before set_id".into(),
+                ));
+            }
             self.flattened_resolutions = flattened;
+            Ok(())
         }
 
         fn close(&mut self) -> Result<()> {

@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::ome_metadata::{
+    create_lsid, OmeDetector, OmeInstrument, OmeMetadata, OmeObjective, OmePlane,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -1048,6 +1051,18 @@ fn volocity_read_stream_f64(bytes: &[u8], offset: usize, little_endian: bool) ->
     })
 }
 
+fn volocity_read_stream_i64(bytes: &[u8], offset: usize, little_endian: bool) -> Option<i64> {
+    let data = bytes.get(offset..offset.checked_add(8)?)?;
+    let array = [
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+    ];
+    Some(if little_endian {
+        i64::from_le_bytes(array)
+    } else {
+        i64::from_be_bytes(array)
+    })
+}
+
 fn volocity_read_stream_string(bytes: &[u8], offset: usize, little_endian: bool) -> Option<String> {
     let len = volocity_read_stream_i32(bytes, offset, little_endian)?;
     if len < 0 {
@@ -1058,6 +1073,20 @@ fn volocity_read_stream_string(bytes: &[u8], offset: usize, little_endian: bool)
     let end = start.checked_add(len)?;
     let data = bytes.get(start..end)?;
     Some(volocity_java_trim(&String::from_utf8_lossy(data)))
+}
+
+fn volocity_timestamps_from_stream(bytes: &[u8], size_t: u32, little_endian: bool) -> Vec<f64> {
+    let mut timestamps = Vec::with_capacity(size_t as usize);
+    let mut first_stamp = None;
+    for t in 0..size_t as usize {
+        let Some(raw) = volocity_read_stream_i64(bytes, 21 + t * 8, little_endian) else {
+            break;
+        };
+        let timestamp = raw as f64 / 1_000_000.0;
+        let first = *first_stamp.get_or_insert(timestamp);
+        timestamps.push(timestamp - first);
+    }
+    timestamps
 }
 
 fn volocity_native_stream_clue(bytes: &[u8]) -> Option<VolocityNativeStreamClue> {
@@ -1494,7 +1523,7 @@ fn parse_volocity_blind_layout(
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u16,
         image_count,
         dimension_order: DimensionOrder::XYZCT,
         is_little_endian: flags & 1 != 0,
@@ -1561,6 +1590,7 @@ struct VolocityStack {
     x_location: f64,
     y_location: f64,
     z_location: f64,
+    timestamps: Vec<f64>,
 
     // Core metadata for this series.
     size_x: u32,
@@ -1777,6 +1807,7 @@ fn volocity_build_stacks(
             x_location: candidate.metadata.x_location.unwrap_or(0.0),
             y_location: candidate.metadata.y_location.unwrap_or(0.0),
             z_location: candidate.metadata.z_location.unwrap_or(0.0),
+            timestamps: Vec::new(),
             size_x: 0,
             size_y: 0,
             size_z: 1,
@@ -1903,6 +1934,8 @@ fn volocity_init_core_metadata(stack: &mut VolocityStack) -> Result<()> {
             }
             let size_t = volocity_read_stream_i32(&bytes, 17, stack.little_endian).unwrap_or(0);
             stack.size_t = size_t.max(0) as u32;
+            stack.timestamps =
+                volocity_timestamps_from_stream(&bytes, stack.size_t, stack.little_endian);
         } else {
             stack.size_t = 1;
         }
@@ -2084,7 +2117,7 @@ fn volocity_stack_metadata(stack: &VolocityStack) -> ImageMetadata {
         size_c: stack.size_c,
         size_t: stack.size_t,
         pixel_type: stack.pixel_type,
-        bits_per_pixel: (stack.pixel_type.bytes_per_sample() * 8) as u8,
+        bits_per_pixel: (stack.pixel_type.bytes_per_sample() * 8) as u16,
         image_count: stack.image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb: stack.rgb,
@@ -2145,8 +2178,90 @@ fn volocity_stack_metadata(stack: &VolocityStack) -> ImageMetadata {
             format!("Channel {index} Name"),
             MetadataValue::String(channel.clone()),
         );
+        meta.series_metadata.insert(
+            format!("channel.{index}.name"),
+            MetadataValue::String(channel.clone()),
+        );
     }
     meta
+}
+
+fn volocity_stack_planes(stack: &VolocityStack) -> Vec<OmePlane> {
+    let mut planes = Vec::with_capacity(stack.image_count as usize);
+    for plane_index in 0..stack.image_count {
+        let [the_z, the_c, the_t] = volocity_zct_coords(stack, plane_index);
+        planes.push(OmePlane {
+            the_z,
+            the_c,
+            the_t,
+            delta_t: stack.timestamps.get(the_t as usize).copied(),
+            exposure_time: None,
+            position_x: Some(stack.x_location),
+            position_y: Some(stack.y_location),
+            position_z: stack
+                .physical_z
+                .map(|physical_z| stack.z_location + f64::from(the_z) * physical_z),
+        });
+    }
+    planes
+}
+
+fn volocity_ome_metadata(stacks: &[VolocityStack], series_meta: &[ImageMetadata]) -> OmeMetadata {
+    let mut ome = OmeMetadata {
+        instruments: vec![OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            objectives: stacks
+                .iter()
+                .enumerate()
+                .map(|(series, stack)| OmeObjective {
+                    id: Some(create_lsid("Objective", &[0, series])),
+                    nominal_magnification: stack.magnification,
+                    immersion: Some("Other".to_string()),
+                    correction: Some("Other".to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            detectors: stacks
+                .iter()
+                .enumerate()
+                .map(|(series, stack)| OmeDetector {
+                    id: Some(create_lsid("Detector", &[0, series])),
+                    model: stack.detector.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    for (series, stack) in stacks.iter().enumerate() {
+        let Some(meta) = series_meta.get(series) else {
+            continue;
+        };
+        let _ = ome.populate_pixels(meta, series);
+        if let Some(image) = ome.images.get_mut(series) {
+            image.name = Some(stack.name.clone());
+            image.description = stack.description.clone();
+            image.physical_size_x = stack.physical_x;
+            image.physical_size_y = stack.physical_y;
+            image.physical_size_z = stack.physical_z;
+            image.instrument_ref = Some(0);
+            image.objective_ref = Some(series);
+            for (channel_index, name) in stack.channel_names.iter().enumerate() {
+                if let Some(channel) = image.channels.get_mut(channel_index) {
+                    channel.name = Some(name.clone());
+                }
+            }
+            let detector_id = create_lsid("Detector", &[0, series]);
+            for channel in &mut image.channels {
+                channel.detector_ref = Some(detector_id.clone());
+            }
+            image.planes = volocity_stack_planes(stack);
+        }
+    }
+
+    ome
 }
 
 /// Java openBytes (lines 142-219) for a single plane of a stack.
@@ -2479,6 +2594,13 @@ impl FormatReader for VolocityReader {
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.open_bytes(p)
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if !self.stacks.is_empty() {
+            Some(volocity_ome_metadata(&self.stacks, &self.series_meta))
+        } else {
+            self.meta.as_ref().map(OmeMetadata::from_image_metadata)
+        }
     }
 }
 
@@ -3092,6 +3214,7 @@ mod tests {
             x_location: 10.0,
             y_location: 20.0,
             z_location: 30.0,
+            timestamps: vec![0.0],
             size_x: 2,
             size_y: 2,
             size_z: 1,
@@ -3147,6 +3270,66 @@ mod tests {
             reader.metadata().series_metadata.get("Channel 0 Name"),
             Some(MetadataValue::String(value)) if value == "R"
         ));
+        let ome = reader.ome_metadata().expect("Volocity OME metadata");
+        assert_eq!(ome.images.len(), 1);
+        assert_eq!(ome.instruments.len(), 1);
+        assert_eq!(ome.instruments[0].id.as_deref(), Some("Instrument:0"));
+        assert_eq!(
+            ome.instruments[0].objectives[0].id.as_deref(),
+            Some("Objective:0:0")
+        );
+        assert_eq!(
+            ome.instruments[0].objectives[0].nominal_magnification,
+            Some(20.0)
+        );
+        assert_eq!(
+            ome.instruments[0].objectives[0].immersion.as_deref(),
+            Some("Other")
+        );
+        assert_eq!(
+            ome.instruments[0].objectives[0].correction.as_deref(),
+            Some("Other")
+        );
+        assert_eq!(
+            ome.instruments[0].detectors[0].id.as_deref(),
+            Some("Detector:0:0")
+        );
+        assert_eq!(
+            ome.instruments[0].detectors[0].model.as_deref(),
+            Some("CCD")
+        );
+        assert_eq!(ome.images[0].instrument_ref, Some(0));
+        assert_eq!(ome.images[0].objective_ref, Some(0));
+        assert_eq!(ome.images[0].name.as_deref(), Some("RGB split"));
+        assert_eq!(ome.images[0].physical_size_x, Some(0.25));
+        assert_eq!(ome.images[0].physical_size_y, Some(0.5));
+        assert_eq!(ome.images[0].physical_size_z, Some(1.5));
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("R"));
+        assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("G"));
+        assert_eq!(
+            ome.images[0].channels[0].detector_ref.as_deref(),
+            Some("Detector:0:0")
+        );
+        assert_eq!(ome.images[0].planes.len(), 2);
+        assert_eq!(ome.images[0].planes[0].position_x, Some(10.0));
+        assert_eq!(ome.images[0].planes[0].position_y, Some(20.0));
+        assert_eq!(ome.images[0].planes[0].position_z, Some(30.0));
+        assert_eq!(ome.images[0].planes[0].delta_t, Some(0.0));
+    }
+
+    #[test]
+    fn volocity_timestamp_stream_matches_java_microsecond_deltas() {
+        let mut bytes = vec![0u8; 21];
+        bytes[0] = b'I';
+        bytes[17..21].copy_from_slice(&3i32.to_le_bytes());
+        bytes.extend_from_slice(&1_000_000i64.to_le_bytes());
+        bytes.extend_from_slice(&2_250_000i64.to_le_bytes());
+        bytes.extend_from_slice(&4_500_000i64.to_le_bytes());
+
+        assert_eq!(
+            volocity_timestamps_from_stream(&bytes, 3, true),
+            vec![0.0, 1.25, 3.5]
+        );
     }
 
     fn blind_mvd2(width: u32, height: u32, z: u32, c: u32, t: u32, payload: &[u8]) -> Vec<u8> {

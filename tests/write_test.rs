@@ -248,7 +248,8 @@ fn tiff_multi_plane_stack() {
     let path = temp_path("stack.tif");
     ImageWriter::save(&path, &meta, &planes).expect("write failed");
 
-    let mut reader = ImageReader::open(&path).expect("read failed");
+    let mut reader =
+        ImageReader::open_with_flattened_resolutions(&path, false).expect("read failed");
     let rmeta = reader.metadata();
     assert_eq!(rmeta.image_count, 3);
     for p in 0u8..3 {
@@ -284,7 +285,8 @@ fn pyramid_tiff_reads_reduced_resolution_for_every_plane() {
     writer.add_resolution_level(reduced_planes.clone());
     writer.close().unwrap();
 
-    let mut reader = ImageReader::open(&path).expect("read failed");
+    let mut reader =
+        ImageReader::open_with_flattened_resolutions(&path, false).expect("read failed");
     assert_eq!(reader.resolution_count(), 2);
     assert_eq!(reader.metadata().size_x, 4);
     assert_eq!(reader.metadata().size_y, 4);
@@ -1531,7 +1533,7 @@ fn ics_writer_byte_order_header_matches_java_little_endian_rules() {
         meta.size_y = 1;
         meta.size_c = 1;
         meta.pixel_type = pixel_type;
-        meta.bits_per_pixel = bits;
+        meta.bits_per_pixel = bits as u16;
         meta.image_count = 1;
         meta.is_little_endian = true;
 
@@ -2409,8 +2411,6 @@ fn jpeg_writer_round_trip_rgb8_with_lossy_tolerance() {
         "JPEG round-trip drift too high: mean={mean_abs_diff:.2}, max={max_abs_diff}"
     );
 }
-
-#[cfg(feature = "jpeg2000-write")]
 #[test]
 fn jpeg2000_writer_round_trip_gray8_lossless() {
     let mut meta = ImageMetadata::default();
@@ -2431,8 +2431,6 @@ fn jpeg2000_writer_round_trip_gray8_lossless() {
     assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
     assert_eq!(reader.open_bytes(0).unwrap(), data);
 }
-
-#[cfg(feature = "jpeg2000-write")]
 #[test]
 fn jpeg2000_writer_round_trip_rgb8_lossless() {
     let mut meta = ImageMetadata::default();
