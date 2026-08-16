@@ -71,6 +71,13 @@ impl ImageReader {
         Ok(())
     }
 
+    /// Extract the detected reader after `set_id()`, for callers that need
+    /// the raw `Box<dyn FormatReader>` rather than this wrapper's own
+    /// delegating methods (e.g. handing it to `ChannelSeparator::new()`).
+    pub fn into_inner(self) -> Result<Box<dyn FormatReader>> {
+        self.inner.ok_or(BioFormatsError::NotInitialized)
+    }
+
     /// Open the file at `path`, detect its format, parse metadata. One-shot
     /// convenience wrapper equivalent to `new()` + `set_id()` with Java's
     /// default (`flattened = true`).
@@ -1432,6 +1439,15 @@ mod tests {
         grouped.set_resolution(1).unwrap();
         assert_eq!(grouped.metadata().size_x, 2);
 
+        // into_inner() hands the raw detected reader to callers (like
+        // ChannelSeparator::new()) that need a Box<dyn FormatReader> instead
+        // of this wrapper's delegating methods. The extracted reader must
+        // still reflect the grouped state configured above.
+        let mut raw = grouped.into_inner().unwrap();
+        assert_eq!(raw.resolution_count(), 2);
+        raw.set_resolution(0).unwrap();
+        assert_eq!(raw.metadata().size_x, 4);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1450,6 +1466,10 @@ mod tests {
             Err(BioFormatsError::NotInitialized)
         ));
         assert!(reader.close().is_ok());
+        assert!(matches!(
+            reader.into_inner(),
+            Err(BioFormatsError::NotInitialized)
+        ));
     }
 
     #[test]
