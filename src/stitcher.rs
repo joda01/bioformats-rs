@@ -172,7 +172,7 @@ impl FileStitcher {
 
 /// Open a format reader for the given file.
 fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
-    crate::registry::open_reader(path)
+    crate::registry::open_reader(path, true)
 }
 
 /// Discover a file sequence from a single exemplar file.

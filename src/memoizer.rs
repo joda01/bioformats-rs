@@ -89,7 +89,7 @@ impl Memoizer {
         let r = if cache.is_some() {
             crate::registry::detect_reader_without_set_id(path)?
         } else {
-            crate::registry::open_reader(path)?
+            crate::registry::open_reader(path, true)?
         };
         let mut memo = Memoizer::new(r);
         memo.file_path = Some(path.to_path_buf());
@@ -167,7 +167,7 @@ impl Memoizer {
                 self.inner_opened = true;
             }
             Err(first_err) => {
-                let mut reopened = match crate::registry::open_reader(&path) {
+                let mut reopened = match crate::registry::open_reader(&path, true) {
                     Ok(reader) => reader,
                     Err(_) => return Err(first_err),
                 };
