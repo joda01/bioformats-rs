@@ -78,6 +78,93 @@ fn plain_root_zarr_array_uses_tczyx_shape_fallback() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Hand-built two-level multiscales group (no Python/zarr generator needed):
+/// `.zattrs` at the root declares `datasets` `0` (4x4) and `1` (2x2), each a
+/// plain v2 array under its own subdirectory.
+fn write_two_level_multiscales(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(".zgroup"), r#"{"zarr_format":2}"#).unwrap();
+    std::fs::write(
+        dir.join(".zattrs"),
+        r#"{"multiscales":[{"axes":[{"name":"y","type":"space"},{"name":"x","type":"space"}],"datasets":[{"path":"0"},{"path":"1"}]}]}"#,
+    )
+    .unwrap();
+
+    let level0 = dir.join("0");
+    std::fs::create_dir_all(&level0).unwrap();
+    std::fs::write(
+        level0.join(".zarray"),
+        r#"{"zarr_format":2,"shape":[4,4],"chunks":[4,4],"dtype":"<u2","compressor":null,"fill_value":0,"order":"C","filters":null}"#,
+    )
+    .unwrap();
+    let pixels0: Vec<u8> = (1u16..=16)
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    std::fs::write(level0.join("0.0"), pixels0).unwrap();
+
+    let level1 = dir.join("1");
+    std::fs::create_dir_all(&level1).unwrap();
+    std::fs::write(
+        level1.join(".zarray"),
+        r#"{"zarr_format":2,"shape":[2,2],"chunks":[2,2],"dtype":"<u2","compressor":null,"fill_value":0,"order":"C","filters":null}"#,
+    )
+    .unwrap();
+    let pixels1: Vec<u8> = (101u16..=104)
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    std::fs::write(level1.join("0.0"), pixels1).unwrap();
+}
+
+#[test]
+fn flattened_resolutions_toggle_matches_java_setflattenedresolutions() {
+    let dir = tmp_zarr_dir("flatten_toggle");
+    let _ = std::fs::remove_dir_all(&dir);
+    write_two_level_multiscales(&dir);
+
+    // Default (Java's setFlattenedResolutions(true)): each pyramid level is
+    // its own top-level series.
+    let mut flattened = OmeZarrReader::new();
+    flattened.set_id(&dir).unwrap();
+    assert_eq!(flattened.series_count(), 2);
+    assert_eq!(flattened.resolution_count(), 1);
+    let m0 = flattened.metadata();
+    assert_eq!((m0.size_x, m0.size_y), (4, 4));
+    let b0 = flattened.open_bytes(0).unwrap();
+    assert_eq!(
+        (0..16).map(|i| le_u16(&b0, i)).collect::<Vec<_>>(),
+        (1u16..=16).collect::<Vec<_>>()
+    );
+    flattened.set_series(1).unwrap();
+    assert_eq!(flattened.resolution_count(), 1);
+    let m1 = flattened.metadata();
+    assert_eq!((m1.size_x, m1.size_y), (2, 2));
+    let b1 = flattened.open_bytes(0).unwrap();
+    assert_eq!(
+        (0..4).map(|i| le_u16(&b1, i)).collect::<Vec<_>>(),
+        (101u16..=104).collect::<Vec<_>>()
+    );
+
+    // setFlattenedResolutions(false): the multiscales image stays one series,
+    // with levels reachable via resolution_count()/set_resolution().
+    let mut grouped = OmeZarrReader::new();
+    grouped.set_flattened_resolutions(false);
+    grouped.set_id(&dir).unwrap();
+    assert_eq!(grouped.series_count(), 1);
+    assert_eq!(grouped.resolution_count(), 2);
+    let m0 = grouped.metadata();
+    assert_eq!((m0.size_x, m0.size_y), (4, 4));
+    grouped.set_resolution(1).unwrap();
+    let m1 = grouped.metadata();
+    assert_eq!((m1.size_x, m1.size_y), (2, 2));
+    let b1 = grouped.open_bytes(0).unwrap();
+    assert_eq!(
+        (0..4).map(|i| le_u16(&b1, i)).collect::<Vec<_>>(),
+        (101u16..=104).collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn memoizer_cache_hit_detects_zarr_directory() {
     let dir = tmp_zarr_dir("memoizer_plain_root_array");

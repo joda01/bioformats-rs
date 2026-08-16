@@ -232,6 +232,9 @@ pub struct NdpiReader {
     use_64bit: bool,
     /// Per-flattened-series OME image metadata (name + physical sizes).
     ome_images: Vec<crate::common::ome_metadata::OmeImage>,
+    /// Java `setFlattenedResolutions`; defaults to `true` (Java's library-wide
+    /// default), matching this reader's prior unconditional behavior.
+    flattened_resolutions: bool,
 }
 
 // NDPI custom TIFF tags (mirrors the constants in NDPIReader.java:66-99).
@@ -296,6 +299,7 @@ impl NdpiReader {
             pyramid_height: 1,
             use_64bit: false,
             ome_images: Vec::new(),
+            flattened_resolutions: true,
         }
     }
 
@@ -964,8 +968,12 @@ impl FormatReader for NdpiReader {
             ));
         }
         // Java's default ImageReader flattens the pyramid: each resolution is its
-        // own top-level series. Mirror that so seriesCount matches the reference.
-        let _ = self.inner.flatten_resolutions_into_series();
+        // own top-level series. Mirror that so seriesCount matches the reference;
+        // callers that requested setFlattenedResolutions(false) keep one series
+        // per pyramid instead, with levels reachable via resolution_count().
+        if self.flattened_resolutions {
+            let _ = self.inner.flatten_resolutions_into_series();
+        }
         // Per-series interleaving follows NDPIReader.useTiffParser: a JPEG IFD
         // larger than MAX_SIZE in both dimensions is decoded chunky/interleaved
         // by the custom NDPI service; everything else is read channel-separated.
@@ -976,6 +984,10 @@ impl FormatReader for NdpiReader {
         // pointers are already corrected during 64-bit IFD parsing above.
         self.analyze_large_file_offsets(path, file_len);
         Ok(())
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) {
+        self.flattened_resolutions = flattened;
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1072,6 +1084,9 @@ pub struct LeicaScnReader {
     /// from the SCN XML before resolution flattening so each (image, resolution)
     /// gets its own name/calibration mirroring Java's LeicaSCNReader.
     ome_images: Vec<crate::common::ome_metadata::OmeImage>,
+    /// Java `setFlattenedResolutions`; defaults to `true` (Java's library-wide
+    /// default), matching this reader's prior unconditional behavior.
+    flattened_resolutions: bool,
 }
 
 /// One `<dimension>` element: a plane for a given z/c/r mapped to a TIFF IFD.
@@ -1115,6 +1130,7 @@ impl LeicaScnReader {
         LeicaScnReader {
             inner: crate::tiff::TiffReader::new(),
             ome_images: Vec::new(),
+            flattened_resolutions: true,
         }
     }
 
@@ -1429,10 +1445,13 @@ impl LeicaScnReader {
             s.metadata.is_interleaved = false;
         }
 
-        // Build per-(image, resolution) OME metadata BEFORE flattening, so each
-        // flattened series gets the right name ("image_NAME (Rk)") and physical
-        // size (Leica volume / resolution width), mirroring LeicaSCNReader.
-        use crate::common::ome_metadata::{OmeChannel, OmeImage};
+        // Build OME metadata BEFORE flattening. When flattened_resolutions is
+        // true (Java's default), each (image, resolution) pair gets its own
+        // entry ("image_NAME (Rk)") with that level's physical size, matching
+        // the post-flatten series list. When false, one entry per image (its
+        // r=0/full-resolution size) matches the grouped series list, whose
+        // other pyramid levels stay reachable via resolution_count().
+        use crate::common::ome_metadata::OmeImage;
         let mut ome_images: Vec<OmeImage> = Vec::new();
         for img in images {
             if img.dims.is_empty() {
@@ -1453,60 +1472,88 @@ impl LeicaScnReader {
             } else {
                 img.size_c.max(1)
             };
-            for r in 0..img.size_r.max(1) {
-                let dim = img.lookup(0, 0, r);
-                let width = dim
-                    .map(|d| d.size_x)
-                    .filter(|&w| w > 0)
-                    .or_else(|| {
-                        dim.and_then(|d| self.inner.ifd(d.ifd))
-                            .and_then(|ifd| ifd.image_width())
-                    })
-                    .unwrap_or(0);
-                let height = dim
-                    .map(|d| d.size_y)
-                    .filter(|&h| h > 0)
-                    .or_else(|| {
-                        dim.and_then(|d| self.inner.ifd(d.ifd))
-                            .and_then(|ifd| ifd.image_length())
-                    })
-                    .unwrap_or(0);
-                let px = if img.v_size_x > 0 && width > 0 {
-                    Some((img.v_size_x as f64 / 1000.0) / width as f64)
-                } else {
-                    None
-                };
-                let py = if img.v_size_y > 0 && height > 0 {
-                    Some((img.v_size_y as f64 / 1000.0) / height as f64)
-                } else {
-                    None
-                };
-                let objective_ref = images
-                    .iter()
-                    .position(|candidate| candidate.name == img.name)
-                    .unwrap_or(0)
-                    .min(1);
-                ome_images.push(OmeImage {
-                    name: Some(format!("{} (R{})", img.name, r)),
-                    physical_size_x: px,
-                    physical_size_y: py,
-                    physical_size_z: (img.v_spacing_z > 0)
-                        .then_some(img.v_spacing_z as f64 / 1000.0),
-                    channels: vec![OmeChannel {
-                        samples_per_pixel: channels,
-                        ..Default::default()
-                    }],
-                    planes: vec![crate::common::ome_metadata::OmePlane::default()],
-                    instrument_ref: Some(0),
-                    objective_ref: Some(objective_ref),
-                    ..Default::default()
-                });
+            if self.flattened_resolutions {
+                for r in 0..img.size_r.max(1) {
+                    ome_images.push(Self::build_scn_ome_image(
+                        &self.inner,
+                        images,
+                        img,
+                        channels,
+                        r,
+                        format!("{} (R{})", img.name, r),
+                    ));
+                }
+            } else {
+                ome_images.push(Self::build_scn_ome_image(
+                    &self.inner,
+                    images,
+                    img,
+                    channels,
+                    0,
+                    img.name.clone(),
+                ));
             }
         }
         self.ome_images = ome_images;
 
         if !new_series.is_empty() {
             self.inner.replace_series(new_series);
+        }
+    }
+
+    /// Build one OME image entry for `img` at resolution `r`, mirroring the
+    /// physical-size/objective-ref derivation in Java's LeicaSCNReader.
+    fn build_scn_ome_image(
+        inner: &crate::tiff::TiffReader,
+        images: &[ScnImage],
+        img: &ScnImage,
+        channels: u32,
+        r: u32,
+        name: String,
+    ) -> crate::common::ome_metadata::OmeImage {
+        use crate::common::ome_metadata::{OmeChannel, OmeImage};
+        let dim = img.lookup(0, 0, r);
+        let width = dim
+            .map(|d| d.size_x)
+            .filter(|&w| w > 0)
+            .or_else(|| dim.and_then(|d| inner.ifd(d.ifd)).and_then(|ifd| ifd.image_width()))
+            .unwrap_or(0);
+        let height = dim
+            .map(|d| d.size_y)
+            .filter(|&h| h > 0)
+            .or_else(|| {
+                dim.and_then(|d| inner.ifd(d.ifd))
+                    .and_then(|ifd| ifd.image_length())
+            })
+            .unwrap_or(0);
+        let px = if img.v_size_x > 0 && width > 0 {
+            Some((img.v_size_x as f64 / 1000.0) / width as f64)
+        } else {
+            None
+        };
+        let py = if img.v_size_y > 0 && height > 0 {
+            Some((img.v_size_y as f64 / 1000.0) / height as f64)
+        } else {
+            None
+        };
+        let objective_ref = images
+            .iter()
+            .position(|candidate| candidate.name == img.name)
+            .unwrap_or(0)
+            .min(1);
+        OmeImage {
+            name: Some(name),
+            physical_size_x: px,
+            physical_size_y: py,
+            physical_size_z: (img.v_spacing_z > 0).then_some(img.v_spacing_z as f64 / 1000.0),
+            channels: vec![OmeChannel {
+                samples_per_pixel: channels,
+                ..Default::default()
+            }],
+            planes: vec![crate::common::ome_metadata::OmePlane::default()],
+            instrument_ref: Some(0),
+            objective_ref: Some(objective_ref),
+            ..Default::default()
         }
     }
 
@@ -1517,8 +1564,12 @@ impl LeicaScnReader {
             return;
         }
         self.build_scn_series(&images);
-        // Java flattens each image's resolution pyramid into top-level series.
-        let _ = self.inner.flatten_resolutions_into_series();
+        // Java flattens each image's resolution pyramid into top-level series;
+        // callers that requested setFlattenedResolutions(false) keep one series
+        // per image instead, with levels reachable via resolution_count().
+        if self.flattened_resolutions {
+            let _ = self.inner.flatten_resolutions_into_series();
+        }
         // Flattening copies the parent metadata; re-assert channel-separated.
         for s in self.inner.series_list_mut() {
             s.metadata.is_interleaved = false;
@@ -1556,6 +1607,10 @@ impl FormatReader for LeicaScnReader {
         self.inner.set_id(path)?;
         self.enrich_metadata();
         Ok(())
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) {
+        self.flattened_resolutions = flattened;
     }
 
     fn close(&mut self) -> Result<()> {
@@ -2647,6 +2702,117 @@ mod leica_scn_ventana_tests {
         bytes.push(13);
 
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Two chained IFDs (IFD0 carries the SCN `ImageDescription`, IFD1 is a
+    /// bare pixel IFD referenced by the XML's second `<dimension>` as the r=1
+    /// sub-resolution), used to exercise `set_flattened_resolutions`. IFD
+    /// widths/heights are real (not just XML-declared) since
+    /// `flatten_resolutions_into_series` re-derives sub-resolution sizes from
+    /// the IFD itself, not the XML.
+    fn write_two_ifd_scn_tiff(path: &Path, description: &str) {
+        let mut desc = description.as_bytes().to_vec();
+        desc.push(0);
+
+        let entry_count0 = 11u32;
+        let entry_count1 = 10u32;
+        let ifd0_start = 8u32;
+        let ifd0_size = 2 + entry_count0 * 12 + 4;
+        let desc_start = ifd0_start + ifd0_size;
+        let pixel0_start = desc_start + desc.len() as u32;
+        let ifd1_start = pixel0_start + 1;
+        let ifd1_size = 2 + entry_count1 * 12 + 4;
+        let pixel1_start = ifd1_start + ifd1_size;
+
+        let entries0 = [
+            tiff_entry(256, 4, 1, 4),                          // ImageWidth
+            tiff_entry(257, 4, 1, 4),                          // ImageLength
+            tiff_entry(258, 3, 1, 8),                          // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                          // Compression
+            tiff_entry(262, 3, 1, 1),                          // Photometric
+            tiff_entry(270, 2, desc.len() as u32, desc_start), // ImageDescription
+            tiff_entry(273, 4, 1, pixel0_start),               // StripOffsets
+            tiff_entry(277, 3, 1, 1),                          // SamplesPerPixel
+            tiff_entry(278, 4, 1, 4),                          // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),                          // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                          // PlanarConfiguration
+        ];
+        let entries1 = [
+            tiff_entry(256, 4, 1, 2),
+            tiff_entry(257, 4, 1, 2),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(273, 4, 1, pixel1_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 2),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd0_start.to_le_bytes());
+
+        bytes.extend_from_slice(&(entries0.len() as u16).to_le_bytes());
+        for entry in entries0 {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&ifd1_start.to_le_bytes()); // next IFD offset
+        bytes.extend_from_slice(&desc);
+        bytes.push(11); // IFD0 pixel byte
+
+        bytes.extend_from_slice(&(entries1.len() as u16).to_le_bytes());
+        for entry in entries1 {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // end of chain
+        bytes.push(22); // IFD1 pixel byte
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn leica_scn_flattened_resolutions_toggle_matches_java_setflattenedresolutions() {
+        let path = temp_path("flatten_toggle", "scn");
+        let xml = concat!(
+            r#"<scn><collection name="c"><image name="main"><pixels>"#,
+            r#"<dimension z="0" c="0" r="0" sizeX="4" sizeY="4" ifd="0"/>"#,
+            r#"<dimension z="0" c="0" r="1" sizeX="2" sizeY="2" ifd="1"/>"#,
+            r#"</pixels></image></collection></scn>"#,
+        );
+        write_two_ifd_scn_tiff(&path, xml);
+
+        // Default (Java's setFlattenedResolutions(true)): each resolution is
+        // its own top-level series.
+        let mut flattened = LeicaScnReader::new();
+        flattened.set_id(&path).unwrap();
+        assert_eq!(flattened.series_count(), 2);
+        assert_eq!(flattened.resolution_count(), 1);
+        assert_eq!(flattened.metadata().size_x, 4);
+        flattened.set_series(1).unwrap();
+        assert_eq!(flattened.metadata().size_x, 2);
+        let flattened_ome = flattened.ome_metadata().unwrap();
+        assert_eq!(flattened_ome.images.len(), 2);
+        assert_eq!(flattened_ome.images[0].name.as_deref(), Some("main (R0)"));
+        assert_eq!(flattened_ome.images[1].name.as_deref(), Some("main (R1)"));
+
+        // setFlattenedResolutions(false): one series per image, with levels
+        // reachable via resolution_count()/set_resolution().
+        let mut grouped = LeicaScnReader::new();
+        grouped.set_flattened_resolutions(false);
+        grouped.set_id(&path).unwrap();
+        assert_eq!(grouped.series_count(), 1);
+        assert_eq!(grouped.resolution_count(), 2);
+        assert_eq!(grouped.metadata().size_x, 4);
+        grouped.set_resolution(1).unwrap();
+        assert_eq!(grouped.metadata().size_x, 2);
+        let grouped_ome = grouped.ome_metadata().unwrap();
+        assert_eq!(grouped_ome.images.len(), 1);
+        assert_eq!(grouped_ome.images[0].name.as_deref(), Some("main"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -12487,6 +12653,40 @@ mod ndpi_offset64_tests {
         );
         assert_eq!(ome.images[0].planes[0].position_x, Some(12.5));
         assert_eq!(ome.images[0].planes[0].position_y, Some(25.0));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ndpi_flattened_resolutions_toggle_matches_java_setflattenedresolutions() {
+        let path = temp_ndpi_path("flatten-toggle");
+        std::fs::write(&path, synthetic_ndpi_capture_mode_tiff(0)).unwrap();
+
+        // Default (Java's setFlattenedResolutions(true)): each pyramid
+        // resolution is its own top-level series, followed by the macro image.
+        let mut flattened = NdpiReader::new();
+        flattened.set_id(&path).unwrap();
+        assert_eq!(flattened.series_count(), 3);
+        assert_eq!(flattened.resolution_count(), 1);
+        assert_eq!(flattened.metadata().size_x, 4);
+        flattened.set_series(1).unwrap();
+        assert_eq!(flattened.metadata().size_x, 2);
+        let flattened_ome = flattened.ome_metadata().unwrap();
+        assert_eq!(flattened_ome.images.len(), 3);
+
+        // setFlattenedResolutions(false): the pyramid stays one series, with
+        // levels reachable via resolution_count()/set_resolution(); the macro
+        // image remains its own series either way.
+        let mut grouped = NdpiReader::new();
+        grouped.set_flattened_resolutions(false);
+        grouped.set_id(&path).unwrap();
+        assert_eq!(grouped.series_count(), 2);
+        assert_eq!(grouped.resolution_count(), 2);
+        assert_eq!(grouped.metadata().size_x, 4);
+        grouped.set_resolution(1).unwrap();
+        assert_eq!(grouped.metadata().size_x, 2);
+        let grouped_ome = grouped.ome_metadata().unwrap();
+        assert_eq!(grouped_ome.images.len(), 2);
 
         let _ = std::fs::remove_file(path);
     }

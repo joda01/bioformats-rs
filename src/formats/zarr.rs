@@ -87,6 +87,11 @@ pub struct OmeZarrReader {
     metadata: ImageMetadata,
     /// Lazily-opened array for the current (series, resolution).
     open_array: Option<(String, Array<FilesystemStore>)>,
+    /// Java `setFlattenedResolutions`; defaults to `true` (Java's library-wide
+    /// default): every (series, resolution) pair becomes its own top-level
+    /// series. When `false`, each multiscales image keeps its full resolution
+    /// list, reachable via `resolution_count()`/`set_resolution()`.
+    flattened_resolutions: bool,
 }
 
 impl Default for OmeZarrReader {
@@ -106,7 +111,34 @@ impl OmeZarrReader {
             current_resolution: 0,
             metadata: ImageMetadata::default(),
             open_array: None,
+            flattened_resolutions: true,
         }
+    }
+
+    /// Explode each series' resolution list into its own single-resolution
+    /// series, mirroring `TiffReader::flatten_resolutions_into_series` for
+    /// Java's default `setFlattenedResolutions(true)`.
+    fn flatten_zarr_series(series: Vec<ZarrSeries>) -> Vec<ZarrSeries> {
+        let mut flat = Vec::with_capacity(series.len());
+        for s in series {
+            if s.levels.len() <= 1 {
+                flat.push(s);
+                continue;
+            }
+            for level in &s.levels {
+                flat.push(ZarrSeries {
+                    group_path: s.group_path.clone(),
+                    name: s.name.clone(),
+                    levels: vec![level.clone()],
+                    physical_size_x: s.physical_size_x,
+                    physical_size_y: s.physical_size_y,
+                    physical_size_z: s.physical_size_z,
+                    time_increment: s.time_increment,
+                    channels: s.channels.clone(),
+                });
+            }
+        }
+        flat
     }
 
     fn current_level(&self) -> Result<&ZarrLevel> {
@@ -430,6 +462,11 @@ impl OmeZarrReader {
                     root.display()
                 )));
             }
+            let plain = if self.flattened_resolutions {
+                Self::flatten_zarr_series(plain)
+            } else {
+                plain
+            };
             self.plate = None;
             self.store = Some(store);
             self.series = plain;
@@ -456,6 +493,14 @@ impl OmeZarrReader {
                 root.display()
             )));
         }
+
+        // Flatten BEFORE building plate metadata: parse_plate's well-sample
+        // image_ref indices are positions into this final series list.
+        let series = if self.flattened_resolutions {
+            Self::flatten_zarr_series(series)
+        } else {
+            series
+        };
 
         self.plate = parse_plate(&root_attrs, &series);
         self.store = Some(store);
@@ -869,6 +914,10 @@ impl FormatReader for OmeZarrReader {
         self.parse(&root)?;
         self.root = Some(root);
         Ok(())
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) {
+        self.flattened_resolutions = flattened;
     }
 
     fn close(&mut self) -> Result<()> {

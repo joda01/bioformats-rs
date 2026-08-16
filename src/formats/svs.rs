@@ -14,12 +14,16 @@ use crate::common::reader::FormatReader;
 
 pub struct SvsReader {
     inner: crate::tiff::TiffReader,
+    /// Java `setFlattenedResolutions`; defaults to `true` (Java's library-wide
+    /// default), matching this reader's prior unconditional behavior.
+    flattened_resolutions: bool,
 }
 
 impl SvsReader {
     pub fn new() -> Self {
         SvsReader {
             inner: crate::tiff::TiffReader::new(),
+            flattened_resolutions: true,
         }
     }
 
@@ -351,11 +355,19 @@ impl FormatReader for SvsReader {
         if is_svs {
             self.inner.regroup_as_svs_pyramid()?;
             // Java's default ImageReader exposes each SVS pyramid resolution as
-            // its own top-level series, followed by label/macro extras.
-            let _ = self.inner.flatten_resolutions_into_series();
+            // its own top-level series, followed by label/macro extras; callers
+            // that requested setFlattenedResolutions(false) keep one series per
+            // image instead, with levels reachable via resolution_count().
+            if self.flattened_resolutions {
+                let _ = self.inner.flatten_resolutions_into_series();
+            }
         }
         self.parse_aperio_metadata();
         Ok(())
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) {
+        self.flattened_resolutions = flattened;
     }
 
     fn close(&mut self) -> Result<()> {
@@ -826,6 +838,111 @@ mod pyramid_tiff_tests {
         );
 
         reader.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Main pyramid (4x4 + a 2x2 sub-resolution) plus label/macro extras.
+    /// The sub-resolution IFD carries an extra TileByteCounts entry purely so
+    /// `SVSReader.removeThumbnail`'s strip-vs-tile heuristic (which drops a
+    /// stripped smallest level) does not eat it — real Aperio pyramids store
+    /// every level tiled, this fixture only fakes the one tag that matters.
+    fn build_svs_pyramid_with_label_macro_tiff() -> Vec<u8> {
+        let ifds: [(u32, u32, &str, Vec<u8>, bool); 4] = [
+            (
+                4,
+                4,
+                "Aperio Image|MPP=0.25",
+                vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                false,
+            ),
+            (2, 2, "Aperio Image|MPP=0.25", vec![21u8, 22, 23, 24], true),
+            (1, 1, "label image", vec![5u8], false),
+            (1, 1, "macro image", vec![6u8], false),
+        ];
+        let entry_counts: Vec<u32> = ifds
+            .iter()
+            .map(|(_, _, _, _, tiled)| if *tiled { 10 } else { 9 })
+            .collect();
+        let ifd_sizes: Vec<u32> = entry_counts.iter().map(|c| 2 + c * 12 + 4).collect();
+        let ifd0_off: u32 = 8;
+        let mut ifd_offs = vec![ifd0_off];
+        for sz in &ifd_sizes[..ifd_sizes.len() - 1] {
+            ifd_offs.push(*ifd_offs.last().unwrap() + sz);
+        }
+        let mut next_off = *ifd_offs.last().unwrap() + ifd_sizes.last().unwrap();
+        let mut desc_offs = Vec::with_capacity(ifds.len());
+        for (_, _, desc, _, _) in &ifds {
+            desc_offs.push(next_off);
+            next_off += desc.len() as u32 + 1;
+        }
+        let mut px_offs = Vec::with_capacity(ifds.len());
+        for (_, _, _, pixels, _) in &ifds {
+            px_offs.push(next_off);
+            next_off += pixels.len() as u32;
+        }
+
+        let mut d: Vec<u8> = Vec::new();
+        d.extend_from_slice(b"II");
+        push_u16(&mut d, 42);
+        push_u32(&mut d, ifd0_off);
+
+        for (i, (w, h, desc, pixels, tiled)) in ifds.iter().enumerate() {
+            let next = if i + 1 < ifds.len() { ifd_offs[i + 1] } else { 0 };
+            push_u16(&mut d, entry_counts[i] as u16);
+            push_long(&mut d, tag::IMAGE_WIDTH, *w);
+            push_long(&mut d, tag::IMAGE_LENGTH, *h);
+            push_short(&mut d, tag::BITS_PER_SAMPLE, 8);
+            push_short(&mut d, tag::COMPRESSION, 1);
+            push_short(&mut d, tag::PHOTOMETRIC_INTERPRETATION, 1);
+            push_ascii_at_offset(&mut d, tag::IMAGE_DESCRIPTION, desc, desc_offs[i]);
+            push_long(&mut d, tag::STRIP_OFFSETS, px_offs[i]);
+            push_long(&mut d, tag::ROWS_PER_STRIP, *h);
+            push_long(&mut d, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+            if *tiled {
+                push_long(&mut d, tag::TILE_BYTE_COUNTS, pixels.len() as u32);
+            }
+            push_u32(&mut d, next);
+        }
+
+        for (_, _, desc, _, _) in &ifds {
+            d.extend_from_slice(desc.as_bytes());
+            d.push(0);
+        }
+        for (_, _, _, pixels, _) in &ifds {
+            d.extend_from_slice(pixels);
+        }
+        d
+    }
+
+    #[test]
+    fn svs_flattened_resolutions_toggle_matches_java_setflattenedresolutions() {
+        let svs = build_svs_pyramid_with_label_macro_tiff();
+        let path =
+            std::env::temp_dir().join(format!("svs_flatten_toggle_{}.svs", std::process::id()));
+        std::fs::write(&path, &svs).unwrap();
+
+        // Default (Java's setFlattenedResolutions(true)): each pyramid
+        // resolution is its own top-level series, followed by label/macro.
+        let mut flattened = SvsReader::new();
+        flattened.set_id(&path).unwrap();
+        assert_eq!(flattened.series_count(), 4);
+        assert_eq!(flattened.resolution_count(), 1);
+        assert_eq!(flattened.metadata().size_x, 4);
+        flattened.set_series(1).unwrap();
+        assert_eq!(flattened.metadata().size_x, 2);
+
+        // setFlattenedResolutions(false): the pyramid stays one series, with
+        // levels reachable via resolution_count()/set_resolution(); label and
+        // macro remain their own series either way.
+        let mut grouped = SvsReader::new();
+        grouped.set_flattened_resolutions(false);
+        grouped.set_id(&path).unwrap();
+        assert_eq!(grouped.series_count(), 3);
+        assert_eq!(grouped.resolution_count(), 2);
+        assert_eq!(grouped.metadata().size_x, 4);
+        grouped.set_resolution(1).unwrap();
+        assert_eq!(grouped.metadata().size_x, 2);
+
         let _ = std::fs::remove_file(&path);
     }
 

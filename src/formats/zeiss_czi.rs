@@ -1771,6 +1771,11 @@ pub struct ZeissCziReader {
     max_resolution: i32,
     current_series: usize,
     current_resolution: usize,
+    /// Java `setFlattenedResolutions`; defaults to `true` (Java's library-wide
+    /// default): every (series, resolution) pair becomes its own top-level
+    /// series. When `false`, each `CziSeries` keeps its full resolution list,
+    /// reachable via `resolution_count()`/`set_resolution()`.
+    flattened_resolutions: bool,
 }
 
 impl ZeissCziReader {
@@ -1791,7 +1796,33 @@ impl ZeissCziReader {
             max_resolution: 0,
             current_series: 0,
             current_resolution: 0,
+            flattened_resolutions: true,
         }
+    }
+
+    /// Explode each series' resolution list into its own single-resolution
+    /// series, mirroring `TiffReader::flatten_resolutions_into_series` for
+    /// Java's default `setFlattenedResolutions(true)`.
+    fn flatten_czi_series(series: Vec<CziSeries>) -> Vec<CziSeries> {
+        let mut flat = Vec::with_capacity(series.len());
+        for s in series {
+            if s.resolutions.len() <= 1 {
+                flat.push(s);
+                continue;
+            }
+            for res in &s.resolutions {
+                flat.push(CziSeries {
+                    scene: s.scene,
+                    acquisition: s.acquisition,
+                    angle: s.angle,
+                    mosaic: s.mosaic,
+                    pixel_type_index: s.pixel_type_index,
+                    palm_size: s.palm_size,
+                    resolutions: vec![res.clone()],
+                });
+            }
+        }
+        flat
     }
 
     fn plane_zct(&self, plane_index: u32) -> Option<(u32, u32, u32)> {
@@ -2134,7 +2165,13 @@ impl FormatReader for ZeissCziReader {
             series_metadata.insert("czi_palm".into(), MetadataValue::Bool(true));
         }
 
-        let first = parsed.series.first();
+        let series = if self.flattened_resolutions {
+            Self::flatten_czi_series(parsed.series)
+        } else {
+            parsed.series
+        };
+
+        let first = series.first();
         let (init_w, init_h, init_res_count) = first
             .and_then(|s| {
                 s.resolutions
@@ -2167,7 +2204,7 @@ impl FormatReader for ZeissCziReader {
         });
         self.packed_spp = parsed.spp.max(1);
         self.entries = parsed.entries;
-        self.series = parsed.series;
+        self.series = series;
         self.pixel_types = parsed.pixel_types;
         self.prestitched = parsed.prestitched;
         self.rotations = parsed.rotations.max(1) as u32;
@@ -2180,6 +2217,10 @@ impl FormatReader for ZeissCziReader {
         self.meta_xml = parsed.meta_xml;
         self.path = Some(path.to_path_buf());
         Ok(())
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) {
+        self.flattened_resolutions = flattened;
     }
 
     fn close(&mut self) -> Result<()> {
@@ -3307,6 +3348,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("pyramid_levels", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false);
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3319,6 +3361,48 @@ mod tests {
         assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_flattened_resolutions_toggle_matches_java_setflattenedresolutions() {
+        let entries = vec![
+            (
+                directory_entry_dims(0, 0, 0, 0, 0, 4, 2, 0),
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 1), vec![9, 10]),
+        ];
+
+        // Default (Java's setFlattenedResolutions(true)): each pyramid
+        // resolution is its own top-level series.
+        let path = write_synthetic_czi_entries("flatten_toggle", entries.clone());
+        let mut flattened = ZeissCziReader::new();
+        flattened.set_id(&path).unwrap();
+        assert_eq!(flattened.series_count(), 2);
+        assert_eq!(flattened.resolution_count(), 1);
+        assert_eq!(flattened.metadata().size_x, 4);
+        assert_eq!(
+            flattened.open_bytes(0).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        flattened.set_series(1).unwrap();
+        assert_eq!(flattened.resolution_count(), 1);
+        assert_eq!(flattened.metadata().size_x, 2);
+        assert_eq!(flattened.open_bytes(0).unwrap(), vec![9, 10]);
+        fs::remove_file(&path).unwrap();
+
+        // setFlattenedResolutions(false): the pyramid stays one series, with
+        // levels reachable via resolution_count()/set_resolution().
+        let path = write_synthetic_czi_entries("flatten_toggle_grouped", entries);
+        let mut grouped = ZeissCziReader::new();
+        grouped.set_flattened_resolutions(false);
+        grouped.set_id(&path).unwrap();
+        assert_eq!(grouped.series_count(), 1);
+        assert_eq!(grouped.resolution_count(), 2);
+        assert_eq!(grouped.metadata().size_x, 4);
+        grouped.set_resolution(1).unwrap();
+        assert_eq!(grouped.metadata().size_x, 2);
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -3335,6 +3419,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("stored_xy_pyramid", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false);
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3470,6 +3555,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("rgb_pyramid_sparse_white", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false);
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3748,6 +3834,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("r_size_one_pyramid", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false);
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();

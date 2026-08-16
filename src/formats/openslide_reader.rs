@@ -35,7 +35,17 @@ mod inner {
         slide: Option<OpenSlide>,
         meta: Option<ImageMetadata>,
         current_resolution: usize,
+        /// Active logical series index when `flattened_resolutions`; always 0
+        /// otherwise. Mirrors `current_resolution` 1:1 while flattened (each
+        /// resolution level is its own top-level series).
+        current_series: usize,
         resolution_dims: Vec<(u32, u32)>,
+        /// Java `setFlattenedResolutions`; defaults to `true` (Java's
+        /// library-wide default): every resolution level becomes its own
+        /// top-level series. When `false`, the whole-slide image stays one
+        /// series, with levels reachable via `resolution_count()`/
+        /// `set_resolution()`.
+        flattened_resolutions: bool,
     }
 
     impl OpenSlideReader {
@@ -45,7 +55,9 @@ mod inner {
                 slide: None,
                 meta: None,
                 current_resolution: 0,
+                current_series: 0,
                 resolution_dims: Vec::new(),
+                flattened_resolutions: true,
             }
         }
 
@@ -206,7 +218,7 @@ mod inner {
                 is_interleaved: true,
                 is_indexed: false,
                 is_little_endian: true,
-                resolution_count: level_count,
+                resolution_count: if self.flattened_resolutions { 1 } else { level_count },
                 ..Default::default()
             };
 
@@ -214,9 +226,14 @@ mod inner {
             self.slide = Some(slide);
             self.meta = Some(meta);
             self.current_resolution = 0;
+            self.current_series = 0;
             self.resolution_dims = resolution_dims;
 
             Ok(())
+        }
+
+        fn set_flattened_resolutions(&mut self, flattened: bool) {
+            self.flattened_resolutions = flattened;
         }
 
         fn close(&mut self) -> Result<()> {
@@ -224,22 +241,44 @@ mod inner {
             self.slide = None;
             self.meta = None;
             self.current_resolution = 0;
+            self.current_series = 0;
             self.resolution_dims.clear();
             Ok(())
         }
 
         fn series_count(&self) -> usize {
-            1
-        }
-        fn set_series(&mut self, s: usize) -> Result<()> {
-            if s != 0 {
-                Err(BioFormatsError::SeriesOutOfRange(s))
+            if self.flattened_resolutions {
+                self.resolution_dims.len().max(1)
             } else {
-                Ok(())
+                1
             }
         }
+        fn set_series(&mut self, s: usize) -> Result<()> {
+            if !self.flattened_resolutions {
+                return if s != 0 {
+                    Err(BioFormatsError::SeriesOutOfRange(s))
+                } else {
+                    Ok(())
+                };
+            }
+            if s >= self.resolution_dims.len() {
+                return Err(BioFormatsError::SeriesOutOfRange(s));
+            }
+            self.current_series = s;
+            self.current_resolution = s;
+            if let Some(meta) = self.meta.as_mut() {
+                let (w, h) = self.resolution_dims[s];
+                meta.size_x = w;
+                meta.size_y = h;
+            }
+            Ok(())
+        }
         fn series(&self) -> usize {
-            0
+            if self.flattened_resolutions {
+                self.current_series
+            } else {
+                0
+            }
         }
 
         fn metadata(&self) -> &ImageMetadata {
@@ -384,10 +423,24 @@ mod inner {
         }
 
         fn resolution_count(&self) -> usize {
-            self.resolution_dims.len()
+            if self.flattened_resolutions {
+                1
+            } else {
+                self.resolution_dims.len()
+            }
         }
 
         fn set_resolution(&mut self, level: usize) -> Result<()> {
+            if self.flattened_resolutions {
+                // Each logical series is already a single flattened resolution.
+                return if level == 0 {
+                    Ok(())
+                } else {
+                    Err(BioFormatsError::Format(format!(
+                        "Resolution level {level} out of range (0)"
+                    )))
+                };
+            }
             if level >= self.resolution_dims.len() {
                 return Err(BioFormatsError::Format(format!(
                     "Resolution level {} out of range ({})",
@@ -406,7 +459,11 @@ mod inner {
         }
 
         fn resolution(&self) -> usize {
-            self.current_resolution
+            if self.flattened_resolutions {
+                0
+            } else {
+                self.current_resolution
+            }
         }
     }
 

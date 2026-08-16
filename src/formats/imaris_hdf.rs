@@ -66,6 +66,11 @@ pub struct ImarisHdfReader {
     // hdf5-pure-rust crate supports hyperslab partial I/O, so we read only the
     // requested z-plane via read_slice instead of the whole channel volume.
     cache: Option<VolumeCache>,
+    /// Java `setFlattenedResolutions`; defaults to `true` (Java's library-wide
+    /// default): every (series, resolution) pair becomes its own top-level
+    /// series. When `false`, `imaris_group_series`'s pyramid grouping is used
+    /// as-is, with levels reachable via `resolution_count()`/`set_resolution()`.
+    flattened_resolutions: bool,
 }
 
 /// Cached decoded plane for one (resolution, timepoint, channel, z) location.
@@ -97,6 +102,7 @@ impl ImarisHdfReader {
             channel_excitation_wavelengths: Vec::new(),
             instrument: ImarisInstrumentMetadata::default(),
             cache: None,
+            flattened_resolutions: true,
         }
     }
 
@@ -555,6 +561,70 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_flattened_resolutions_toggle_matches_java_setflattenedresolutions() {
+        let path = tmp_ims_path("flatten_toggle");
+        let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        {
+            let mut info = file.create_group("DataSetInfo").unwrap();
+            let mut image = info.create_group("Image").unwrap();
+            image.add_fixed_ascii_attr("X", "4", 1).unwrap();
+            image.add_fixed_ascii_attr("Y", "3", 1).unwrap();
+            image.add_fixed_ascii_attr("Z", "1", 1).unwrap();
+        }
+        {
+            let mut dataset = file.create_group("DataSet").unwrap();
+            let mut res0 = dataset.create_group("ResolutionLevel 0").unwrap();
+            let mut time0 = res0.create_group("TimePoint 0").unwrap();
+            let mut channel0 = time0.create_group("Channel 0").unwrap();
+            channel0
+                .new_dataset_builder("Data")
+                .shape(&[1, 3, 4]) // z=1, y=3, x=4
+                .write::<u8>(&[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+                .unwrap();
+
+            let mut res1 = dataset.create_group("ResolutionLevel 1").unwrap();
+            let mut time1 = res1.create_group("TimePoint 0").unwrap();
+            let mut channel1 = time1.create_group("Channel 0").unwrap();
+            channel1
+                .new_dataset_builder("Data")
+                .shape(&[1, 1, 2]) // z=1, y=1, x=2
+                .write::<u8>(&[21u8, 22])
+                .unwrap();
+        }
+        file.flush().unwrap();
+
+        // Default (Java's setFlattenedResolutions(true)): each ResolutionLevel
+        // is its own top-level series.
+        let mut flattened = ImarisHdfReader::new();
+        flattened.set_id(&path).unwrap();
+        assert_eq!(flattened.series_count(), 2);
+        assert_eq!(flattened.resolution_count(), 1);
+        assert_eq!(flattened.metadata().size_x, 4);
+        assert_eq!(
+            flattened.open_bytes(0).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+        flattened.set_series(1).unwrap();
+        assert_eq!(flattened.resolution_count(), 1);
+        assert_eq!(flattened.metadata().size_x, 2);
+        assert_eq!(flattened.open_bytes(0).unwrap(), vec![21, 22]);
+
+        // setFlattenedResolutions(false): both levels stay one series, with
+        // levels reachable via resolution_count()/set_resolution().
+        let mut grouped = ImarisHdfReader::new();
+        grouped.set_flattened_resolutions(false);
+        grouped.set_id(&path).unwrap();
+        assert_eq!(grouped.series_count(), 1);
+        assert_eq!(grouped.resolution_count(), 2);
+        assert_eq!(grouped.metadata().size_x, 4);
+        grouped.set_resolution(1).unwrap();
+        assert_eq!(grouped.metadata().size_x, 2);
+        assert_eq!(grouped.open_bytes(0).unwrap(), vec![21, 22]);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -2817,7 +2887,14 @@ impl FormatReader for ImarisHdfReader {
         // Build the Java series grouping, then fix up each level's reported
         // resolution_count to its series' resolution count (Java's per-series
         // core.size(series)) rather than the global ResolutionLevel total.
-        let series = imaris_group_series(&resolutions);
+        let grouped = imaris_group_series(&resolutions);
+        let series = if self.flattened_resolutions {
+            // Java's default ImageReader configuration: every (series,
+            // resolution) pair becomes its own top-level series.
+            grouped.into_iter().flatten().map(|level| vec![level]).collect()
+        } else {
+            grouped
+        };
         for group in &series {
             let count = group.len() as u32;
             for &level in group {
@@ -2843,6 +2920,10 @@ impl FormatReader for ImarisHdfReader {
         self.channel_excitation_wavelengths = parsed.channel_excitation_wavelengths;
         self.instrument = parsed.instrument;
         Ok(())
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) {
+        self.flattened_resolutions = flattened;
     }
 
     fn close(&mut self) -> Result<()> {
