@@ -6,14 +6,16 @@ use crate::common::io::peek_header;
 use crate::common::metadata::{ImageMetadata, LookupTable, MetadataOptions};
 use crate::common::ome_metadata::OmeMetadata;
 use crate::common::path::confined_join;
-use crate::common::reader::FormatReader;
+use crate::common::reader::{uninitialized_metadata, FormatReader};
 
 const DETECTION_HEADER_BYTES: usize = 2048;
 
 /// The top-level reader that auto-detects the file format and delegates to the
 /// appropriate format-specific reader.
 pub struct ImageReader {
-    inner: Box<dyn FormatReader>,
+    inner: Option<Box<dyn FormatReader>>,
+    options: ImageReaderOptions,
+    metadata_options: Option<MetadataOptions>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,17 +64,34 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
 }
 
 impl ImageReader {
+    /// Create an uninitialized reader.
+    ///
+    /// Configure pre-initialization options, then call [`ImageReader::set_id`]
+    /// to detect the file format and parse metadata.
+    pub fn new() -> Self {
+        Self {
+            inner: None,
+            options: ImageReaderOptions::default(),
+            metadata_options: None,
+        }
+    }
+
     /// Open the file at `path`, detect its format, parse metadata.
     pub fn open(path: &Path) -> Result<Self> {
         Ok(ImageReader {
-            inner: open_reader(path)?,
+            inner: Some(open_reader(path)?),
+            options: ImageReaderOptions::default(),
+            metadata_options: None,
         })
     }
 
     /// Open the file with reader options that must be set before initialization.
     pub fn open_with_options(path: &Path, options: ImageReaderOptions) -> Result<Self> {
+        let inner = open_reader_with_options(path, options.clone())?;
         Ok(ImageReader {
-            inner: open_reader_with_options(path, options)?,
+            inner: Some(inner),
+            options,
+            metadata_options: None,
         })
     }
 
@@ -85,28 +104,73 @@ impl ImageReader {
         )
     }
 
+    /// Set whether pyramid resolutions should be exposed as public series.
+    ///
+    /// This must be called before [`ImageReader::set_id`].
+    pub fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.inner.is_some() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.options.flattened_resolutions = flattened;
+        Ok(())
+    }
+
+    /// Detect the file format, initialize the concrete reader, and parse metadata.
+    pub fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner = Some(open_reader_with_options_and_metadata(
+            path,
+            self.options,
+            self.metadata_options.as_ref(),
+        )?);
+        Ok(())
+    }
+
+    /// Consume this wrapper and return the initialized concrete reader.
+    pub fn into_inner(self) -> Result<Box<dyn FormatReader>> {
+        self.inner.ok_or(BioFormatsError::NotInitialized)
+    }
+
+    fn inner(&self) -> Result<&dyn FormatReader> {
+        self.inner.as_deref().ok_or(BioFormatsError::NotInitialized)
+    }
+
+    fn inner_mut(&mut self) -> Result<&mut (dyn FormatReader + '_)> {
+        match self.inner.as_deref_mut() {
+            Some(inner) => Ok(inner),
+            None => Err(BioFormatsError::NotInitialized),
+        }
+    }
+
     /// Return structured OME metadata.
     ///
     /// Equivalent to Java Bio-Formats `reader.setMetadataStore(service.createOMEXMLMetadata())`.
     /// Returns baseline OME metadata for all readers and enriched metadata for
     /// formats that parse additional OME-compatible fields.
     pub fn ome_metadata(&self) -> Option<OmeMetadata> {
-        self.inner.ome_metadata()
+        self.inner.as_deref().and_then(FormatReader::ome_metadata)
     }
     pub fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.inner
+            .as_deref()
+            .map(FormatReader::series_count)
+            .unwrap_or(0)
     }
     pub fn set_series(&mut self, series: usize) -> Result<()> {
-        self.inner.set_series(series)
+        self.inner_mut()?.set_series(series)
     }
     pub fn series(&self) -> usize {
-        self.inner.series()
+        self.inner.as_deref().map(FormatReader::series).unwrap_or(0)
     }
     pub fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        match self.inner.as_deref() {
+            Some(inner) => inner.metadata(),
+            None => uninitialized_metadata(),
+        }
     }
     pub fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(plane_index)
+        self.inner_mut()?.open_bytes(plane_index)
     }
     pub fn open_bytes_region(
         &mut self,
@@ -116,23 +180,26 @@ impl ImageReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(plane_index, x, y, w, h)
+        self.inner_mut()?.open_bytes_region(plane_index, x, y, w, h)
     }
     pub fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(plane_index)
+        self.inner_mut()?.open_thumb_bytes(plane_index)
     }
     pub fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
-        self.inner.lookup_table(plane_index)
+        self.inner_mut()?.lookup_table(plane_index)
     }
     pub fn set_metadata_options(&mut self, options: MetadataOptions) {
-        self.inner.set_metadata_options(options);
+        if let Some(inner) = self.inner.as_deref_mut() {
+            inner.set_metadata_options(options.clone());
+        }
+        self.metadata_options = Some(options);
     }
     pub fn compressed_level_info(
         &self,
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
-        self.inner.compressed_level_info(plane_index, level)
+        self.inner()?.compressed_level_info(plane_index, level)
     }
     pub fn read_compressed_tile(
         &mut self,
@@ -142,23 +209,42 @@ impl ImageReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        self.inner
+        self.inner_mut()?
             .read_compressed_tile(plane_index, level, col, row, preferred_modes)
     }
     pub fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        self.inner
+            .as_deref()
+            .map(FormatReader::resolution_count)
+            .unwrap_or(1)
     }
     pub fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner_mut()?.set_resolution(level)
     }
     pub fn resolution(&self) -> usize {
-        self.inner.resolution()
+        self.inner
+            .as_deref()
+            .map(FormatReader::resolution)
+            .unwrap_or(0)
     }
     pub fn has_flattened_resolutions(&self) -> bool {
-        self.inner.has_flattened_resolutions()
+        self.inner
+            .as_deref()
+            .map(FormatReader::has_flattened_resolutions)
+            .unwrap_or(self.options.flattened_resolutions)
     }
     pub fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        if let Some(inner) = self.inner.as_deref_mut() {
+            inner.close()?;
+        }
+        self.inner = None;
+        Ok(())
+    }
+}
+
+impl Default for ImageReader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -170,13 +256,21 @@ pub(crate) fn open_reader_with_options(
     path: &Path,
     options: ImageReaderOptions,
 ) -> Result<Box<dyn FormatReader>> {
+    open_reader_with_options_and_metadata(path, options, None)
+}
+
+fn open_reader_with_options_and_metadata(
+    path: &Path,
+    options: ImageReaderOptions,
+    metadata_options: Option<&MetadataOptions>,
+) -> Result<Box<dyn FormatReader>> {
     // OME-Zarr is a directory-based format. `peek_header` cannot read a
     // directory, so detect and dispatch it before any byte sniffing. Mirrors
     // Java `ZarrReader.isThisType`, which matches on the `.zarr` path.
     #[cfg(feature = "zarr")]
     if crate::formats::zarr::is_zarr_path(path) {
         let mut r = boxed_reader(crate::formats::zarr::OmeZarrReader::new());
-        match set_reader_id(&mut r, path, options) {
+        match set_reader_id(&mut r, path, &options, metadata_options) {
             Ok(()) => return Ok(r),
             // A directory cannot fall through to `peek_header`; surface the error.
             Err(err) if path.is_dir() => return Err(err),
@@ -189,7 +283,7 @@ pub(crate) fn open_reader_with_options(
     // text happens to begin with image/container magic bytes.
     if has_pattern_extension(path) {
         let mut r = boxed_reader(crate::formats::misc4::FilePatternReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -198,7 +292,7 @@ pub(crate) fn open_reader_with_options(
     // cannot claim Keller Lab Block filenames as filename patterns first.
     if has_klb_extension(path) {
         let mut r = boxed_reader(crate::formats::misc4::KlbReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -207,7 +301,7 @@ pub(crate) fn open_reader_with_options(
     // probes, but Java ICSReader accepts either side by suffix.
     if has_ics_extension(path) || (has_ids_extension(path) && ics_header_sibling_exists(path)) {
         let mut r = boxed_reader(crate::formats::ics::IcsReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -215,7 +309,7 @@ pub(crate) fn open_reader_with_options(
     // Java accepts them by suffix via CV7000Reader before later XML/HCS readers.
     if has_wpi_extension(path) {
         let mut r = boxed_reader(crate::formats::extended::YokogawaReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -224,7 +318,7 @@ pub(crate) fn open_reader_with_options(
     // companion entry points behave like opening the LEI file.
     if has_raw_extension(path) && has_lei_sibling(path) {
         let mut r = boxed_reader(crate::formats::leica::LeicaReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -234,7 +328,7 @@ pub(crate) fn open_reader_with_options(
     // generic XML suffix fallback first.
     if has_operetta_index_name(path) {
         let mut r = boxed_reader(crate::formats::hcs2::OperettaReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -255,7 +349,7 @@ pub(crate) fn open_reader_with_options(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("nd2"))
     {
         let mut r = boxed_reader(crate::formats::nd2::Nd2Reader::new());
-        match set_reader_id(&mut r, path, options) {
+        match set_reader_id(&mut r, path, &options, metadata_options) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
         }
@@ -269,19 +363,19 @@ pub(crate) fn open_reader_with_options(
     // route straight to the HDF5 Imaris reader before any TIFF-based handling.
     if has_ims_extension(path) && is_hdf5_header(&header) {
         let mut r = boxed_reader(crate::formats::imaris_hdf::ImarisHdfReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
     if has_h5_extension(path) && is_hdf5_header(&header) && has_bdv_xml_sibling(path) {
         let mut r = boxed_reader(crate::formats::bdv::BdvReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
     if has_ch5_extension(path) && is_hdf5_header(&header) {
         let mut r = boxed_reader(crate::formats::cellh5::CellH5Reader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -290,7 +384,7 @@ pub(crate) fn open_reader_with_options(
         && has_columbus_measurement_index_sibling(path)
     {
         let mut r = boxed_reader(crate::formats::hcs2::ColumbusReader::new());
-        set_reader_id(&mut r, path, options)?;
+        set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
@@ -300,7 +394,7 @@ pub(crate) fn open_reader_with_options(
     // streams before rejecting the file.
     if has_zvi_extension(path) {
         let mut r = boxed_reader(crate::formats::zeiss_zvi::ZeissZviReader::new());
-        match set_reader_id(&mut r, path, options) {
+        match set_reader_id(&mut r, path, &options, metadata_options) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
         }
@@ -315,7 +409,7 @@ pub(crate) fn open_reader_with_options(
         .unwrap_or(false)
     {
         let mut r = boxed_reader(crate::formats::camera2::CanonRawReader::new());
-        match set_reader_id(&mut r, path, options) {
+        match set_reader_id(&mut r, path, &options, metadata_options) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
         }
@@ -327,7 +421,7 @@ pub(crate) fn open_reader_with_options(
     let dicom_probe = crate::formats::dicom::DicomReader::new();
     if dicom_probe.is_this_type_by_bytes(&header) {
         let mut r = boxed_reader(crate::formats::dicom::DicomReader::new());
-        match set_reader_id(&mut r, path, options) {
+        match set_reader_id(&mut r, path, &options, metadata_options) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
         }
@@ -339,7 +433,7 @@ pub(crate) fn open_reader_with_options(
     if is_tiff_header(&header) {
         let had_tiff_wrappers = !tiff_wrapper_readers_for_extension(path, &header).is_empty();
         for mut r in tiff_wrapper_readers_for_extension(path, &header) {
-            match set_reader_id(&mut r, path, options) {
+            match set_reader_id(&mut r, path, &options, metadata_options) {
                 Ok(()) => return Ok(r),
                 Err(err) => remember_set_id_error(&mut best_error, err),
             }
@@ -351,14 +445,14 @@ pub(crate) fn open_reader_with_options(
         }
         if has_ndpi_extension(path) {
             let mut r = boxed_reader(crate::tiff::TiffReader::new());
-            return match set_reader_id(&mut r, path, options) {
+            return match set_reader_id(&mut r, path, &options, metadata_options) {
                 Ok(()) => Ok(r),
                 Err(err) => Err(err),
             };
         }
         if has_tiff_extension(path) {
             let mut r = boxed_reader(crate::tiff::TiffReader::new());
-            match set_reader_id(&mut r, path, options) {
+            match set_reader_id(&mut r, path, &options, metadata_options) {
                 Ok(()) => return Ok(r),
                 Err(err) => remember_set_id_error(&mut best_error, err),
             }
@@ -370,7 +464,7 @@ pub(crate) fn open_reader_with_options(
     // prefix, so bridge that full-stream predicate here before suffix fallback.
     if crate::formats::amira::is_spider_file(path) {
         let mut r = boxed_reader(crate::formats::amira::SpiderReader::new());
-        match set_reader_id(&mut r, path, options) {
+        match set_reader_id(&mut r, path, &options, metadata_options) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
         }
@@ -379,7 +473,7 @@ pub(crate) fn open_reader_with_options(
     // 1. Magic bytes
     for mut r in all_readers() {
         if r.is_this_type_by_bytes(&header) {
-            match set_reader_id(&mut r, path, options) {
+            match set_reader_id(&mut r, path, &options, metadata_options) {
                 Ok(()) => return Ok(r),
                 Err(err @ BioFormatsError::UnsupportedFormat(_))
                     if unsupported_magic_error_is_terminal(&err) =>
@@ -399,7 +493,7 @@ pub(crate) fn open_reader_with_options(
     let mut replacing_magic_error = best_error.is_some();
     for mut r in all_readers() {
         if r.is_this_type_by_name(path) {
-            match set_reader_id(&mut r, path, options) {
+            match set_reader_id(&mut r, path, &options, metadata_options) {
                 Ok(()) => return Ok(r),
                 Err(err) => {
                     if replacing_magic_error {
@@ -1325,9 +1419,13 @@ fn boxed_reader<T: FormatReader + 'static>(reader: T) -> Box<dyn FormatReader> {
 fn set_reader_id(
     reader: &mut Box<dyn FormatReader>,
     path: &Path,
-    options: ImageReaderOptions,
+    options: &ImageReaderOptions,
+    metadata_options: Option<&MetadataOptions>,
 ) -> Result<()> {
     reader.set_flattened_resolutions(options.flattened_resolutions)?;
+    if let Some(metadata_options) = metadata_options {
+        reader.set_metadata_options(metadata_options.clone());
+    }
     reader.set_id(path)
 }
 
@@ -1419,8 +1517,71 @@ mod tests {
         ImageWriter::save(path, &meta, &[pixels]).unwrap();
     }
 
+    fn write_gray_tiff(path: &PathBuf, width: u32, height: u32) {
+        let meta = ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        let pixels = vec![9; (width * height) as usize];
+        ImageWriter::save(path, &meta, &[pixels]).unwrap();
+    }
+
     fn push_i32(buf: &mut Vec<u8>, value: i32) {
         buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn new_set_id_and_into_inner_match_open_lifecycle() {
+        let path = temp_path("new_set_id.tif");
+        write_gray_tiff(&path, 3, 2);
+
+        let mut reader = ImageReader::new();
+        assert_eq!(reader.series_count(), 0);
+        assert_eq!(
+            reader.open_bytes(0).unwrap_err().to_string(),
+            BioFormatsError::NotInitialized.to_string()
+        );
+
+        reader.set_flattened_resolutions(false).unwrap();
+        assert!(!reader.has_flattened_resolutions());
+        reader
+            .set_id(&path)
+            .expect("set_id should initialize reader");
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9; 6]);
+
+        let raw = reader.into_inner().expect("initialized reader");
+        assert_eq!(raw.series_count(), 1);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn flattened_resolutions_must_be_set_before_set_id() {
+        let path = temp_path("flatten_after_set_id.tif");
+        write_gray_tiff(&path, 1, 1);
+
+        let mut reader = ImageReader::new();
+        reader
+            .set_id(&path)
+            .expect("set_id should initialize reader");
+
+        let err = reader.set_flattened_resolutions(false).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("set_flattened_resolutions must be called before set_id"));
+
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
