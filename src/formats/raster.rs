@@ -1583,25 +1583,37 @@ impl FormatWriter for TgaWriter {
         let pixels = crate::common::writer::to_interleaved_samples(meta, data)?;
         let (w, h) = (meta.size_x, meta.size_y);
         let spp = meta.size_c as usize;
-        let img: image::DynamicImage = match spp {
-            1 => image::GrayImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageLuma8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            3 => image::RgbImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageRgb8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            4 => image::RgbaImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageRgba8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
+        let mut out = Vec::with_capacity(18 + pixels.len());
+        out.push(0); // ID length
+        out.push(0); // no color map
+        out.push(if spp == 1 { 3 } else { 2 }); // uncompressed gray/true-color
+        out.extend_from_slice(&[0, 0, 0, 0, 0]); // color map spec
+        out.extend_from_slice(&[0, 0, 0, 0]); // x/y origin
+        out.extend_from_slice(&(w as u16).to_le_bytes());
+        out.extend_from_slice(&(h as u16).to_le_bytes());
+        out.push((spp * 8) as u8);
+        out.push(0x20); // top-left origin
+
+        match spp {
+            1 => out.extend_from_slice(&pixels),
+            3 => {
+                for px in pixels.chunks_exact(3) {
+                    out.extend_from_slice(&[px[2], px[1], px[0]]);
+                }
+            }
+            4 => {
+                for px in pixels.chunks_exact(4) {
+                    out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                }
+            }
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "TGA: spp={}",
                     spp
                 )))
             }
-        };
-        img.save(path)
-            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        }
+        std::fs::write(path, out).map_err(BioFormatsError::Io)?;
         self.wrote = true;
         Ok(())
     }

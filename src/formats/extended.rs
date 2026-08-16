@@ -788,6 +788,7 @@ pub struct VectraReader {
     current_resolution: usize,
     plane_ifds: Vec<Vec<usize>>,
     pyramid_depth: usize,
+    flattened_resolutions: bool,
 }
 
 impl VectraReader {
@@ -798,6 +799,7 @@ impl VectraReader {
             current_resolution: 0,
             plane_ifds: Vec::new(),
             pyramid_depth: 1,
+            flattened_resolutions: true,
         }
     }
 
@@ -1192,6 +1194,7 @@ mod qptiff_tests {
         write_qptiff_two_channel_pyramid(&path);
 
         let mut reader = VectraReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.series_count(), 2);
@@ -1738,6 +1741,9 @@ impl FormatReader for VectraReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
+        self.inner
+            .set_flattened_resolutions(self.flattened_resolutions)?;
         self.inner.set_id(path)?;
         let software = self
             .inner
@@ -1841,6 +1847,21 @@ impl FormatReader for VectraReader {
         self.inner.set_resolution(level)?;
         self.current_resolution = level;
         self.refresh_metadata();
+        Ok(())
+    }
+
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.inner.ifd_count() > 0 {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        self.inner.set_flattened_resolutions(flattened)?;
         Ok(())
     }
 
@@ -7325,6 +7346,7 @@ impl FormatReader for HamamatsuVmsReader {
                 ome.instruments.extend(image_ome.instruments);
             }
             ome.images.extend(image_ome.images);
+            let _ = ome.add_original_metadata_annotations(meta, image_index);
         }
 
         Some(ome)

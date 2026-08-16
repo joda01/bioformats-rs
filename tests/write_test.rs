@@ -248,7 +248,8 @@ fn tiff_multi_plane_stack() {
     let path = temp_path("stack.tif");
     ImageWriter::save(&path, &meta, &planes).expect("write failed");
 
-    let mut reader = ImageReader::open(&path).expect("read failed");
+    let mut reader =
+        ImageReader::open_with_flattened_resolutions(&path, false).expect("read failed");
     let rmeta = reader.metadata();
     assert_eq!(rmeta.image_count, 3);
     for p in 0u8..3 {
@@ -284,7 +285,8 @@ fn pyramid_tiff_reads_reduced_resolution_for_every_plane() {
     writer.add_resolution_level(reduced_planes.clone());
     writer.close().unwrap();
 
-    let mut reader = ImageReader::open(&path).expect("read failed");
+    let mut reader =
+        ImageReader::open_with_flattened_resolutions(&path, false).expect("read failed");
     assert_eq!(reader.resolution_count(), 2);
     assert_eq!(reader.metadata().size_x, 4);
     assert_eq!(reader.metadata().size_y, 4);

@@ -13591,6 +13591,7 @@ pub struct CellSensReader {
     series_phys: Vec<Option<(f64, f64)>>,
     /// Currently selected public series index into `series_map`.
     current: usize,
+    flattened_resolutions: bool,
     /// Path to the base `.vsi` file (needed to read embedded-TIFF JPEG strips
     /// directly when the inner reader cannot merge the JPEGTables tag).
     vsi_path: Option<PathBuf>,
@@ -15825,6 +15826,7 @@ impl CellSensReader {
             series_names: Vec::new(),
             series_phys: Vec::new(),
             current: 0,
+            flattened_resolutions: true,
             vsi_path: None,
         }
     }
@@ -16281,8 +16283,9 @@ impl CellSensReader {
         }
         self.ets = volumes;
 
-        // Build the Java-default public ordering. Java FormatReader defaults to
-        // flattened resolutions, so each ETS pyramid level is a public series.
+        // Build the public ordering. Java FormatReader defaults to flattened
+        // resolutions, so each ETS pyramid level is a public series unless the
+        // caller opted into the unflattened view before set_id.
         // Keep the internal `(volume, resolution)` mapping in the target so ETS
         // tile dispatch still follows CellSensReader.getResolutionIndex().
         self.series_map.clear();
@@ -16298,7 +16301,12 @@ impl CellSensReader {
         } else {
             for (vi, vol) in self.ets.iter().enumerate() {
                 let level_count = vol.levels.len().max(1);
-                for resolution in 0..level_count {
+                let public_level_count = if self.flattened_resolutions {
+                    level_count
+                } else {
+                    1
+                };
+                for resolution in 0..public_level_count {
                     self.series_map.push(CellSensTarget::Ets {
                         volume: vi,
                         resolution,
@@ -16732,7 +16740,13 @@ impl FormatReader for CellSensReader {
                 .to_string();
             self.ets.push(vol);
             if !self.ets[0].levels.is_empty() {
-                for resolution in 0..self.ets[0].levels.len() {
+                let level_count = self.ets[0].levels.len();
+                let public_level_count = if self.flattened_resolutions {
+                    level_count
+                } else {
+                    1
+                };
+                for resolution in 0..public_level_count {
                     self.series_map.push(CellSensTarget::Ets {
                         volume: 0,
                         resolution,
@@ -16751,6 +16765,7 @@ impl FormatReader for CellSensReader {
             }
             return Ok(());
         }
+        self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path).map_err(|_| {
             BioFormatsError::UnsupportedFormat(
                 "Olympus cellSens VSI: could not parse as TIFF (may require ETS companion files)"
@@ -16799,7 +16814,9 @@ impl FormatReader for CellSensReader {
             Some(CellSensTarget::Ets { volume, resolution }) => {
                 self.target = CellSensTarget::Ets { volume, resolution };
                 let mut meta = self.ets[volume].level_metadata(resolution)?;
-                meta.resolution_count = 1;
+                if self.flattened_resolutions {
+                    meta.resolution_count = 1;
+                }
                 self.ets_meta = Some(meta);
                 self.current = s;
                 Ok(())
@@ -16816,17 +16833,71 @@ impl FormatReader for CellSensReader {
             .unwrap_or_else(|| self.inner.metadata())
     }
     fn resolution_count(&self) -> usize {
-        1
+        if self.flattened_resolutions {
+            return 1;
+        }
+        match self.target {
+            CellSensTarget::Ets { volume, .. } => self
+                .ets
+                .get(volume)
+                .map(|v| v.levels.len().max(1))
+                .unwrap_or(1),
+            CellSensTarget::Tiff(_) => self.inner.resolution_count(),
+        }
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level == 0 {
-            Ok(())
-        } else {
-            Err(BioFormatsError::PlaneOutOfRange(level as u32))
+        if self.flattened_resolutions {
+            return if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::PlaneOutOfRange(level as u32))
+            };
+        }
+        match self.target {
+            CellSensTarget::Ets { volume, .. } => {
+                let max = self
+                    .ets
+                    .get(volume)
+                    .map(|v| v.levels.len().max(1))
+                    .unwrap_or(1);
+                if level >= max {
+                    return Err(BioFormatsError::PlaneOutOfRange(level as u32));
+                }
+                self.target = CellSensTarget::Ets {
+                    volume,
+                    resolution: level,
+                };
+                self.ets_meta = Some(self.ets[volume].level_metadata(level)?);
+                Ok(())
+            }
+            CellSensTarget::Tiff(ts) => {
+                self.inner.set_series(ts)?;
+                self.inner.set_resolution(level)
+            }
         }
     }
     fn resolution(&self) -> usize {
-        0
+        if self.flattened_resolutions {
+            0
+        } else {
+            match self.target {
+                CellSensTarget::Ets { resolution, .. } => resolution,
+                CellSensTarget::Tiff(_) => self.inner.resolution(),
+            }
+        }
+    }
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.series_map.is_empty() || !self.ets.is_empty() || self.vsi_path.is_some() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        self.inner.set_flattened_resolutions(flattened)?;
+        Ok(())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         match self.target {

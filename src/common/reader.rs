@@ -77,6 +77,20 @@ pub trait FormatReader: Send + Sync {
         0
     }
 
+    /// Whether sub-resolution pyramid levels are exposed as independent public
+    /// series. Defaults to Java Bio-Formats' `flattenedResolutions == true`.
+    fn has_flattened_resolutions(&self) -> bool {
+        true
+    }
+
+    /// Set whether pyramid resolutions should be flattened into public series.
+    ///
+    /// Must be called before [`FormatReader::set_id`] for readers that build
+    /// their public series map during initialization.
+    fn set_flattened_resolutions(&mut self, _flattened: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether the current series is a low-resolution thumbnail/preview rather
     /// than full-resolution image data. Mirrors Java
     /// `IFormatReader.isThumbnailSeries()`. The default reads

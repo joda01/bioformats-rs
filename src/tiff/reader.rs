@@ -139,6 +139,8 @@ pub struct TiffReader {
     series: Vec<TiffSeries>,
     current_series: usize,
     current_resolution: usize,
+    current_public_series: usize,
+    flattened_resolutions: bool,
     current_resolution_metadata: Option<ImageMetadata>,
     /// OME-XML embedded in the first IFD's ImageDescription, if present.
     ome_xml: Option<String>,
@@ -163,6 +165,8 @@ impl TiffReader {
             series: Vec::new(),
             current_series: 0,
             current_resolution: 0,
+            current_public_series: 0,
+            flattened_resolutions: true,
             current_resolution_metadata: None,
             ome_xml: None,
             path: None,
@@ -186,6 +190,51 @@ impl TiffReader {
     /// Access the series list mutably (for enriching metadata in wrappers).
     pub fn series_list_mut(&mut self) -> &mut [TiffSeries] {
         &mut self.series
+    }
+
+    fn resolution_count_for_series(&self, series: usize) -> usize {
+        self.series
+            .get(series)
+            .map(|s| 1 + s.sub_resolutions.len())
+            .unwrap_or(1)
+    }
+
+    fn public_series_count(&self) -> usize {
+        if self.flattened_resolutions {
+            self.series
+                .iter()
+                .map(|s| 1 + s.sub_resolutions.len())
+                .sum()
+        } else {
+            self.series.len()
+        }
+    }
+
+    fn public_series_to_core(&self, public_series: usize) -> Option<(usize, usize)> {
+        if !self.flattened_resolutions {
+            return (public_series < self.series.len()).then_some((public_series, 0));
+        }
+        let mut remaining = public_series;
+        for (series, s) in self.series.iter().enumerate() {
+            let count = 1 + s.sub_resolutions.len();
+            if remaining < count {
+                return Some((series, remaining));
+            }
+            remaining -= count;
+        }
+        None
+    }
+
+    fn core_to_public_series(&self, core_series: usize, resolution: usize) -> usize {
+        if !self.flattened_resolutions {
+            return core_series;
+        }
+        self.series
+            .iter()
+            .take(core_series)
+            .map(|s| 1 + s.sub_resolutions.len())
+            .sum::<usize>()
+            + resolution
     }
 
     /// Return metadata for a logical `(series, resolution)` pair without
@@ -226,6 +275,7 @@ impl TiffReader {
         self.series = series;
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
     }
 
@@ -281,6 +331,7 @@ impl TiffReader {
         self.series = flat;
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         Ok(())
     }
@@ -3181,6 +3232,7 @@ impl TiffReader {
         self.file = Some(tf);
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         Ok(())
     }
@@ -5107,6 +5159,7 @@ impl crate::common::reader::FormatReader for TiffReader {
                         self.file = Some(tf);
                         self.current_series = 0;
                         self.current_resolution = 0;
+                        self.current_public_series = 0;
                         self.current_resolution_metadata = None;
                         self.parse_sub_ifds()?;
                         self.synthesize_jpeg2000_sub_ifds()?;
@@ -5127,6 +5180,7 @@ impl crate::common::reader::FormatReader for TiffReader {
         self.file = Some(tf);
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         // Parse SubIFD chains for pyramid support
         self.parse_sub_ifds()?;
@@ -5138,6 +5192,9 @@ impl crate::common::reader::FormatReader for TiffReader {
     fn close(&mut self) -> Result<()> {
         self.file = None;
         self.series.clear();
+        self.current_series = 0;
+        self.current_resolution = 0;
+        self.current_public_series = 0;
         self.current_resolution_metadata = None;
         self.ome_xml = None;
         self.path = None;
@@ -5147,21 +5204,26 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series.len()
+        self.public_series_count()
     }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
-        if series >= self.series.len() {
+        let Some((core_series, resolution)) = self.public_series_to_core(series) else {
             return Err(BioFormatsError::SeriesOutOfRange(series));
-        }
-        self.current_series = series;
-        self.current_resolution = 0;
-        self.current_resolution_metadata = None;
+        };
+        self.current_series = core_series;
+        self.current_resolution = resolution;
+        self.current_public_series = series;
+        self.current_resolution_metadata = if resolution == 0 {
+            None
+        } else {
+            Some(self.metadata_at(core_series, resolution)?)
+        };
         Ok(())
     }
 
     fn series(&self) -> usize {
-        self.current_series
+        self.current_public_series
     }
 
     fn metadata(&self) -> &crate::common::metadata::ImageMetadata {
@@ -5295,13 +5357,15 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn resolution_count(&self) -> usize {
-        let s = &self.series[self.current_series];
-        1 + s.sub_resolutions.len()
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.resolution_count_for_series(self.current_series)
+        }
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        let s = &self.series[self.current_series];
-        let max = 1 + s.sub_resolutions.len();
+        let max = self.resolution_count();
         if level >= max {
             return Err(BioFormatsError::Format(format!(
                 "resolution level {} out of range (max {})",
@@ -5310,12 +5374,31 @@ impl crate::common::reader::FormatReader for TiffReader {
             )));
         }
         self.current_resolution = level;
+        self.current_public_series = self.core_to_public_series(self.current_series, level);
         self.current_resolution_metadata = self.resolution_metadata(level)?;
         Ok(())
     }
 
     fn resolution(&self) -> usize {
-        self.current_resolution
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.current_resolution
+        }
+    }
+
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.file.is_some() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        Ok(())
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
@@ -5535,6 +5618,7 @@ mod tests {
         fs::write(&tiff_path, synthetic_jpeg2000_tiff(&jp2, 8, 8)).unwrap();
 
         let mut reader = TiffReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&tiff_path).unwrap();
         assert!(reader.resolution_count() > 1);
         assert_eq!(

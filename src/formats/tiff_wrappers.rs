@@ -235,6 +235,7 @@ pub struct NdpiReader {
     use_64bit: bool,
     /// Per-flattened-series OME image metadata (name + physical sizes).
     ome_images: Vec<crate::common::ome_metadata::OmeImage>,
+    flattened_resolutions: bool,
 }
 
 // NDPI custom TIFF tags (mirrors the constants in NDPIReader.java:66-99).
@@ -304,6 +305,7 @@ impl NdpiReader {
             pyramid_height: 1,
             use_64bit: false,
             ome_images: Vec::new(),
+            flattened_resolutions: true,
         }
     }
 
@@ -326,8 +328,12 @@ impl NdpiReader {
         self.public_series.clear();
         for (series_index, series) in self.inner.series_list().iter().enumerate() {
             let resolution_count = series.metadata.resolution_count.max(1) as usize;
-            for resolution in 0..resolution_count {
-                self.public_series.push((series_index, resolution));
+            if self.flattened_resolutions {
+                for resolution in 0..resolution_count {
+                    self.public_series.push((series_index, resolution));
+                }
+            } else {
+                self.public_series.push((series_index, 0));
             }
         }
         self.set_public_series(0)
@@ -341,7 +347,9 @@ impl NdpiReader {
         self.inner.set_series(logical_series)?;
         self.inner.set_resolution(resolution)?;
         let mut meta = self.inner.metadata_at(logical_series, resolution)?;
-        meta.resolution_count = 1;
+        if self.flattened_resolutions {
+            meta.resolution_count = 1;
+        }
         if let Some(ifd_idx) = self.target_ifd_index(logical_series, resolution) {
             meta.is_interleaved = self.ndpi_ifd_interleaved(ifd_idx);
         }
@@ -1016,6 +1024,7 @@ impl FormatReader for NdpiReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
+        self.inner.set_flattened_resolutions(false)?;
         self.size_z = 1;
         self.pyramid_height = 1;
         self.use_64bit = false;
@@ -1133,21 +1142,54 @@ impl FormatReader for NdpiReader {
         )
     }
     fn resolution_count(&self) -> usize {
-        1
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.inner.resolution_count()
+        }
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level == 0 {
-            Ok(())
+        if self.flattened_resolutions {
+            if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::Format(format!(
+                    "resolution level {level} out of range (max 0)"
+                )))
+            }
         } else {
-            Err(BioFormatsError::Format(format!(
-                "resolution level {level} out of range (max 0)"
-            )))
+            self.inner.set_resolution(level)?;
+            let &(logical_series, _) = self.public_series.get(self.current_public_series).ok_or(
+                BioFormatsError::SeriesOutOfRange(self.current_public_series),
+            )?;
+            let mut meta = self.inner.metadata_at(logical_series, level)?;
+            if let Some(ifd_idx) = self.target_ifd_index(logical_series, level) {
+                meta.is_interleaved = self.ndpi_ifd_interleaved(ifd_idx);
+            }
+            self.current_public_metadata = Some(meta);
+            Ok(())
         }
     }
     fn resolution(&self) -> usize {
-        0
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.inner.resolution()
+        }
     }
-
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.public_series.is_empty() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        self.inner.set_flattened_resolutions(flattened)?;
+        Ok(())
+    }
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         if self.ome_images.is_empty() {
             return None;
@@ -1183,6 +1225,7 @@ pub struct LeicaScnReader {
     /// from the SCN XML before resolution flattening so each (image, resolution)
     /// gets its own name/calibration mirroring Java's LeicaSCNReader.
     ome_images: Vec<crate::common::ome_metadata::OmeImage>,
+    flattened_resolutions: bool,
 }
 
 /// One `<dimension>` element: a plane for a given z/c/r mapped to a TIFF IFD.
@@ -1229,6 +1272,7 @@ impl LeicaScnReader {
             current_public_series: 0,
             current_public_metadata: None,
             ome_images: Vec::new(),
+            flattened_resolutions: true,
         }
     }
 
@@ -1236,8 +1280,12 @@ impl LeicaScnReader {
         self.public_series.clear();
         for (series_index, series) in self.inner.series_list().iter().enumerate() {
             let resolution_count = series.metadata.resolution_count.max(1) as usize;
-            for resolution in 0..resolution_count {
-                self.public_series.push((series_index, resolution));
+            if self.flattened_resolutions {
+                for resolution in 0..resolution_count {
+                    self.public_series.push((series_index, resolution));
+                }
+            } else {
+                self.public_series.push((series_index, 0));
             }
         }
         self.set_public_series(0)
@@ -1251,7 +1299,9 @@ impl LeicaScnReader {
         self.inner.set_series(logical_series)?;
         self.inner.set_resolution(resolution)?;
         let mut meta = self.inner.metadata_at(logical_series, resolution)?;
-        meta.resolution_count = 1;
+        if self.flattened_resolutions {
+            meta.resolution_count = 1;
+        }
         meta.is_interleaved = false;
         self.current_public_series = series;
         self.current_public_metadata = Some(meta);
@@ -1696,6 +1746,7 @@ impl FormatReader for LeicaScnReader {
         self.current_public_series = 0;
         self.current_public_metadata = None;
         self.inner.close()?;
+        self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path)?;
         self.enrich_metadata();
         if self.inner.series_count() == 0 {
@@ -1776,21 +1827,52 @@ impl FormatReader for LeicaScnReader {
         )
     }
     fn resolution_count(&self) -> usize {
-        1
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.inner.resolution_count()
+        }
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level == 0 {
-            Ok(())
+        if self.flattened_resolutions {
+            if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::Format(format!(
+                    "resolution level {level} out of range (max 0)"
+                )))
+            }
         } else {
-            Err(BioFormatsError::Format(format!(
-                "resolution level {level} out of range (max 0)"
-            )))
+            self.inner.set_resolution(level)?;
+            let &(logical_series, _) = self.public_series.get(self.current_public_series).ok_or(
+                BioFormatsError::SeriesOutOfRange(self.current_public_series),
+            )?;
+            let mut meta = self.inner.metadata_at(logical_series, level)?;
+            meta.is_interleaved = false;
+            self.current_public_metadata = Some(meta);
+            Ok(())
         }
     }
     fn resolution(&self) -> usize {
-        0
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.inner.resolution()
+        }
     }
-
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.public_series.is_empty() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        self.inner.set_flattened_resolutions(flattened)?;
+        Ok(())
+    }
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         if self.ome_images.is_empty() {
             return None;
@@ -2748,6 +2830,8 @@ impl FormatReader for VentanaReader {
         self.metadata_override = None;
         self.ome_images.clear();
         self.file_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        self.inner.close()?;
+        self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path)?;
         self.enrich_metadata();
         if self.inner.series_count() > 0 {

@@ -17,6 +17,7 @@ pub struct SvsReader {
     public_series: Vec<(usize, usize)>,
     current_public_series: usize,
     current_public_metadata: Option<ImageMetadata>,
+    flattened_resolutions: bool,
 }
 
 impl SvsReader {
@@ -26,6 +27,7 @@ impl SvsReader {
             public_series: Vec::new(),
             current_public_series: 0,
             current_public_metadata: None,
+            flattened_resolutions: true,
         }
     }
 
@@ -33,8 +35,12 @@ impl SvsReader {
         self.public_series.clear();
         for (series_index, series) in self.inner.series_list().iter().enumerate() {
             let resolution_count = series.metadata.resolution_count.max(1) as usize;
-            for resolution in 0..resolution_count {
-                self.public_series.push((series_index, resolution));
+            if self.flattened_resolutions {
+                for resolution in 0..resolution_count {
+                    self.public_series.push((series_index, resolution));
+                }
+            } else {
+                self.public_series.push((series_index, 0));
             }
         }
         self.set_public_series(0)
@@ -48,7 +54,9 @@ impl SvsReader {
         self.inner.set_series(logical_series)?;
         self.inner.set_resolution(resolution)?;
         let mut meta = self.inner.metadata_at(logical_series, resolution)?;
-        meta.resolution_count = 1;
+        if self.flattened_resolutions {
+            meta.resolution_count = 1;
+        }
         self.current_public_series = series;
         self.current_public_metadata = Some(meta);
         Ok(())
@@ -307,6 +315,7 @@ impl FormatReader for PyramidTiffReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
+        self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path)?;
         self.init_standard_metadata();
         Ok(())
@@ -413,6 +422,7 @@ impl FormatReader for SvsReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
+        self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path)?;
         // Aperio SVS stores its pyramid as the main IFD chain (differently
         // sized IFDs). TiffReader splits these into separate series by default;
@@ -502,19 +512,49 @@ impl FormatReader for SvsReader {
         )
     }
     fn resolution_count(&self) -> usize {
-        1
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.inner.resolution_count()
+        }
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level == 0 {
-            Ok(())
+        if self.flattened_resolutions {
+            if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::Format(format!(
+                    "resolution level {level} out of range (max 0)"
+                )))
+            }
         } else {
-            Err(BioFormatsError::Format(format!(
-                "resolution level {level} out of range (max 0)"
-            )))
+            self.inner.set_resolution(level)?;
+            let &(logical_series, _) = self.public_series.get(self.current_public_series).ok_or(
+                BioFormatsError::SeriesOutOfRange(self.current_public_series),
+            )?;
+            self.current_public_metadata = Some(self.inner.metadata_at(logical_series, level)?);
+            Ok(())
         }
     }
     fn resolution(&self) -> usize {
-        0
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.inner.resolution()
+        }
+    }
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.public_series.is_empty() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        self.inner.set_flattened_resolutions(flattened)?;
+        Ok(())
     }
 
     /// One OME image per series, named like Java `SVSReader.initMetadataStore`:
