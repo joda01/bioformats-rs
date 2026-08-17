@@ -929,22 +929,22 @@ fn direct_stack_writer_cases() -> Vec<(
         (
             "ICS",
             "ics",
-            Box::new(bioformats::formats::ics::IcsWriter::new()),
+            Box::new(bioformats::formats::bsd::ics::IcsWriter::new()),
         ),
         (
             "MRC",
             "mrc",
-            Box::new(bioformats::formats::mrc::MrcWriter::new()),
+            Box::new(bioformats::formats::gpl::mrc::MrcWriter::new()),
         ),
         (
             "FITS",
             "fits",
-            Box::new(bioformats::formats::fits::FitsWriter::new()),
+            Box::new(bioformats::formats::bsd::fits::FitsWriter::new()),
         ),
         (
             "NRRD",
             "nrrd",
-            Box::new(bioformats::formats::nrrd::NrrdWriter::new()),
+            Box::new(bioformats::formats::bsd::nrrd::NrrdWriter::new()),
         ),
         (
             "MetaImage",
@@ -954,17 +954,17 @@ fn direct_stack_writer_cases() -> Vec<(
         (
             "OME-XML",
             "ome",
-            Box::new(bioformats::formats::ome_xml::OmeXmlWriter::new()),
+            Box::new(bioformats::formats::bsd::ome_xml::OmeXmlWriter::new()),
         ),
         (
             "AVI",
             "avi",
-            Box::new(bioformats::formats::avi::AviWriter::new()),
+            Box::new(bioformats::formats::bsd::avi::AviWriter::new()),
         ),
         (
             "DICOM",
             "dcm",
-            Box::new(bioformats::formats::dicom::DicomWriter::new()),
+            Box::new(bioformats::formats::bsd::dicom::DicomWriter::new()),
         ),
     ]
 }
@@ -1077,7 +1077,7 @@ fn axis_flattening_writers_reject_unsupported_c_t_metadata() {
             "FITS",
             "fits",
             c_meta.clone(),
-            Box::new(bioformats::formats::fits::FitsWriter::new()),
+            Box::new(bioformats::formats::bsd::fits::FitsWriter::new()),
         ),
         (
             "MetaImage",
@@ -1089,13 +1089,13 @@ fn axis_flattening_writers_reject_unsupported_c_t_metadata() {
             "MRC",
             "mrc",
             c_meta.clone(),
-            Box::new(bioformats::formats::mrc::MrcWriter::new()),
+            Box::new(bioformats::formats::gpl::mrc::MrcWriter::new()),
         ),
         (
             "NRRD",
             "nrrd",
             c_meta,
-            Box::new(bioformats::formats::nrrd::NrrdWriter::new()),
+            Box::new(bioformats::formats::bsd::nrrd::NrrdWriter::new()),
         ),
     ];
 
@@ -1183,7 +1183,7 @@ fn ics_writer_describes_rgb_as_interleaved_channel_axis() {
     let path = temp_path("ics_rgb_interleaved.ics");
     ImageWriter::save(&path, &meta, &[vec![1, 2, 3, 4, 5, 6]]).unwrap();
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
     assert!(reader.metadata().is_rgb);
     assert!(reader.metadata().is_interleaved);
@@ -1208,7 +1208,7 @@ fn ics_writer_reorders_non_rgb_planes_to_declared_xyztc_layout() {
     let path = temp_path("ics_ct_reordered.ics");
     ImageWriter::save(&path, &meta, &[vec![10], vec![20], vec![30], vec![40]]).unwrap();
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
     assert_eq!(
         reader.metadata().dimension_order,
@@ -1245,11 +1245,11 @@ fn ics_writer_accepts_ids_suffix_like_java_ics1_pair() {
     assert!(header.contains("layout\tsizes\t8 2 1 1 1 1"));
     assert_eq!(std::fs::read(&ids_path).unwrap(), vec![7, 9]);
 
-    let mut from_ics = bioformats::formats::ics::IcsReader::new();
+    let mut from_ics = bioformats::formats::bsd::ics::IcsReader::new();
     from_ics.set_id(&ics_path).unwrap();
     assert_eq!(from_ics.open_bytes(0).unwrap(), vec![7, 9]);
 
-    let mut from_ids = bioformats::formats::ics::IcsReader::new();
+    let mut from_ids = bioformats::formats::bsd::ics::IcsReader::new();
     from_ids.set_id(&ids_path).unwrap();
     assert_eq!(from_ids.open_bytes(0).unwrap(), vec![7, 9]);
 }
@@ -1303,7 +1303,7 @@ fn ics_writer_emits_java_parameter_scales_for_physical_sizes() {
     assert!(header.contains("parameter\tscale\t1 0.5 0.25 2 1.5 1"));
     assert!(header.contains("parameter\tunits\tbits micrometers micrometers micrometers seconds"));
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
     let ome = reader.ome_metadata().unwrap();
     let image = &ome.images[0];
@@ -1332,7 +1332,7 @@ fn ics_reader_maps_millisecond_time_scale_to_seconds() {
     bytes.extend_from_slice(&[3, 4]);
     std::fs::write(&path, bytes).unwrap();
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
     let ome = reader.ome_metadata().unwrap();
 
@@ -1359,7 +1359,7 @@ fn ics_reader_accepts_missing_scale_units_like_java() {
     bytes.extend_from_slice(&[3, 4]);
     std::fs::write(&path, bytes).unwrap();
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
     let ome = reader.ome_metadata().unwrap();
     let image = &ome.images[0];
@@ -1387,7 +1387,7 @@ fn ics_reader_falls_back_to_raw_when_gzip_flag_is_wrong_like_java() {
     bytes.extend_from_slice(&[9, 8, 7]);
     std::fs::write(&path, bytes).unwrap();
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
 
     assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 8, 7]);
@@ -1474,7 +1474,7 @@ fn ics_reader_tokenizes_ctrl_d_separator_like_java() {
     bytes.extend_from_slice(&[11, 13]);
     std::fs::write(&path, bytes).unwrap();
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
 
     assert_eq!(reader.metadata().size_x, 2);
@@ -1503,7 +1503,7 @@ fn ics_reader_maps_parameter_t_to_plane_delta_t_like_java() {
     bytes.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
     std::fs::write(&path, bytes).unwrap();
 
-    let mut reader = bioformats::formats::ics::IcsReader::new();
+    let mut reader = bioformats::formats::bsd::ics::IcsReader::new();
     reader.set_id(&path).unwrap();
     let ome = reader.ome_metadata().unwrap();
     let planes = &ome.images[0].planes;
@@ -1560,7 +1560,7 @@ fn scientific_writers_emit_bytes_matching_declared_endianness() {
 
     let fits = temp_path("writer_big_input.fits");
     ImageWriter::save(&fits, &big_meta, &[vec![0x12, 0x34]]).unwrap();
-    let mut fits_reader = bioformats::formats::fits::FitsReader::new();
+    let mut fits_reader = bioformats::formats::bsd::fits::FitsReader::new();
     fits_reader.set_id(&fits).unwrap();
     assert!(!fits_reader.metadata().is_little_endian);
     assert_eq!(fits_reader.open_bytes(0).unwrap(), vec![0x12, 0x34]);
@@ -1570,7 +1570,7 @@ fn scientific_writers_emit_bytes_matching_declared_endianness() {
             "ICS",
             "writer_big_input.ics",
             Box::new(|p| {
-                let mut r = bioformats::formats::ics::IcsReader::new();
+                let mut r = bioformats::formats::bsd::ics::IcsReader::new();
                 r.set_id(p).unwrap();
                 r.open_bytes(0).unwrap()
             }),
@@ -1579,7 +1579,7 @@ fn scientific_writers_emit_bytes_matching_declared_endianness() {
             "MRC",
             "writer_big_input.mrc",
             Box::new(|p| {
-                let mut r = bioformats::formats::mrc::MrcReader::new();
+                let mut r = bioformats::formats::gpl::mrc::MrcReader::new();
                 r.set_id(p).unwrap();
                 r.open_bytes(0).unwrap()
             }),
@@ -1588,7 +1588,7 @@ fn scientific_writers_emit_bytes_matching_declared_endianness() {
             "NRRD",
             "writer_big_input.nrrd",
             Box::new(|p| {
-                let mut r = bioformats::formats::nrrd::NrrdReader::new();
+                let mut r = bioformats::formats::bsd::nrrd::NrrdReader::new();
                 r.set_id(p).unwrap();
                 r.open_bytes(0).unwrap()
             }),
@@ -1751,22 +1751,22 @@ fn direct_stateful_stack_writers_allow_retry_after_incomplete_close() {
         (
             "ICS",
             "ics",
-            Box::new(bioformats::formats::ics::IcsWriter::new()),
+            Box::new(bioformats::formats::bsd::ics::IcsWriter::new()),
         ),
         (
             "MRC",
             "mrc",
-            Box::new(bioformats::formats::mrc::MrcWriter::new()),
+            Box::new(bioformats::formats::gpl::mrc::MrcWriter::new()),
         ),
         (
             "FITS",
             "fits",
-            Box::new(bioformats::formats::fits::FitsWriter::new()),
+            Box::new(bioformats::formats::bsd::fits::FitsWriter::new()),
         ),
         (
             "NRRD",
             "nrrd",
-            Box::new(bioformats::formats::nrrd::NrrdWriter::new()),
+            Box::new(bioformats::formats::bsd::nrrd::NrrdWriter::new()),
         ),
         (
             "MetaImage",
@@ -1776,17 +1776,17 @@ fn direct_stateful_stack_writers_allow_retry_after_incomplete_close() {
         (
             "DICOM",
             "dcm",
-            Box::new(bioformats::formats::dicom::DicomWriter::new()),
+            Box::new(bioformats::formats::bsd::dicom::DicomWriter::new()),
         ),
         (
             "OME-XML",
             "ome",
-            Box::new(bioformats::formats::ome_xml::OmeXmlWriter::new()),
+            Box::new(bioformats::formats::bsd::ome_xml::OmeXmlWriter::new()),
         ),
         (
             "AVI",
             "avi",
-            Box::new(bioformats::formats::avi::AviWriter::new()),
+            Box::new(bioformats::formats::bsd::avi::AviWriter::new()),
         ),
     ];
 
@@ -1822,7 +1822,7 @@ fn mrc_writer_rejects_non_rgb_channels_instead_of_flattening_to_z() {
     meta.is_rgb = false;
 
     let path = temp_path("mrc_non_rgb_channels.mrc");
-    let mut writer = bioformats::formats::mrc::MrcWriter::new();
+    let mut writer = bioformats::formats::gpl::mrc::MrcWriter::new();
     let err = writer.set_metadata(&meta).unwrap_err();
     assert!(
         err.to_string().contains("not non-RGB C/T axes"),
@@ -1862,7 +1862,7 @@ fn direct_single_plane_writers_reject_malformed_planes() {
     eps_meta.image_count = 1;
     eps_meta.size_c = 1;
 
-    let mut eps = bioformats::formats::eps::EpsWriter::new();
+    let mut eps = bioformats::formats::bsd::eps::EpsWriter::new();
     eps.set_metadata(&eps_meta).unwrap();
     eps.set_id(&temp_path("direct_duplicate.eps")).unwrap();
     eps.save_bytes(0, &[1]).unwrap();
@@ -1909,7 +1909,7 @@ fn direct_single_plane_writers_reject_malformed_planes() {
     let mut stack_meta = eps_meta.clone();
     stack_meta.size_z = 2;
     stack_meta.image_count = 2;
-    let mut jpeg = bioformats::formats::jpeg::JpegWriter::new();
+    let mut jpeg = bioformats::formats::bsd::jpeg::JpegWriter::new();
     let err = jpeg.set_metadata(&stack_meta).unwrap_err();
     assert!(
         err.to_string()
@@ -1937,7 +1937,7 @@ fn direct_tga_and_eps_writers_reject_stack_metadata() {
         "unexpected TGA error: {err}"
     );
 
-    let mut eps = bioformats::formats::eps::EpsWriter::new();
+    let mut eps = bioformats::formats::bsd::eps::EpsWriter::new();
     let err = eps.set_metadata(&stack_meta).unwrap_err();
     assert!(
         err.to_string()
@@ -2010,7 +2010,7 @@ fn avi_writer_rejects_metadata_it_cannot_encode() {
     uint16_meta.pixel_type = PixelType::Uint16;
     uint16_meta.size_c = 1;
     uint16_meta.image_count = 1;
-    let mut writer = bioformats::formats::avi::AviWriter::new();
+    let mut writer = bioformats::formats::bsd::avi::AviWriter::new();
     let err = writer.set_metadata(&uint16_meta).unwrap_err();
     assert!(
         err.to_string().contains("only 8-bit pixel data"),
@@ -2023,7 +2023,7 @@ fn avi_writer_rejects_metadata_it_cannot_encode() {
     channel_meta.pixel_type = PixelType::Uint8;
     channel_meta.size_c = 2;
     channel_meta.image_count = 2;
-    let mut writer = bioformats::formats::avi::AviWriter::new();
+    let mut writer = bioformats::formats::bsd::avi::AviWriter::new();
     let err = writer.set_metadata(&channel_meta).unwrap_err();
     assert!(
         err.to_string().contains("got 2 non-RGB channels"),
@@ -2038,7 +2038,7 @@ fn avi_writer_rejects_metadata_it_cannot_encode() {
     rgba_meta.image_count = 1;
     rgba_meta.is_rgb = true;
     rgba_meta.is_interleaved = true;
-    let mut writer = bioformats::formats::avi::AviWriter::new();
+    let mut writer = bioformats::formats::bsd::avi::AviWriter::new();
     let err = writer.set_metadata(&rgba_meta).unwrap_err();
     assert!(
         err.to_string().contains("RGB Uint8 data with 3 channels"),
@@ -2284,7 +2284,7 @@ fn direct_tiff_set_ome_metadata_populates_required_channels() {
 
 #[test]
 fn direct_ome_xml_writer_populates_required_channels_from_empty_store() {
-    use bioformats::formats::ome_xml::OmeXmlWriter;
+    use bioformats::formats::bsd::ome_xml::OmeXmlWriter;
     use bioformats::OmeMetadata;
 
     let mut meta = ImageMetadata::default();
@@ -2459,7 +2459,7 @@ fn jpeg2000_writer_round_trip_rgb8_lossless() {
 
 #[test]
 fn ome_xml_writer_splits_rgb_bindata_per_channel_like_java() {
-    use bioformats::formats::ome_xml::{OmeXmlReader, OmeXmlWriter};
+    use bioformats::formats::bsd::ome_xml::{OmeXmlReader, OmeXmlWriter};
 
     let mut meta = ImageMetadata::default();
     meta.size_x = 2;
