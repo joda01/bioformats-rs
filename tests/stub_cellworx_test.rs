@@ -9,7 +9,7 @@ use std::path::Path;
 
 use bioformats::common::metadata::MetadataValue;
 use bioformats::common::reader::FormatReader;
-use bioformats::formats::mias::CellWorxReader;
+use bioformats::formats::gpl::mias::CellWorxReader;
 
 const HTD: &str = "testdata/metaxpress/BSF018292-1A.HTD";
 const A01_W1: &str = "testdata/metaxpress/BSF018292-1A_A01_w1.TIF";
